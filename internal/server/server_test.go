@@ -13,7 +13,11 @@ import (
 // {"status":"ok"}. Uses a real httptest server + client (no lingering
 // foreground process).
 func TestHealth(t *testing.T) {
-	srv := httptest.NewServer(server.NewMux())
+	mux, err := server.NewMux(server.Deps{JWTSecret: "test-secret"})
+	if err != nil {
+		t.Fatalf("NewMux: %v", err)
+	}
+	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
 	resp, err := http.Get(srv.URL + "/health")
@@ -31,5 +35,15 @@ func TestHealth(t *testing.T) {
 	}
 	if got := string(body); got != `{"status":"ok"}` {
 		t.Fatalf("body = %q, want {\"status\":\"ok\"}", got)
+	}
+}
+
+// TestNewMuxRejectsEmptySecret covers the fail-closed invariant at the handler
+// layer: NewMux refuses to build when the JWT secret is empty, so the server
+// cannot be wired without one. (The same invariant is enforced at startup by
+// config.Load; this guards the handler construction path independently.)
+func TestNewMuxRejectsEmptySecret(t *testing.T) {
+	if _, err := server.NewMux(server.Deps{JWTSecret: ""}); err == nil {
+		t.Fatal("expected NewMux to reject an empty JWT secret, got nil")
 	}
 }

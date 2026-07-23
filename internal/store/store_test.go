@@ -2,6 +2,7 @@ package store_test
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"testing"
 
@@ -62,4 +63,57 @@ func TestEnsureSchemaIdempotent(t *testing.T) {
 	if err := store.EnsureSchema(ctx, db2); err != nil {
 		t.Fatalf("ensure #2 (idempotent restart) failed: %v", err)
 	}
+}
+
+// TestSeedCatalogsIdempotent covers the CONTRACT-02 T1 acceptance criterion:
+// seeding the role/permission catalogs twice on the same file neither
+// duplicates rows nor fails. SELECT count(*) FROM roles is equal before and
+// after the second seed, and equals len(schema.Roles); same for permissions.
+func TestSeedCatalogsIdempotent(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "seed.db")
+	ctx := context.Background()
+
+	db, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	if err := store.EnsureSchema(ctx, db); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+
+	if err := store.SeedCatalogs(ctx, db.DB); err != nil {
+		t.Fatalf("seed #1: %v", err)
+	}
+	rolesAfter1 := count(t, db.DB, "SELECT count(*) FROM roles")
+	permsAfter1 := count(t, db.DB, "SELECT count(*) FROM permissions")
+	if rolesAfter1 != len(schema.Roles) {
+		t.Fatalf("roles after seed #1 = %d, want %d", rolesAfter1, len(schema.Roles))
+	}
+	if permsAfter1 != len(schema.Permissions) {
+		t.Fatalf("permissions after seed #1 = %d, want %d", permsAfter1, len(schema.Permissions))
+	}
+
+	// Second seed on the same file: must be a no-op (no duplicate rows, no error).
+	if err := store.SeedCatalogs(ctx, db.DB); err != nil {
+		t.Fatalf("seed #2 (idempotent) failed: %v", err)
+	}
+	rolesAfter2 := count(t, db.DB, "SELECT count(*) FROM roles")
+	permsAfter2 := count(t, db.DB, "SELECT count(*) FROM permissions")
+	if rolesAfter2 != rolesAfter1 {
+		t.Fatalf("roles after seed #2 = %d, want %d (no duplicates)", rolesAfter2, rolesAfter1)
+	}
+	if permsAfter2 != permsAfter1 {
+		t.Fatalf("permissions after seed #2 = %d, want %d (no duplicates)", permsAfter2, permsAfter1)
+	}
+}
+
+// count returns the integer result of a single-row SELECT count(*) query.
+func count(t *testing.T, db *sql.DB, query string) int {
+	t.Helper()
+	var n int
+	if err := db.QueryRow(query).Scan(&n); err != nil {
+		t.Fatalf("count %q: %v", query, err)
+	}
+	return n
 }

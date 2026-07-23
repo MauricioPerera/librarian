@@ -154,6 +154,31 @@ func catalogTable(name string) compat.Table {
 	}
 }
 
+// apiKeysTable builds the api_keys table (CONTRACT-02 T4): one row per issued
+// API key. The plaintext secret is never stored — only its SHA-256 hash
+// (key_hash, UNIQUE, looked up exactly by the DB on verification). role_id FK
+// cascades on delete of the role. revoked_at is nullable; a non-null value
+// marks the key as revoked (rejected at verification time). created_at
+// defaults to now. id defaults to gen_random_uuid() on both engines.
+func apiKeysTable() compat.Table {
+	return compat.Table{
+		Name: "api_keys",
+		Columns: []compat.Column{
+			idColumn(),
+			textColumn("label", false),
+			textColumn("key_hash", false),
+			uuidColumn("role_id", false),
+			nowColumn("created_at"),
+			timestampColumn("revoked_at", true),
+		},
+		Constraints: []compat.Constraint{
+			primaryKey("id"),
+			unique("key_hash"),
+			foreignKeyCascade("role_id", "roles", "id"),
+		},
+	}
+}
+
 // junctionTable builds an M:N link table with a composite PK and both FKs
 // cascading on delete.
 func junctionTable(name, leftCol, leftTable, rightCol, rightTable string) compat.Table {
@@ -183,6 +208,7 @@ func Build() compat.Schema {
 			catalogTable("permissions"),
 			junctionTable("role_permissions", "role_id", "roles", "permission_id", "permissions"),
 			junctionTable("user_roles", "user_id", "users", "role_id", "roles"),
+			apiKeysTable(),
 			// T2 example content type, built through the reusable helper.
 			ContentType("articles", []compat.Column{
 				textColumn("title", false),

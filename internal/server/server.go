@@ -1,25 +1,151 @@
-// Package server builds the librarian HTTP handler. In this first contract it
-// only exposes GET /health; it is the skeleton onto which later contracts hang
-// auth and CRUD routes.
+// Package server builds the librarian HTTP handler. CONTRACT-01 exposed
+// GET /health; CONTRACT-02 adds the dual-auth surface: POST /auth/login
+// (password → JWT) and the GET /whoami demo endpoint protected by either a
+// valid JWT or a valid API key.
 package server
 
 import (
+	"database/sql"
+	"encoding/json"
+	"errors"
 	"net/http"
+	"strings"
+	"time"
+
+	"github.com/MauricioPerera/librarian/internal/auth"
 )
 
-// NewMux returns the HTTP handler for librarian. Routes use stdlib
-// method+pattern matching (Go 1.22+ ServeMux) — no external router, sufficient
-// for this base.
-func NewMux() *http.ServeMux {
+// Deps carries the runtime dependencies the routes need. JWTSecret must be
+// non-empty — NewMux fails (fail-closed) if it is not, so the server never
+// starts with a default/hardcoded secret. DB is the shared *sql.DB from
+// compat.Store.DB.
+type Deps struct {
+	DB        *sql.DB
+	JWTSecret string
+}
+
+// NewMux returns the librarian HTTP handler wired with the auth routes. It
+// fails if JWTSecret is empty — there is no default secret, by contract.
+func NewMux(deps Deps) (*http.ServeMux, error) {
+	if deps.JWTSecret == "" {
+		return nil, errors.New("JWT secret must not be empty (set LIBRARIAN_JWT_SECRET)")
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", handleHealth)
-	return mux
+
+	h := &handlers{db: deps.DB, jwtSecret: deps.JWTSecret, now: time.Now}
+	mux.HandleFunc("POST /auth/login", h.handleLogin)
+	mux.HandleFunc("GET /whoami", h.handleWhoami)
+	return mux, nil
+}
+
+// handlers holds the per-request-shared state for the auth routes.
+type handlers struct {
+	db        *sql.DB
+	jwtSecret string
+	now       func() time.Time
 }
 
 // handleHealth answers 200 {"status":"ok"}.
 func handleHealth(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// loginRequest is the body of POST /auth/login.
+type loginRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+// handleLogin verifies credentials (auth.VerifyCredentials) and, on success,
+// issues a 24h JWT. On any credential failure it returns 401 with the same
+// generic envelope and message that VerifyCredentials uses — anti-enumeration.
+func (h *handlers) handleLogin(w http.ResponseWriter, r *http.Request) {
+	var req loginRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	user, err := auth.VerifyCredentials(r.Context(), h.db, req.Email, req.Password)
+	if err != nil {
+		// Same generic message for unknown user and wrong password.
+		writeError(w, http.StatusUnauthorized, "invalid credentials")
+		return
+	}
+	token, err := auth.IssueJWT(h.jwtSecret, user, h.now())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not issue token")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"token": token})
+}
+
+// handleWhoami resolves the caller's identity from either a valid JWT or a
+// valid API key supplied as Authorization: Bearer <token>. It tries JWT first;
+// if that fails it tries the API-key path; if both fail it returns 401. The
+// response shape depends on which mechanism authenticated the request.
+func (h *handlers) handleWhoami(w http.ResponseWriter, r *http.Request) {
+	token, ok := bearerToken(r)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	// Try JWT first.
+	if claims, err := auth.VerifyJWT(h.jwtSecret, token); err == nil {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"auth":    "jwt",
+			"user_id": claims.Subject,
+			"email":   claims.Email,
+			"roles":   claims.Roles,
+		})
+		return
+	}
+
+	// Fall back to API key. The lookup is an exact-match on the hash, inside
+	// the DB; a revoked or unknown key yields ErrAPIKeyRejected.
+	key, err := auth.VerifyAPIKey(r.Context(), h.db, token)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"auth":    "apikey",
+		"label":   key.Label,
+		"role_id": key.RoleID,
+	})
+}
+
+// bearerToken extracts the token from an "Authorization: Bearer <token>"
+// header. It returns ok=false when the header is absent or malformed; it never
+// distinguishes "absent" from "malformed" in the response (both route to 401).
+func bearerToken(r *http.Request) (string, bool) {
+	v := r.Header.Get("Authorization")
+	const prefix = "Bearer "
+	if len(v) <= len(prefix) || !strings.EqualFold(v[:len(prefix)], prefix) {
+		return "", false
+	}
+	token := strings.TrimSpace(v[len(prefix):])
+	if token == "" {
+		return "", false
+	}
+	return token, true
+}
+
+// writeJSON encodes v as JSON with the given status. It uses json.Marshal (not
+// an Encoder, which would append a trailing newline) so response bodies are
+// exact and deterministic — e.g. /health stays the byte-exact {"status":"ok"}.
+func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	// Fixed literal body; no user data, so a direct write is safe and exact.
-	_, _ = w.Write([]byte(`{"status":"ok"}`))
+	w.WriteHeader(status)
+	body, err := json.Marshal(v)
+	if err != nil {
+		return
+	}
+	_, _ = w.Write(body)
+}
+
+// writeError emits the standard error envelope: {"error": <msg>}.
+func writeError(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg})
 }

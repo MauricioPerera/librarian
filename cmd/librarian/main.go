@@ -1,6 +1,8 @@
 // Command librarian is the single headless backend binary. On startup it opens
 // (or creates) the embedded libSQL database, applies the canonical schema
-// idempotently, and only then starts serving HTTP.
+// idempotently, seeds the role/permission catalogs, and only then starts
+// serving HTTP. The JWT signing secret is required (LIBRARIAN_JWT_SECRET);
+// without it the process refuses to start.
 package main
 
 import (
@@ -8,15 +10,10 @@ import (
 	"errors"
 	"log"
 	"net/http"
-	"os"
 
+	"github.com/MauricioPerera/librarian/internal/config"
 	"github.com/MauricioPerera/librarian/internal/server"
 	"github.com/MauricioPerera/librarian/internal/store"
-)
-
-const (
-	defaultAddr = ":8080"
-	defaultDB   = "librarian.db"
 )
 
 func main() {
@@ -26,27 +23,32 @@ func main() {
 }
 
 func run() error {
-	addr := os.Getenv("LIBRARIAN_ADDR")
-	if addr == "" {
-		addr = defaultAddr
-	}
-	dbPath := os.Getenv("LIBRARIAN_DB")
-	if dbPath == "" {
-		dbPath = defaultDB
+	cfg, err := config.Load()
+	if err != nil {
+		return err
 	}
 
-	db, err := store.Open(dbPath)
+	db, err := store.Open(cfg.DBPath)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
 
-	if err := store.EnsureSchema(context.Background(), db); err != nil {
+	ctx := context.Background()
+	if err := store.EnsureSchema(ctx, db); err != nil {
+		return err
+	}
+	if err := store.SeedCatalogs(ctx, db.DB); err != nil {
 		return err
 	}
 
-	log.Printf("librarian: schema ready on %s, listening on %s", dbPath, addr)
-	srv := &http.Server{Addr: addr, Handler: server.NewMux()}
+	mux, err := server.NewMux(server.Deps{DB: db.DB, JWTSecret: cfg.JWTSecret})
+	if err != nil {
+		return err
+	}
+
+	log.Printf("librarian: schema ready on %s, listening on %s", cfg.DBPath, cfg.Addr)
+	srv := &http.Server{Addr: cfg.Addr, Handler: mux}
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}

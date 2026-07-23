@@ -4,6 +4,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 
 	"github.com/MauricioPerera/librarian/internal/schema"
@@ -59,4 +60,36 @@ func schemaApplied(ctx context.Context, store *compat.Store, want compat.Schema)
 		}
 	}
 	return true, nil
+}
+
+// SeedCatalogs inserts the fixed role and permission catalogs (schema.Roles,
+// schema.Permissions) into the live database if a row for a given name does not
+// already exist. It is idempotent: running it twice on the same file neither
+// duplicates rows nor fails. The id column is left to its DEFAULT
+// gen_random_uuid() — UUIDs are not generated in Go.
+//
+// All SQL is parameterized; the only interpolated value is the table name,
+// which is a fixed internal constant, not user input.
+func SeedCatalogs(ctx context.Context, db *sql.DB) error {
+	if err := seedNames(ctx, db, "roles", schema.Roles); err != nil {
+		return fmt.Errorf("seed roles: %w", err)
+	}
+	if err := seedNames(ctx, db, "permissions", schema.Permissions); err != nil {
+		return fmt.Errorf("seed permissions: %w", err)
+	}
+	return nil
+}
+
+// seedNames inserts each name with INSERT ... ON CONFLICT(name) DO NOTHING,
+// supported by both SQLite (3.24+) and PostgreSQL. table is a fixed internal
+// constant (never user input), so it is interpolated into the statement text;
+// name is always bound as a parameter.
+func seedNames(ctx context.Context, db *sql.DB, table string, names []string) error {
+	stmt := `INSERT INTO ` + table + ` (name) VALUES (?) ON CONFLICT(name) DO NOTHING`
+	for _, name := range names {
+		if _, err := db.ExecContext(ctx, stmt, name); err != nil {
+			return fmt.Errorf("insert %q: %w", name, err)
+		}
+	}
+	return nil
 }
