@@ -36,6 +36,17 @@ func NewMux(deps Deps) (*http.ServeMux, error) {
 	h := &handlers{db: deps.DB, jwtSecret: deps.JWTSecret, now: time.Now}
 	mux.HandleFunc("POST /auth/login", h.handleLogin)
 	mux.HandleFunc("GET /whoami", h.handleWhoami)
+
+	// CONTRACT-03 T3: CRUD over the articles content type. Create/update/
+	// publish/delete are gated by permission via the reusable middleware;
+	// list/get require only a valid identity (reading is not permission-gated
+	// in v1). Go 1.26 ServeMux patterns with {id} wildcards route here.
+	mux.Handle("POST /articles", h.requirePermission("content.create")(http.HandlerFunc(h.handleCreateArticle)))
+	mux.Handle("GET /articles", h.requireAuth(http.HandlerFunc(h.handleListArticles)))
+	mux.Handle("GET /articles/{id}", h.requireAuth(http.HandlerFunc(h.handleGetArticle)))
+	mux.Handle("PUT /articles/{id}", h.requirePermission("content.update")(http.HandlerFunc(h.handleUpdateArticle)))
+	mux.Handle("POST /articles/{id}/publish", h.requirePermission("content.publish")(http.HandlerFunc(h.handlePublishArticle)))
+	mux.Handle("DELETE /articles/{id}", h.requirePermission("content.delete")(http.HandlerFunc(h.handleDeleteArticle)))
 	return mux, nil
 }
 
@@ -81,39 +92,37 @@ func (h *handlers) handleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleWhoami resolves the caller's identity from either a valid JWT or a
-// valid API key supplied as Authorization: Bearer <token>. It tries JWT first;
-// if that fails it tries the API-key path; if both fail it returns 401. The
-// response shape depends on which mechanism authenticated the request.
+// valid API key supplied as Authorization: Bearer <token>. Resolution is shared
+// with the permission middleware via resolveIdentity (CONTRACT-03 T2) — this
+// handler no longer duplicates the JWT-then-API-key resolution inline. The
+// response shape is unchanged (public contract from CONTRACT-02): it depends
+// on which mechanism authenticated the request.
 func (h *handlers) handleWhoami(w http.ResponseWriter, r *http.Request) {
 	token, ok := bearerToken(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-
-	// Try JWT first.
-	if claims, err := auth.VerifyJWT(h.jwtSecret, token); err == nil {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"auth":    "jwt",
-			"user_id": claims.Subject,
-			"email":   claims.Email,
-			"roles":   claims.Roles,
-		})
-		return
-	}
-
-	// Fall back to API key. The lookup is an exact-match on the hash, inside
-	// the DB; a revoked or unknown key yields ErrAPIKeyRejected.
-	key, err := auth.VerifyAPIKey(r.Context(), h.db, token)
-	if err != nil {
+	id, ok := resolveIdentity(r.Context(), h.db, h.jwtSecret, token)
+	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"auth":    "apikey",
-		"label":   key.Label,
-		"role_id": key.RoleID,
-	})
+	switch id.Kind {
+	case "jwt":
+		writeJSON(w, http.StatusOK, map[string]any{
+			"auth":    "jwt",
+			"user_id": id.UserID,
+			"email":   id.Email,
+			"roles":   id.Roles,
+		})
+	case "apikey":
+		writeJSON(w, http.StatusOK, map[string]any{
+			"auth":    "apikey",
+			"label":   id.Label,
+			"role_id": id.RoleID,
+		})
+	}
 }
 
 // bearerToken extracts the token from an "Authorization: Bearer <token>"

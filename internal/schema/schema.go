@@ -29,9 +29,14 @@ var (
 var (
 	// Roles is the fixed role catalog.
 	Roles = []string{"administrator", "editor", "author", "contributor"}
-	// Permissions is the fixed permission catalog.
+	// Permissions is the fixed permission catalog. content.update is added by
+	// CONTRACT-03 T1 — the rest date from CONTRACT-02. The seed (store.
+	// SeedCatalogs) is idempotent and data-driven off this slice, so adding the
+	// row here is the only change required; it needs no seed-logic change and
+	// does not touch the schema DDL (it is a catalog row, not a table).
 	Permissions = []string{
 		"content.create",
+		"content.update",
 		"content.publish",
 		"content.delete",
 		"users.manage",
