@@ -8,6 +8,7 @@ import (
 
 	"github.com/MauricioPerera/librarian/internal/schema"
 	"github.com/MauricioPerera/librarian/internal/store"
+	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
 
 // TestRoundTripExact covers the round-trip acceptance criterion: applying the
@@ -62,6 +63,69 @@ func TestEnsureSchemaIdempotent(t *testing.T) {
 	defer db2.Close()
 	if err := store.EnsureSchema(ctx, db2); err != nil {
 		t.Fatalf("ensure #2 (idempotent restart) failed: %v", err)
+	}
+}
+
+// TestEnsureSchemaAddsOnlyMissingTable simulates the real scenario a redeploy
+// hits when the code adds a new content-type table to an already-deployed
+// database (CONTRACT-11: adding "products" to a database created before it
+// existed). A database with every table EXCEPT one is built directly (bypassing
+// EnsureSchema, to control exactly which table is absent); EnsureSchema must
+// then create ONLY that missing table, not fail trying to re-CREATE TABLE the
+// ones that already exist (compat's ApplySchema has no "IF NOT EXISTS" — the
+// full-schema re-apply this test guards against would crash a real service on
+// startup after any schema-adding change).
+func TestEnsureSchemaAddsOnlyMissingTable(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "partial.db")
+	ctx := context.Background()
+
+	db, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+
+	full := schema.Build()
+	var partial compat.Schema
+	for _, table := range full.Tables {
+		if table.Name != "products" {
+			partial.Tables = append(partial.Tables, table)
+		}
+	}
+	if err := db.ApplySchema(ctx, partial); err != nil {
+		t.Fatalf("apply partial schema (everything but products): %v", err)
+	}
+
+	// The real regression: this must NOT try to re-CREATE the tables applied
+	// above, only add the missing "products".
+	if err := store.EnsureSchema(ctx, db); err != nil {
+		t.Fatalf("EnsureSchema on a database missing one table failed: %v", err)
+	}
+
+	inspection, err := db.InspectSchema(ctx)
+	if err != nil {
+		t.Fatalf("inspect: %v", err)
+	}
+	var sawProducts, sawUsers bool
+	for _, table := range inspection.Schema.Tables {
+		if table.Name == "products" {
+			sawProducts = true
+		}
+		if table.Name == "users" {
+			sawUsers = true
+		}
+	}
+	if !sawProducts {
+		t.Fatal("products table was not created")
+	}
+	if !sawUsers {
+		t.Fatal("pre-existing users table went missing")
+	}
+
+	// Idempotency still holds on top of the incremental apply: a second
+	// EnsureSchema call (every table now present) must remain a no-op.
+	if err := store.EnsureSchema(ctx, db); err != nil {
+		t.Fatalf("EnsureSchema second call (now fully applied) failed: %v", err)
 	}
 }
 

@@ -5,6 +5,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 
 	"github.com/MauricioPerera/librarian/internal/schema"
@@ -18,48 +19,88 @@ func Open(path string) (*compat.Store, error) {
 	return compat.OpenSQLite(schema.SQLiteVersion, path)
 }
 
-// EnsureSchema applies the canonical librarian schema if it is not already
-// present. It is idempotent: on a database that already has the tables it
-// returns nil without attempting to recreate them.
+// EnsureSchema applies the canonical librarian schema, creating ONLY the
+// tables that do not exist yet. It is idempotent (a restart on a database that
+// already has every table is a no-op) AND incremental (a restart after a code
+// change that adds a NEW content type creates just that table, leaving every
+// existing table and its data untouched).
 //
-// Idempotency is decided by inspecting the live catalog: if every table of the
-// canonical schema is already present, EnsureSchema is a no-op. Otherwise the
-// schema is applied. (compat's ApplySchema uses plain CREATE TABLE, which would
-// fail on a second run — so the guard is required for the "stop and restart on
-// the same file" contract.)
+// This matters for a real deployed instance: compat's ApplySchema compiles
+// and runs a plain CREATE TABLE per table with no "IF NOT EXISTS" — applying
+// the FULL canonical schema against a database that already has some (but not
+// all) of its tables fails outright on the first pre-existing table, which
+// would crash the service on startup after any schema-adding change (found
+// verifying CONTRACT-11, which adds a second content type to an already
+// deployed database — a full-schema re-apply would have taken production
+// down). Filtering to only the missing tables before calling ApplySchema is
+// the fix: it is the exact same DDL for each new table, just scoped to what
+// is actually absent.
 func EnsureSchema(ctx context.Context, store *compat.Store) error {
 	want := schema.Build()
 
-	applied, err := schemaApplied(ctx, store, want)
+	missing, err := missingTables(ctx, store, want)
 	if err != nil {
 		return err
 	}
-	if applied {
+	if len(missing) == 0 {
 		return nil
 	}
-	if err := store.ApplySchema(ctx, want); err != nil {
+	if err := store.ApplySchema(ctx, compat.Schema{Tables: missing}); err != nil {
 		return fmt.Errorf("apply schema: %w", err)
+	}
+	// ApplySchema above records compat's own "canonical_schema" metadata (the
+	// __compat_schema table InspectSchema prefers over introspecting the live
+	// catalog — see InspectSchema's source) — but it records it for the
+	// REDUCED schema passed in (only the tables just created), not the full
+	// canonical schema. Left as-is, the NEXT restart would read that narrow
+	// metadata back, believe every pre-existing table (users, articles, ...)
+	// is missing again, and crash trying to re-CREATE them. Overwrite that row
+	// with the full `want` schema so InspectSchema's canonical-metadata view
+	// stays accurate after an incremental apply, not just after a from-scratch
+	// one. Same table/key/upsert shape compat's own writeSchemaMetadata uses
+	// (unexported, so replicated here rather than touching compat).
+	if err := writeFullSchemaMetadata(ctx, store, want); err != nil {
+		return fmt.Errorf("record full schema metadata: %w", err)
 	}
 	return nil
 }
 
-// schemaApplied reports whether every table of want already exists in the
-// store's live catalog.
-func schemaApplied(ctx context.Context, store *compat.Store, want compat.Schema) (bool, error) {
+// writeFullSchemaMetadata upserts the full canonical schema into compat's own
+// __compat_schema metadata table, replacing whatever a prior (possibly
+// reduced) ApplySchema call left there.
+func writeFullSchemaMetadata(ctx context.Context, store *compat.Store, want compat.Schema) error {
+	payload, err := json.Marshal(want)
+	if err != nil {
+		return err
+	}
+	_, err = store.DB.ExecContext(ctx,
+		`INSERT INTO "__compat_schema" ("key", "value") VALUES (?, ?)
+		 ON CONFLICT("key") DO UPDATE SET "value" = excluded."value"`,
+		"canonical_schema", string(payload),
+	)
+	return err
+}
+
+// missingTables returns the tables of want that are not yet present in the
+// store's live catalog, in want's declared order (so a table's FK targets that
+// are themselves also missing are still created before it, same as a
+// from-scratch apply).
+func missingTables(ctx context.Context, store *compat.Store, want compat.Schema) ([]compat.Table, error) {
 	inspection, err := store.InspectSchema(ctx)
 	if err != nil {
-		return false, fmt.Errorf("inspect schema: %w", err)
+		return nil, fmt.Errorf("inspect schema: %w", err)
 	}
 	present := make(map[string]struct{}, len(inspection.Schema.Tables))
 	for _, table := range inspection.Schema.Tables {
 		present[table.Name] = struct{}{}
 	}
+	var missing []compat.Table
 	for _, table := range want.Tables {
 		if _, ok := present[table.Name]; !ok {
-			return false, nil
+			missing = append(missing, table)
 		}
 	}
-	return true, nil
+	return missing, nil
 }
 
 // SeedCatalogs inserts the fixed role and permission catalogs (schema.Roles,
