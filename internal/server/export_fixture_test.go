@@ -294,10 +294,21 @@ func TestExportFixture(t *testing.T) {
 	// audit.json: contract with required_features inferred from the schema
 	// (compat.InferFeatures), so the audit proves every capability the schema
 	// actually uses — not a hand-picked subset.
+	//
+	// CONTRACT-13: this is the THIRD former schema.Build() call site. It now
+	// infers the features from the COMPOSED canonical schema (code + the dynamic
+	// content types persisted in this very fixture database). Left on Build()
+	// alone, the audit would attest to the capabilities of only half the schema
+	// being copied — e.g. a dynamic decimal column's requirements would never be
+	// checked against the destination.
+	fullSchema, err := store.CanonicalSchema(ctx, sdb)
+	if err != nil {
+		t.Fatalf("compose canonical schema (code + dynamic): %v", err)
+	}
 	contract := compat.Contract{
 		Source:           sqliteTarget,
 		Destination:      pgTarget,
-		RequiredFeatures: compat.InferFeatures(schema.Build()),
+		RequiredFeatures: compat.InferFeatures(fullSchema),
 	}
 	auditJSON, err := json.MarshalIndent(contract, "", "  ")
 	if err != nil {

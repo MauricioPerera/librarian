@@ -37,12 +37,18 @@ func TestSchemaRoundTripJSON(t *testing.T) {
 		t.Fatalf("CompileDDL(postgres) original: %v", err)
 	}
 
-	data, err := schema.JSON()
+	// CONTRACT-13: schema.JSON() became schema.JSONWith(defs) — the dump must be
+	// handed the dynamic definitions so it can never emit an incomplete schema
+	// by accident. With nil definitions the dump is exactly the code schema, so
+	// this CONTRACT-04 round-trip test keeps testing precisely what it tested
+	// before. The composed (code + dynamic) round trip is covered separately by
+	// TestDynamicSchemaRoundTripJSON in dynamic_test.go.
+	data, err := schema.JSONWith(nil)
 	if err != nil {
-		t.Fatalf("schema.JSON: %v", err)
+		t.Fatalf("schema.JSONWith(nil): %v", err)
 	}
 	if len(data) == 0 {
-		t.Fatal("schema.JSON produced empty output")
+		t.Fatal("schema.JSONWith(nil) produced empty output")
 	}
 
 	var round compat.Schema

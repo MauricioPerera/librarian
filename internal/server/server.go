@@ -10,6 +10,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/MauricioPerera/librarian/internal/auth"
@@ -70,6 +71,17 @@ func NewMux(deps Deps) (*http.ServeMux, error) {
 	mux.Handle("PUT /articles/{id}/terms", h.requirePermission("terms.manage")(http.HandlerFunc(h.handleSetArticleTerms)))
 	mux.Handle("PUT /products/{id}/terms", h.requirePermission("terms.manage")(http.HandlerFunc(h.handleSetProductTerms)))
 
+	// CONTRACT-13 T3: dynamic content types. Creating one CREATES A REAL TABLE
+	// in the production database, so it is gated by its own dedicated
+	// permission, content_types.manage — not by the generic content.* grants
+	// (DEFINITION-CPT-DINAMICOS.md). Reading the definitions requires only a
+	// valid identity, like every other read route. There is no PUT and no
+	// DELETE: v1 is create-only (compat has no ALTER TABLE, and dropping a type
+	// was never in scope).
+	mux.Handle("POST /content-types", h.requirePermission("content_types.manage")(http.HandlerFunc(h.handleCreateContentType)))
+	mux.Handle("GET /content-types", h.requireAuth(http.HandlerFunc(h.handleListContentTypes)))
+	mux.Handle("GET /content-types/{name}", h.requireAuth(http.HandlerFunc(h.handleGetContentType)))
+
 	// CONTRACT-06: browser-facing UI (static assets, login/logout, protected
 	// home) on the same mux/handlers. JSON routes above are unaffected.
 	h.registerUIRoutes(mux)
@@ -81,6 +93,13 @@ type handlers struct {
 	db        *sql.DB
 	jwtSecret string
 	now       func() time.Time
+	// schemaMu serializes the schema-MUTATING requests (CONTRACT-13: creating a
+	// dynamic content type). That operation reads which tables are missing and
+	// then creates one; two concurrent creations of different types could
+	// otherwise interleave their diff and create steps. It does NOT guard
+	// uniqueness of a type name — that is the schema-level UNIQUE(name) on
+	// content_types, the only guarantee that also holds across processes.
+	schemaMu sync.Mutex
 }
 
 // handleHealth answers 200 {"status":"ok"}.

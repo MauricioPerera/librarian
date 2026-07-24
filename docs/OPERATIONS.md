@@ -95,13 +95,27 @@ PG destination cleaned (librarian tables dropped if present).
 
 ```powershell
 go build -o $lb ./cmd/librarian
-& $lb --dump-schema (Join-Path $EXPORT_DIR "schema.json")
+& $lb --dump-schema (Join-Path $EXPORT_DIR "schema.json") --db $DB_PATH
 ```
 
-`--dump-schema` serializa `schema.Build()` a JSON indentado y sale (no necesita
-`LIBRARIAN_JWT_SECRET` ni base de datos — el esquema es puro código). Acepta
-también `librarian --dump-schema` (a stdout) o `librarian --dump-schema=path`.
-Este JSON es el `schema_ref` que consume `compat copy`.
+`--dump-schema` serializa el esquema canónico a JSON indentado y sale. Sigue sin
+necesitar `LIBRARIAN_JWT_SECRET`, pero **desde CONTRACT-13 SÍ necesita la base de
+datos**: el esquema canónico ya no es puro código, es `schema.Build()` **más** las
+tablas de los tipos de contenido dinámicos persistidos en la propia base. Un dump
+que no la leyera produciría un `schema_ref` que deja esas tablas — y todas sus
+filas — fuera del export, en silencio.
+
+La base se localiza, en este orden: `--db <path>` / `--db=<path>`, luego
+`LIBRARIAN_DB`, luego `librarian.db`. **Si ese archivo no existe, el comando
+FALLA con exit≠0**; nunca cae de vuelta al esquema de solo-código ni deja que
+SQLite cree una base vacía (un path mal escrito produciría un dump verosímil pero
+incompleto). Si la base existe pero no tiene la tabla de registro
+`content_types` (una base anterior a CONTRACT-13), emite el esquema de código y
+eso **es** completo para esa base: una definición solo puede vivir en esa tabla.
+
+Acepta también `librarian --dump-schema --db <path>` (a stdout) o
+`librarian --dump-schema=path.json --db=<path>`. Este JSON es el `schema_ref`
+que consume `compat copy`.
 
 ### 3. Auditar el contrato (debe dar `exact` en todo)
 

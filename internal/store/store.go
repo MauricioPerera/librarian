@@ -35,8 +35,34 @@ func Open(path string) (*compat.Store, error) {
 // down). Filtering to only the missing tables before calling ApplySchema is
 // the fix: it is the exact same DDL for each new table, just scoped to what
 // is actually absent.
+// CONTRACT-13 changes ONE thing here, and it is the heart of that contract:
+// `want` is no longer schema.Build() (the code half) but the COMPOSED canonical
+// schema — code PLUS the tables derived from the dynamic content-type
+// definitions persisted in the database. Two distinct bugs are fixed by that
+// single change, and they compound:
+//
+//	(a) the incremental apply would consider every dynamic table "not wanted"
+//	    and therefore never (re)create one that is genuinely missing;
+//	(b) far worse, writeFullSchemaMetadata below would REWRITE __compat_schema
+//	    with a schema that omits the dynamic tables — on EVERY restart. Since
+//	    compat's InspectSchema prefers that metadata over the live catalog, the
+//	    next restart would then believe those tables never existed, and
+//	    `--dump-schema`/`compat copy` would export the instance without them or
+//	    their data.
+//
+// CanonicalSchema (below) is careful about ordering: it reads the definitions
+// BEFORE anything is applied, and it treats "the registry table does not exist
+// yet" (a fresh database, or one created by a pre-CONTRACT-13 binary) as
+// "provably zero dynamic types" — which is correct, not a silent omission,
+// because a definition can only live in that table. That keeps EnsureSchema a
+// SINGLE pass: composing first and applying once means the reduced metadata
+// compat writes inside ApplySchema is always overwritten with the full composed
+// schema before anything reads it again.
 func EnsureSchema(ctx context.Context, store *compat.Store) error {
-	want := schema.Build()
+	want, err := CanonicalSchema(ctx, store)
+	if err != nil {
+		return err
+	}
 
 	missing, err := missingTables(ctx, store, want)
 	if err != nil {
@@ -59,21 +85,29 @@ func EnsureSchema(ctx context.Context, store *compat.Store) error {
 	// stays accurate after an incremental apply, not just after a from-scratch
 	// one. Same table/key/upsert shape compat's own writeSchemaMetadata uses
 	// (unexported, so replicated here rather than touching compat).
-	if err := writeFullSchemaMetadata(ctx, store, want); err != nil {
+	if err := writeFullSchemaMetadata(ctx, store.DB, want); err != nil {
 		return fmt.Errorf("record full schema metadata: %w", err)
 	}
 	return nil
 }
 
+// execer is the tiny shared surface of *sql.DB and *sql.Tx that
+// writeFullSchemaMetadata needs, so the SAME metadata write is reused both by
+// EnsureSchema (on the pool) and by CreateContentType (inside its single atomic
+// transaction).
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
 // writeFullSchemaMetadata upserts the full canonical schema into compat's own
 // __compat_schema metadata table, replacing whatever a prior (possibly
 // reduced) ApplySchema call left there.
-func writeFullSchemaMetadata(ctx context.Context, store *compat.Store, want compat.Schema) error {
+func writeFullSchemaMetadata(ctx context.Context, db execer, want compat.Schema) error {
 	payload, err := json.Marshal(want)
 	if err != nil {
 		return err
 	}
-	_, err = store.DB.ExecContext(ctx,
+	_, err = db.ExecContext(ctx,
 		`INSERT INTO "__compat_schema" ("key", "value") VALUES (?, ?)
 		 ON CONFLICT("key") DO UPDATE SET "value" = excluded."value"`,
 		"canonical_schema", string(payload),

@@ -43,6 +43,16 @@ var (
 	// not the shared taxonomy the content is filed under; users.manage/roles.manage
 	// are the account/RBAC domain. terms.manage gates BOTH the CRUD of terms and
 	// the (re)assignment of terms to content.
+	//
+	// content_types.manage is added by CONTRACT-13 — the SECOND genuinely new
+	// permission of the project (after terms.manage). It is dedicated and
+	// separate on purpose: creating a dynamic content type CREATES A REAL TABLE
+	// in the production database, an irreversible, higher-risk action than
+	// administering existing content or taxonomy. DEFINITION-CPT-DINAMICOS.md
+	// decided explicitly that it be an ASSIGNABLE permission rather than a
+	// capability hardcoded to the administrator role. Like every other entry
+	// here it is picked up automatically by the idempotent, data-driven seed
+	// (store.SeedCatalogs) — adding the string is the only change required.
 	Permissions = []string{
 		"content.create",
 		"content.update",
@@ -51,6 +61,7 @@ var (
 		"users.manage",
 		"roles.manage",
 		"terms.manage",
+		"content_types.manage",
 	}
 	// Taxonomies is the fixed taxonomy catalog (CONTRACT-12): the kinds of term a
 	// piece of content can be filed under. Like Roles/Permissions it is code-fixed
@@ -334,10 +345,116 @@ func termsTable() compat.Table {
 	}
 }
 
-// Build returns the complete canonical librarian schema (T1 core tables + the
-// example content type from T2). Tables are ordered so that referenced tables
-// (users, roles, permissions) are created before the tables that reference them
-// — required for FK creation on both engines and for a byte-exact round-trip.
+// integerColumn builds a plain INTEGER column (CONTRACT-13). Mirrors the
+// textColumn/jsonColumn helper shape exactly.
+func integerColumn(name string, nullable bool) compat.Column {
+	return compat.Column{Name: name, Type: compat.Type{Family: compat.IntegerType}, Nullable: nullable}
+}
+
+// checkIn builds a CHECK constraint restricting a column to a fixed set of
+// string values, using the same compat expression shape users.status already
+// uses (Kind "in" with the column followed by the literals). Factored out here
+// because CONTRACT-13 needs a second one (content_type_fields.field_type) and
+// the two must be built identically.
+func checkIn(column string, values []string) compat.Constraint {
+	args := make([]compat.Expression, 0, len(values)+1)
+	args = append(args, compat.Expression{Kind: "column", Value: column})
+	for _, v := range values {
+		args = append(args, compat.Expression{Kind: "string", Value: v})
+	}
+	return compat.Constraint{
+		Kind:       compat.Check,
+		Columns:    []string{column},
+		Expression: &compat.Expression{Kind: "in", Args: args},
+	}
+}
+
+// contentTypesTable is the registry of DYNAMIC content types (CONTRACT-13 T1):
+// one row per type defined at runtime by an admin. It is a CODE table declared
+// here in Build() — the registry itself is never dynamic. It is NOT built
+// through ContentType(): a type DEFINITION is not content (no author, no
+// publish workflow, no metadata escape column); it is admin-managed reference
+// data, like terms.
+//
+// UNIQUE(name) is the real uniqueness guarantee for a type name. It is a
+// SCHEMA-level constraint, not an application-level "does this name already
+// exist?" check, precisely because the latter can lose a concurrent race
+// between two admins creating the same type name simultaneously — the same
+// reasoning that put UNIQUE on products.sku and UNIQUE(taxonomy_id, slug) on
+// terms. The server translates the violation into a clean 400.
+//
+// There is deliberately no updated_at: DEFINITION-CPT-DINAMICOS.md makes v1
+// create-only (compat has no ALTER TABLE support, so an already-applied type
+// can never be edited); a column that could never change would be a lie.
+func contentTypesTable() compat.Table {
+	return compat.Table{
+		Name: ContentTypesTable,
+		Columns: []compat.Column{
+			idColumn(),
+			textColumn("name", false),
+			nowColumn("created_at"),
+		},
+		Constraints: []compat.Constraint{
+			primaryKey("id"),
+			unique("name"),
+		},
+	}
+}
+
+// contentTypeFieldsTable is the per-field half of the registry (CONTRACT-13 T1):
+// one row per field of a dynamic content type.
+//
+//   - content_type_id: FK to content_types, ON DELETE CASCADE. Deleting a type
+//     is out of scope in v1, but the integrity rule is declared honestly (and it
+//     is what makes the compensating cleanup of a half-created type a single
+//     DELETE on the parent row).
+//   - name / field_type: the column to create and which of the five allowed
+//     scalar types it uses.
+//   - ordinal: the field's position, so the produced table's column order is
+//     stable and reproducible (required for a byte-exact schema round-trip).
+//     Named "ordinal" rather than "position" because POSITION is a reserved word
+//     in PostgreSQL; compat quotes identifiers so either would compile, but a
+//     non-reserved word keeps hand-written diagnostic SQL readable.
+//
+// UNIQUE(content_type_id, name) makes a field name unique WITHIN a type while
+// allowing the same field name across different types — schema-level, so two
+// concurrent writers cannot both win. UNIQUE(content_type_id, ordinal) keeps
+// the ordering unambiguous. The CHECK on field_type pins the stored vocabulary
+// to exactly schema.FieldTypes, so a row written outside the API can never
+// smuggle in an unsupported type family.
+func contentTypeFieldsTable() compat.Table {
+	return compat.Table{
+		Name: ContentTypeFieldsTable,
+		Columns: []compat.Column{
+			idColumn(),
+			uuidColumn("content_type_id", false),
+			textColumn("name", false),
+			textColumn("field_type", false),
+			integerColumn("ordinal", false),
+		},
+		Constraints: []compat.Constraint{
+			primaryKey("id"),
+			unique("content_type_id", "name"),
+			unique("content_type_id", "ordinal"),
+			foreignKeyCascade("content_type_id", ContentTypesTable, "id"),
+			checkIn("field_type", FieldTypeNames()),
+		},
+	}
+}
+
+// Build returns the CODE half of the canonical librarian schema (T1 core tables
+// + the code-defined content types + the dynamic-type registry). Tables are
+// ordered so that referenced tables (users, roles, permissions) are created
+// before the tables that reference them — required for FK creation on both
+// engines and for a byte-exact round-trip.
+//
+// IMPORTANT (CONTRACT-13): Build() is NO LONGER the canonical schema of a
+// running instance. Since dynamic content types exist, the canonical schema is
+// Build() PLUS the tables derived from the persisted definitions — see
+// BuildWith(). Treating Build() as complete is exactly the bug this contract
+// exists to remove: EnsureSchema would erase the dynamic tables from the
+// __compat_schema metadata on every restart, and --dump-schema would hand
+// `compat copy` a schema that silently omits those tables AND their data.
 func Build() compat.Schema {
 	return compat.Schema{
 		Tables: []compat.Table{
@@ -373,6 +490,13 @@ func Build() compat.Schema {
 			termsTable(),
 			junctionTable("article_terms", "article_id", "articles", "term_id", "terms"),
 			junctionTable("product_terms", "product_id", "products", "term_id", "terms"),
+			// CONTRACT-13 T1: the registry of DYNAMIC content types. Two plain
+			// code tables (the registry is never itself dynamic), ordered parent
+			// before child so the FK target exists first. Because they are part
+			// of Build(), ReservedNames() reserves their names automatically —
+			// a dynamic type can never be called "content_types".
+			contentTypesTable(),
+			contentTypeFieldsTable(),
 		},
 	}
 }
