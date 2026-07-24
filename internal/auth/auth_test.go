@@ -114,7 +114,12 @@ func TestIssueAndVerifyJWT(t *testing.T) {
 	const secret = "super-secret-test-key"
 	user := &auth.User{ID: "user-123", Email: "alice@example.com", Roles: []string{"editor", "author"}}
 
-	now := time.Date(2026, 7, 23, 12, 0, 0, 0, time.UTC)
+	// Relative to the real clock: VerifyJWT checks expiry against wall-clock
+	// time, so a hardcoded past date makes this test a time-bomb that starts
+	// failing once more than 24h have elapsed since that date (found in
+	// CONTRACT-10 verification — confirmed pre-existing, unrelated to that
+	// contract).
+	now := time.Now().UTC().Truncate(time.Second) // JWT NumericDate has second precision
 	token, err := auth.IssueJWT(secret, user, now)
 	if err != nil {
 		t.Fatalf("issue: %v", err)
