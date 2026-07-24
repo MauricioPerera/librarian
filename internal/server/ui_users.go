@@ -139,7 +139,7 @@ func (h *handlers) handleAdminUsersList(w http.ResponseWriter, r *http.Request) 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_ = adminUsersListTmpl.ExecuteTemplate(w, "layout", adminUsersListPage{
-		pageData: pageData{Title: "Usuarios — librarian", Authenticated: true, Email: emailOf(idn)},
+		pageData: pageData{Title: "Usuarios — librarian", Authenticated: true, Email: emailOf(idn), Path: r.URL.Path},
 		Users:    views,
 	})
 }
@@ -149,7 +149,7 @@ func (h *handlers) handleAdminUsersList(w http.ResponseWriter, r *http.Request) 
 func (h *handlers) handleAdminUserNewForm(w http.ResponseWriter, r *http.Request) {
 	idn, _ := identityFromContext(r.Context())
 	renderUserNew(w, http.StatusOK, adminUserNewPage{
-		pageData: pageData{Title: "Nuevo usuario — librarian", Authenticated: true, Email: emailOf(idn)},
+		pageData: pageData{Title: "Nuevo usuario — librarian", Authenticated: true, Email: emailOf(idn), Path: r.URL.Path},
 		Roles:    roleChecks(nil),
 	})
 }
@@ -163,7 +163,7 @@ func (h *handlers) handleAdminUserCreate(w http.ResponseWriter, r *http.Request)
 	idn, _ := identityFromContext(r.Context())
 	if err := r.ParseForm(); err != nil {
 		renderUserNew(w, http.StatusBadRequest, adminUserNewPage{
-			pageData: pageData{Title: "Nuevo usuario — librarian", Authenticated: true, Email: emailOf(idn)},
+			pageData: pageData{Title: "Nuevo usuario — librarian", Authenticated: true, Email: emailOf(idn), Path: r.URL.Path},
 			Roles:    roleChecks(nil),
 			Error:    "Formulario inválido.",
 		})
@@ -174,7 +174,7 @@ func (h *handlers) handleAdminUserCreate(w http.ResponseWriter, r *http.Request)
 	roles := r.PostForm["roles"]
 	if email == "" || password == "" {
 		renderUserNew(w, http.StatusBadRequest, adminUserNewPage{
-			pageData:  pageData{Title: "Nuevo usuario — librarian", Authenticated: true, Email: emailOf(idn)},
+			pageData:  pageData{Title: "Nuevo usuario — librarian", Authenticated: true, Email: emailOf(idn), Path: r.URL.Path},
 			FormEmail: email,
 			Roles:     roleChecks(roles),
 			Error:     "email and password are required",
@@ -185,7 +185,7 @@ func (h *handlers) handleAdminUserCreate(w http.ResponseWriter, r *http.Request)
 		// Unknown role (crafted request) or duplicate email — a client error, not
 		// a 500. Re-render with the reason and the user's input preserved.
 		renderUserNew(w, http.StatusBadRequest, adminUserNewPage{
-			pageData:  pageData{Title: "Nuevo usuario — librarian", Authenticated: true, Email: emailOf(idn)},
+			pageData:  pageData{Title: "Nuevo usuario — librarian", Authenticated: true, Email: emailOf(idn), Path: r.URL.Path},
 			FormEmail: email,
 			Roles:     roleChecks(roles),
 			Error:     userCreateErrorMessage(err),
@@ -211,7 +211,7 @@ func (h *handlers) handleAdminUserDetail(w http.ResponseWriter, r *http.Request)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_ = adminUsersDetailTmpl.ExecuteTemplate(w, "layout", adminUserDetailPage{
-		pageData: pageData{Title: "Usuario — librarian", Authenticated: true, Email: emailOf(idn)},
+		pageData: pageData{Title: "Usuario — librarian", Authenticated: true, Email: emailOf(idn), Path: r.URL.Path},
 		User:     userView{ID: u.ID, Email: u.Email, Status: u.Status, Roles: u.Roles},
 		Statuses: statusOptions(u.Status),
 		Roles:    roleChecks(u.Roles),
@@ -286,7 +286,7 @@ func (h *handlers) handleAdminRolesList(w http.ResponseWriter, r *http.Request) 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_ = adminRolesTmpl.ExecuteTemplate(w, "layout", adminRolesPage{
-		pageData: pageData{Title: "Roles y permisos — librarian", Authenticated: true, Email: emailOf(idn)},
+		pageData: pageData{Title: "Roles y permisos — librarian", Authenticated: true, Email: emailOf(idn), Path: r.URL.Path},
 		Roles:    roles,
 	})
 }

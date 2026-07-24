@@ -242,3 +242,122 @@ html, body {
 .empty { color: var(--muted); }
 
 .error-card { max-width: 480px; }
+
+/* CONTRACT-10 — WordPress-style two-column admin layout (sidebar + topbar).
+   Presentation only. The sidebar is a fixed-width dark column on the left; the
+   active section is highlighted and its sub-options expand beneath it. */
+
+:root {
+  --sidebar-bg: #1c2430;
+  --sidebar-text: #c7cfda;
+  --sidebar-muted: #8b95a5;
+  --sidebar-active-bg: #2b5ce6;
+  --sidebar-active-text: #ffffff;
+  --sidebar-hover-bg: #273140;
+  --sidebar-width: 240px;
+}
+
+.admin-shell {
+  display: flex;
+  min-height: 100vh;
+  align-items: stretch;
+}
+
+.sidebar {
+  flex: 0 0 var(--sidebar-width);
+  width: var(--sidebar-width);
+  background: var(--sidebar-bg);
+  color: var(--sidebar-text);
+  display: flex;
+  flex-direction: column;
+  padding: 0.5rem 0;
+}
+
+.sidebar-brand {
+  display: block;
+  padding: 1rem 1.25rem;
+  font-weight: 700;
+  font-size: 1.15rem;
+  color: #ffffff;
+  text-decoration: none;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  margin-bottom: 0.5rem;
+}
+
+.sidebar-nav { display: flex; flex-direction: column; }
+
+.nav-section-link {
+  display: block;
+  padding: 0.6rem 1.25rem;
+  color: var(--sidebar-text);
+  text-decoration: none;
+  font-weight: 600;
+  font-size: 0.95rem;
+  border-left: 3px solid transparent;
+}
+
+.nav-section-link:hover { background: var(--sidebar-hover-bg); }
+
+.nav-section.is-active > .nav-section-link {
+  background: var(--sidebar-active-bg);
+  color: var(--sidebar-active-text);
+  border-left-color: #ffffff;
+}
+
+.nav-children {
+  list-style: none;
+  margin: 0;
+  padding: 0.25rem 0 0.5rem;
+  background: rgba(0, 0, 0, 0.15);
+}
+
+.nav-child {
+  display: block;
+  padding: 0.45rem 1.25rem 0.45rem 2.25rem;
+  color: var(--sidebar-muted);
+  text-decoration: none;
+  font-size: 0.9rem;
+  border-left: 3px solid transparent;
+}
+
+.nav-child:hover { background: var(--sidebar-hover-bg); color: var(--sidebar-text); }
+
+.nav-child.is-active {
+  color: var(--sidebar-active-text);
+  font-weight: 600;
+  border-left-color: var(--sidebar-active-bg);
+}
+
+.admin-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 0.75rem 1.5rem;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  box-shadow: var(--shadow);
+}
+
+.topbar-title {
+  margin: 0;
+  font-size: 1.05rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* Inside the two-column shell the content column already has the topbar above
+   it, so it no longer needs the centered auto-margins the standalone layout used;
+   keep a comfortable reading max-width and left-align it within the main area. */
+.admin-main .content {
+  max-width: 960px;
+  margin: 1.5rem;
+  padding: 0;
+}

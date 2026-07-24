@@ -8,16 +8,44 @@
   <script src="/static/htmx.min.js" defer></script>
 </head>
 <body>
+{{if .Authenticated}}
+  <div class="admin-shell">
+    <aside class="sidebar">
+      <a class="sidebar-brand" href="/">librarian</a>
+      <nav class="sidebar-nav" aria-label="Navegación principal">
+        {{range .Nav}}
+        <div class="nav-section{{if .Active}} is-active{{end}}">
+          <a class="nav-section-link" href="{{.Href}}"{{if .Active}} aria-current="true"{{end}}>{{.Label}}</a>
+          {{if and .Children .Active}}
+          <ul class="nav-children">
+            {{range .Children}}
+            <li><a class="nav-child{{if .Active}} is-active{{end}}" href="{{.Href}}"{{if .Active}} aria-current="page"{{end}}>{{.Label}}</a></li>
+            {{end}}
+          </ul>
+          {{end}}
+        </div>
+        {{end}}
+      </nav>
+    </aside>
+    <div class="admin-main">
+      <header class="topbar">
+        <h2 class="topbar-title">{{.Title}}</h2>
+        <form method="post" action="/logout" class="logout-form">
+          <button type="submit" class="btn btn-ghost">Cerrar sesión ({{.Email}})</button>
+        </form>
+      </header>
+      <main class="content">
+        {{template "content" .}}
+      </main>
+    </div>
+  </div>
+{{else}}
   <nav class="nav">
     <a class="brand" href="/">librarian</a>
-    {{if .Authenticated}}
-    <form method="post" action="/logout" class="logout-form">
-      <button type="submit" class="btn btn-ghost">Cerrar sesión ({{.Email}})</button>
-    </form>
-    {{end}}
   </nav>
   <main class="content">
     {{template "content" .}}
   </main>
+{{end}}
 </body>
 </html>{{end}}

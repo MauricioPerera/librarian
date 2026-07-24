@@ -126,7 +126,7 @@ func (h *handlers) handleAdminAPIKeysList(w http.ResponseWriter, r *http.Request
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_ = adminAPIKeysListTmpl.ExecuteTemplate(w, "layout", adminAPIKeysListPage{
-		pageData: pageData{Title: "API keys — librarian", Authenticated: true, Email: emailOf(idn)},
+		pageData: pageData{Title: "API keys — librarian", Authenticated: true, Email: emailOf(idn), Path: r.URL.Path},
 		Keys:     views,
 	})
 }
@@ -136,7 +136,7 @@ func (h *handlers) handleAdminAPIKeysList(w http.ResponseWriter, r *http.Request
 func (h *handlers) handleAdminAPIKeyNewForm(w http.ResponseWriter, r *http.Request) {
 	idn, _ := identityFromContext(r.Context())
 	renderAPIKeyNew(w, http.StatusOK, adminAPIKeyNewPage{
-		pageData: pageData{Title: "Nueva API key — librarian", Authenticated: true, Email: emailOf(idn)},
+		pageData: pageData{Title: "Nueva API key — librarian", Authenticated: true, Email: emailOf(idn), Path: r.URL.Path},
 		Roles:    schema.Roles,
 	})
 }
@@ -149,7 +149,7 @@ func (h *handlers) handleAdminAPIKeyNewForm(w http.ResponseWriter, r *http.Reque
 // error, preserving the entered label and role selection.
 func (h *handlers) handleAdminAPIKeyCreate(w http.ResponseWriter, r *http.Request) {
 	idn, _ := identityFromContext(r.Context())
-	title := pageData{Title: "Nueva API key — librarian", Authenticated: true, Email: emailOf(idn)}
+	title := pageData{Title: "Nueva API key — librarian", Authenticated: true, Email: emailOf(idn), Path: r.URL.Path}
 	if err := r.ParseForm(); err != nil {
 		renderAPIKeyNew(w, http.StatusBadRequest, adminAPIKeyNewPage{
 			pageData: title, Roles: schema.Roles, Error: "Formulario inválido.",
@@ -187,7 +187,7 @@ func (h *handlers) handleAdminAPIKeyCreate(w http.ResponseWriter, r *http.Reques
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_ = adminAPIKeysCreatedTmpl.ExecuteTemplate(w, "layout", adminAPIKeyCreatedPage{
-		pageData: pageData{Title: "API key creada — librarian", Authenticated: true, Email: emailOf(idn)},
+		pageData: pageData{Title: "API key creada — librarian", Authenticated: true, Email: emailOf(idn), Path: r.URL.Path},
 		Label:    label,
 		RoleName: role,
 		Secret:   secret,

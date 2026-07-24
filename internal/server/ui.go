@@ -53,11 +53,15 @@ var (
 const genericLoginError = "Email o contraseña incorrectos."
 
 // pageData is the layout's view model: title and, when authenticated, the email
-// used to render the nav's logout control.
+// used to render the topbar's logout control. Path is the current request path
+// (CONTRACT-10) from which the shared layout infers the active sidebar
+// section/sub-item via the Nav() method — presentation only, no route or
+// authorization data.
 type pageData struct {
 	Title         string
 	Authenticated bool
 	Email         string
+	Path          string
 }
 
 // loginPage adds the optional error banner shown after a failed submit.
@@ -285,5 +289,6 @@ func renderHome(w http.ResponseWriter, email string) {
 		Title:         "Inicio — librarian",
 		Authenticated: true,
 		Email:         email,
+		Path:          "/",
 	})
 }

@@ -143,7 +143,7 @@ func (h *handlers) handleAdminArticlesList(w http.ResponseWriter, r *http.Reques
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_ = adminListTmpl.ExecuteTemplate(w, "layout", adminListPage{
-		pageData: pageData{Title: "Artículos — librarian", Authenticated: true, Email: emailOf(id)},
+		pageData: pageData{Title: "Artículos — librarian", Authenticated: true, Email: emailOf(id), Path: r.URL.Path},
 		Articles: views,
 	})
 }
@@ -152,7 +152,7 @@ func (h *handlers) handleAdminArticlesList(w http.ResponseWriter, r *http.Reques
 func (h *handlers) handleAdminArticleNewForm(w http.ResponseWriter, r *http.Request) {
 	id, _ := identityFromContext(r.Context())
 	renderAdminForm(w, adminNewTmpl, http.StatusOK, adminFormPage{
-		pageData: pageData{Title: "Nuevo artículo — librarian", Authenticated: true, Email: emailOf(id)},
+		pageData: pageData{Title: "Nuevo artículo — librarian", Authenticated: true, Email: emailOf(id), Path: r.URL.Path},
 	})
 }
 
@@ -168,7 +168,7 @@ func (h *handlers) handleAdminArticleCreate(w http.ResponseWriter, r *http.Reque
 	}
 	if err := r.ParseForm(); err != nil {
 		renderAdminForm(w, adminNewTmpl, http.StatusBadRequest, adminFormPage{
-			pageData: pageData{Title: "Nuevo artículo — librarian", Authenticated: true, Email: id.Email},
+			pageData: pageData{Title: "Nuevo artículo — librarian", Authenticated: true, Email: id.Email, Path: r.URL.Path},
 			Error:    "Formulario inválido.",
 		})
 		return
@@ -177,7 +177,7 @@ func (h *handlers) handleAdminArticleCreate(w http.ResponseWriter, r *http.Reque
 	body := r.PostFormValue("body")
 	if title == "" || body == "" {
 		renderAdminForm(w, adminNewTmpl, http.StatusBadRequest, adminFormPage{
-			pageData: pageData{Title: "Nuevo artículo — librarian", Authenticated: true, Email: id.Email},
+			pageData: pageData{Title: "Nuevo artículo — librarian", Authenticated: true, Email: id.Email, Path: r.URL.Path},
 			Article:  articleView{Title: title, Body: body},
 			Error:    "title and body are required",
 		})
@@ -204,7 +204,7 @@ func (h *handlers) handleAdminArticleEditForm(w http.ResponseWriter, r *http.Req
 		return
 	}
 	renderAdminForm(w, adminEditTmpl, http.StatusOK, adminFormPage{
-		pageData: pageData{Title: "Editar artículo — librarian", Authenticated: true, Email: emailOf(id)},
+		pageData: pageData{Title: "Editar artículo — librarian", Authenticated: true, Email: emailOf(id), Path: r.URL.Path},
 		Article:  toArticleView(a),
 	})
 }
@@ -233,7 +233,7 @@ func (h *handlers) handleAdminArticleUpdate(w http.ResponseWriter, r *http.Reque
 	if title == "" || body == "" {
 		// Re-render the edit form with the error (htmx swaps it back in).
 		renderAdminForm(w, adminEditTmpl, http.StatusBadRequest, adminFormPage{
-			pageData: pageData{Title: "Editar artículo — librarian", Authenticated: true, Email: emailOf(idn)},
+			pageData: pageData{Title: "Editar artículo — librarian", Authenticated: true, Email: emailOf(idn), Path: r.URL.Path},
 			Article:  articleView{ID: id, Title: title, Body: body},
 			Error:    "title and body are required",
 		})
