@@ -1,0 +1,23 @@
+{{define "layout"}}<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.Title}}</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/htmx.min.js" defer></script>
+</head>
+<body>
+  <nav class="nav">
+    <a class="brand" href="/">librarian</a>
+    {{if .Authenticated}}
+    <form method="post" action="/logout" class="logout-form">
+      <button type="submit" class="btn btn-ghost">Cerrar sesión ({{.Email}})</button>
+    </form>
+    {{end}}
+  </nav>
+  <main class="content">
+    {{template "content" .}}
+  </main>
+</body>
+</html>{{end}}

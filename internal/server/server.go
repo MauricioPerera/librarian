@@ -47,6 +47,10 @@ func NewMux(deps Deps) (*http.ServeMux, error) {
 	mux.Handle("PUT /articles/{id}", h.requirePermission("content.update")(http.HandlerFunc(h.handleUpdateArticle)))
 	mux.Handle("POST /articles/{id}/publish", h.requirePermission("content.publish")(http.HandlerFunc(h.handlePublishArticle)))
 	mux.Handle("DELETE /articles/{id}", h.requirePermission("content.delete")(http.HandlerFunc(h.handleDeleteArticle)))
+
+	// CONTRACT-06: browser-facing UI (static assets, login/logout, protected
+	// home) on the same mux/handlers. JSON routes above are unaffected.
+	h.registerUIRoutes(mux)
 	return mux, nil
 }
 
