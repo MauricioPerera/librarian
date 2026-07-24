@@ -225,6 +225,7 @@ func TestCreateArticleWithMetadata(t *testing.T) {
 		t.Fatalf("omitted metadata should be NULL, got %q", meta2.String)
 	}
 }
+
 // one whose role has content.create) cannot create an article because it has
 // no human author — articles.author_id is NOT NULL → reject with 403 + a
 // clear message.

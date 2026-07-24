@@ -296,7 +296,7 @@ func TestExportFixture(t *testing.T) {
 	// actually uses — not a hand-picked subset.
 	contract := compat.Contract{
 		Source:           sqliteTarget,
-		Destination:     pgTarget,
+		Destination:      pgTarget,
 		RequiredFeatures: compat.InferFeatures(schema.Build()),
 	}
 	auditJSON, err := json.MarshalIndent(contract, "", "  ")
