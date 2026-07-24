@@ -1,6 +1,8 @@
 package schema_test
 
 import (
+	"encoding/json"
+	"reflect"
 	"testing"
 
 	"github.com/MauricioPerera/librarian/internal/schema"
@@ -13,6 +15,59 @@ func TestSchemaValidates(t *testing.T) {
 	if err := schema.Build().Validate(); err != nil {
 		t.Fatalf("schema does not validate: %v", err)
 	}
+}
+
+// TestSchemaRoundTripJSON covers CONTRACT-04 T1: the JSON dump of the canonical
+// schema deserializes back to a compat.Schema that Validate()s and that
+// CompileDDL renders to the EXACT same statements as the original schema.Build()
+// — for BOTH engines. If a field lost its json tag or an Expression got a bad
+// omitempty, the round-trip DDL would diverge and fail here, not silently later
+// in the real CLI. This is the no-PG acceptance test for the dump mechanism.
+func TestSchemaRoundTripJSON(t *testing.T) {
+	orig := schema.Build()
+
+	origSQLite, err := compat.CompileDDL(schema.SQLiteTarget, orig)
+	if err != nil {
+		t.Fatalf("CompileDDL(sqlite) original: %v", err)
+	}
+	origPostgres, err := compat.CompileDDL(schema.PostgresTarget, orig)
+	if err != nil {
+		t.Fatalf("CompileDDL(postgres) original: %v", err)
+	}
+
+	data, err := schema.JSON()
+	if err != nil {
+		t.Fatalf("schema.JSON: %v", err)
+	}
+	if len(data) == 0 {
+		t.Fatal("schema.JSON produced empty output")
+	}
+
+	var round compat.Schema
+	if err := json.Unmarshal(data, &round); err != nil {
+		t.Fatalf("unmarshal dumped schema: %v", err)
+	}
+	if err := round.Validate(); err != nil {
+		t.Fatalf("round-tripped schema does not validate: %v", err)
+	}
+
+	rtSQLite, err := compat.CompileDDL(schema.SQLiteTarget, round)
+	if err != nil {
+		t.Fatalf("CompileDDL(sqlite) round-trip: %v", err)
+	}
+	rtPostgres, err := compat.CompileDDL(schema.PostgresTarget, round)
+	if err != nil {
+		t.Fatalf("CompileDDL(postgres) round-trip: %v", err)
+	}
+
+	if !reflect.DeepEqual(origSQLite, rtSQLite) {
+		t.Fatalf("sqlite DDL diverged across JSON round-trip:\norig=%#v\nrt  =%#v", origSQLite, rtSQLite)
+	}
+	if !reflect.DeepEqual(origPostgres, rtPostgres) {
+		t.Fatalf("postgres DDL diverged across JSON round-trip:\norig=%#v\nrt  =%#v", origPostgres, rtPostgres)
+	}
+	t.Logf("ROUND_TRIP OK: sqlite statements=%d, postgres statements=%d, DIFF=none (both engines)",
+		len(origSQLite), len(origPostgres))
 }
 
 // TestCompileDDLBothEngines covers the exportability invariant: the full schema

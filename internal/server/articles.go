@@ -34,10 +34,16 @@ type article struct {
 	UpdatedAt   string  `json:"updated_at"`
 }
 
-// articleBody is the request body for POST and PUT.
+// articleBody is the request body for POST and PUT. Metadata is an optional
+// JSON value (CONTRACT-04 T2): when present and non-null it is stored verbatim
+// in the articles.metadata JSON escape column, so the export path exercises a
+// real JSON value produced by the app end-to-end. It is omitempty and optional
+// — existing callers that omit it keep the original NULL-default behavior, so
+// the CONTRACT-03 surface is unchanged for them.
 type articleBody struct {
-	Title string `json:"title"`
-	Body  string `json:"body"`
+	Title    string          `json:"title"`
+	Body     string          `json:"body"`
+	Metadata json.RawMessage `json:"metadata,omitempty"`
 }
 
 // handleCreateArticle creates a draft (published_at NULL). Requires
@@ -64,14 +70,31 @@ func (h *handlers) handleCreateArticle(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "title and body are required")
 		return
 	}
+	// metadata is an optional JSON value. A literal JSON null, or an absent
+	// field, leaves the column at its NULL default; any other JSON value is
+	// stored verbatim. The metadata column is TEXT on both engines (compat maps
+	// JSONType to TEXT to preserve the payload byte-for-byte), so the raw JSON
+	// text is bound as a parameter just like title/body — no string interpolation.
+	hasMeta := len(req.Metadata) > 0 && string(req.Metadata) != "null"
 	var articleID string
-	err := h.db.QueryRowContext(r.Context(),
-		`INSERT INTO articles (author_id, title, body) VALUES (?, ?, ?) RETURNING id`,
-		id.UserID, req.Title, req.Body,
-	).Scan(&articleID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not create article")
-		return
+	if hasMeta {
+		err := h.db.QueryRowContext(r.Context(),
+			`INSERT INTO articles (author_id, title, body, metadata) VALUES (?, ?, ?, ?) RETURNING id`,
+			id.UserID, req.Title, req.Body, string(req.Metadata),
+		).Scan(&articleID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "could not create article")
+			return
+		}
+	} else {
+		err := h.db.QueryRowContext(r.Context(),
+			`INSERT INTO articles (author_id, title, body) VALUES (?, ?, ?) RETURNING id`,
+			id.UserID, req.Title, req.Body,
+		).Scan(&articleID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "could not create article")
+			return
+		}
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"id":        articleID,

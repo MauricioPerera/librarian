@@ -3,6 +3,7 @@ package server_test
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -171,7 +172,59 @@ func TestCreateArticle(t *testing.T) {
 	}
 }
 
-// TestCreateArticleAPIKeyRejected covers the design decision: an API key (even
+// TestCreateArticleWithMetadata covers CONTRACT-04 T2's extension to POST
+// /articles: an optional metadata JSON value is stored verbatim in the
+// articles.metadata column. Omitting it keeps the original NULL default, so the
+// CONTRACT-03 surface is backward compatible. This runs in the default suite
+// (green twice); the end-to-end export fixture is the tagged test below.
+func TestCreateArticleWithMetadata(t *testing.T) {
+	db, srv, cleanup := openAuthMux(t)
+	defer cleanup()
+	grant(t, db, "editor", "content.create")
+	editorToken := jwtFor(t, db, "ed@example.com", "pw", "editor")
+
+	// With a real JSON metadata value → 201 + stored verbatim.
+	status, body := doJSON(t, srv, http.MethodPost, "/articles",
+		map[string]any{"title": "With Meta", "body": "B", "metadata": map[string]any{"tags": []string{"a", "b"}, "n": 1}},
+		authHeader(editorToken))
+	if status != http.StatusCreated {
+		t.Fatalf("with-metadata status=%d body=%v, want 201", status, body)
+	}
+	id, _ := body["id"].(string)
+	if id == "" {
+		t.Fatalf("no id returned: %v", body)
+	}
+	var meta sql.NullString
+	if err := db.QueryRow(`SELECT metadata FROM articles WHERE id = ?`, id).Scan(&meta); err != nil {
+		t.Fatalf("select metadata: %v", err)
+	}
+	if !meta.Valid || meta.String == "" {
+		t.Fatalf("metadata not stored: %+v", meta)
+	}
+	// The stored text must be valid JSON carrying the sent fields.
+	var got map[string]any
+	if err := json.Unmarshal([]byte(meta.String), &got); err != nil {
+		t.Fatalf("stored metadata not valid JSON: %q: %v", meta.String, err)
+	}
+	if _, ok := got["tags"]; !ok {
+		t.Fatalf("stored metadata lost tags: %v", got)
+	}
+
+	// Omitting metadata → NULL (backward compatible with CONTRACT-03).
+	status, body = doJSON(t, srv, http.MethodPost, "/articles",
+		map[string]any{"title": "No Meta", "body": "B"}, authHeader(editorToken))
+	if status != http.StatusCreated {
+		t.Fatalf("no-metadata status=%d body=%v, want 201", status, body)
+	}
+	id2, _ := body["id"].(string)
+	var meta2 sql.NullString
+	if err := db.QueryRow(`SELECT metadata FROM articles WHERE id = ?`, id2).Scan(&meta2); err != nil {
+		t.Fatalf("select metadata2: %v", err)
+	}
+	if meta2.Valid && meta2.String != "" {
+		t.Fatalf("omitted metadata should be NULL, got %q", meta2.String)
+	}
+}
 // one whose role has content.create) cannot create an article because it has
 // no human author — articles.author_id is NOT NULL → reject with 403 + a
 // clear message.
