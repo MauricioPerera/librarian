@@ -32,13 +32,12 @@ import (
 // render a single <tr> for an htmx swap; the list set also includes it so the
 // list can range over rows calling the same "article_row" definition.
 var (
-	adminListTmpl = template.Must(template.ParseFS(templatesFS,
-		"templates/layout.html", "templates/articles_list.html", "templates/articles_row.html"))
-	adminRowTmpl  = template.Must(template.ParseFS(templatesFS, "templates/articles_row.html"))
-	adminNewTmpl  = template.Must(template.ParseFS(templatesFS, "templates/layout.html", "templates/articles_new.html"))
-	adminEditTmpl = template.Must(template.ParseFS(templatesFS, "templates/layout.html", "templates/articles_edit.html"))
-	forbiddenTmpl = template.Must(template.ParseFS(templatesFS, "templates/layout.html", "templates/error_403.html"))
-	notFoundTmpl  = template.Must(template.ParseFS(templatesFS, "templates/layout.html", "templates/error_404.html"))
+	adminListTmpl = mustParseFS("templates/layout.html", "templates/articles_list.html", "templates/articles_row.html")
+	adminRowTmpl  = mustParseFS("templates/articles_row.html")
+	adminNewTmpl  = mustParseFS("templates/layout.html", "templates/articles_new.html")
+	adminEditTmpl = mustParseFS("templates/layout.html", "templates/articles_edit.html")
+	forbiddenTmpl = mustParseFS("templates/layout.html", "templates/error_403.html")
+	notFoundTmpl  = mustParseFS("templates/layout.html", "templates/error_404.html")
 )
 
 // renderAdminForm writes a new/edit form page with the given status.

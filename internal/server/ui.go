@@ -12,7 +12,9 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
 	"html/template"
 	"net/http"
 	"path"
@@ -39,12 +41,51 @@ var assetsFS embed.FS
 //go:embed templates/layout.html templates/login.html templates/home.html templates/articles_list.html templates/articles_row.html templates/articles_new.html templates/articles_edit.html templates/error_403.html templates/error_404.html templates/users_list.html templates/users_new.html templates/users_detail.html templates/roles_list.html templates/apikeys_list.html templates/apikeys_row.html templates/apikeys_new.html templates/apikeys_created.html
 var templatesFS embed.FS
 
+// assetVersion is a short hash of the embedded static assets' content,
+// computed once at process start. It is appended to /static/* URLs as a
+// ?v= query param so that a CDN or browser caching them as
+// "Cache-Control: immutable" (see handleStatic) is forced to re-fetch
+// whenever the embedded content actually changes across a redeploy — the
+// URL itself changes, so there is nothing stale to serve. Found necessary
+// after a real redeploy: Cloudflare kept serving the pre-CONTRACT-10
+// stylesheet for the immutable-cached path long after the origin was
+// updated, because nothing about the request ever changed.
+var assetVersion = computeAssetVersion()
+
+func computeAssetVersion() string {
+	h := sha256.New()
+	for _, name := range []string{"assets/app.css", "assets/htmx.min.js"} {
+		data, err := assetsFS.ReadFile(name)
+		if err != nil {
+			continue
+		}
+		h.Write(data)
+	}
+	return hex.EncodeToString(h.Sum(nil))[:12]
+}
+
+// templateFuncs is attached to every template set below (via baseTmpl) so
+// layout.html can call {{assetVersion}} to build cache-busted asset URLs.
+var templateFuncs = template.FuncMap{
+	"assetVersion": func() string { return assetVersion },
+}
+
+// baseTmpl carries templateFuncs; every page's template set is parsed from a
+// clone of it so all of them can call {{assetVersion}} inside layout.html
+// without repeating the Funcs() wiring at each parse site.
+var baseTmpl = template.New("base").Funcs(templateFuncs)
+
+func mustParseFS(patterns ...string) *template.Template {
+	t := template.Must(baseTmpl.Clone())
+	return template.Must(t.ParseFS(templatesFS, patterns...))
+}
+
 // Each page is its own template set (layout + one page). Parsing pages into
 // separate sets avoids a collision on the shared "content" definition that a
 // single combined set would produce.
 var (
-	loginTmpl = template.Must(template.ParseFS(templatesFS, "templates/layout.html", "templates/login.html"))
-	homeTmpl  = template.Must(template.ParseFS(templatesFS, "templates/layout.html", "templates/home.html"))
+	loginTmpl = mustParseFS("templates/layout.html", "templates/login.html")
+	homeTmpl  = mustParseFS("templates/layout.html", "templates/home.html")
 )
 
 // genericLoginError is the SINGLE message shown for every credential failure —

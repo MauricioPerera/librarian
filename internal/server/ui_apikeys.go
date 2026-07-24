@@ -29,7 +29,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"html/template"
 	"net/http"
 
 	"github.com/MauricioPerera/librarian/internal/auth"
@@ -42,11 +41,10 @@ import (
 // fragment standalone so the revoke handler can render a single <tr> for an htmx
 // swap.
 var (
-	adminAPIKeysListTmpl = template.Must(template.ParseFS(templatesFS,
-		"templates/layout.html", "templates/apikeys_list.html", "templates/apikeys_row.html"))
-	adminAPIKeysRowTmpl     = template.Must(template.ParseFS(templatesFS, "templates/apikeys_row.html"))
-	adminAPIKeysNewTmpl     = template.Must(template.ParseFS(templatesFS, "templates/layout.html", "templates/apikeys_new.html"))
-	adminAPIKeysCreatedTmpl = template.Must(template.ParseFS(templatesFS, "templates/layout.html", "templates/apikeys_created.html"))
+	adminAPIKeysListTmpl    = mustParseFS("templates/layout.html", "templates/apikeys_list.html", "templates/apikeys_row.html")
+	adminAPIKeysRowTmpl     = mustParseFS("templates/apikeys_row.html")
+	adminAPIKeysNewTmpl     = mustParseFS("templates/layout.html", "templates/apikeys_new.html")
+	adminAPIKeysCreatedTmpl = mustParseFS("templates/layout.html", "templates/apikeys_created.html")
 )
 
 // apiKeyView is the row/list view model. It carries NO secret and NO key_hash —

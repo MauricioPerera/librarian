@@ -33,7 +33,6 @@ package server
 import (
 	"context"
 	"errors"
-	"html/template"
 	"net/http"
 
 	"github.com/MauricioPerera/librarian/internal/auth"
@@ -43,10 +42,10 @@ import (
 // Admin user/role template sets. One set per page (layout + page) following the
 // CONTRACT-06/07 pattern that avoids a shared "content" definition collision.
 var (
-	adminUsersListTmpl   = template.Must(template.ParseFS(templatesFS, "templates/layout.html", "templates/users_list.html"))
-	adminUsersNewTmpl    = template.Must(template.ParseFS(templatesFS, "templates/layout.html", "templates/users_new.html"))
-	adminUsersDetailTmpl = template.Must(template.ParseFS(templatesFS, "templates/layout.html", "templates/users_detail.html"))
-	adminRolesTmpl       = template.Must(template.ParseFS(templatesFS, "templates/layout.html", "templates/roles_list.html"))
+	adminUsersListTmpl   = mustParseFS("templates/layout.html", "templates/users_list.html")
+	adminUsersNewTmpl    = mustParseFS("templates/layout.html", "templates/users_new.html")
+	adminUsersDetailTmpl = mustParseFS("templates/layout.html", "templates/users_detail.html")
+	adminRolesTmpl       = mustParseFS("templates/layout.html", "templates/roles_list.html")
 )
 
 // userView is the row/detail view model for the user templates.
