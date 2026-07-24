@@ -36,7 +36,7 @@ const sessionMaxAgeSeconds = 24 * 60 * 60
 //go:embed assets/htmx.min.js assets/app.css
 var assetsFS embed.FS
 
-//go:embed templates/layout.html templates/login.html templates/home.html templates/articles_list.html templates/articles_row.html templates/articles_new.html templates/articles_edit.html templates/error_403.html templates/error_404.html templates/users_list.html templates/users_new.html templates/users_detail.html templates/roles_list.html
+//go:embed templates/layout.html templates/login.html templates/home.html templates/articles_list.html templates/articles_row.html templates/articles_new.html templates/articles_edit.html templates/error_403.html templates/error_404.html templates/users_list.html templates/users_new.html templates/users_detail.html templates/roles_list.html templates/apikeys_list.html templates/apikeys_row.html templates/apikeys_new.html templates/apikeys_created.html
 var templatesFS embed.FS
 
 // Each page is its own template set (layout + one page). Parsing pages into
@@ -77,6 +77,7 @@ func (h *handlers) registerUIRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /logout", h.handleLogout)
 	h.registerAdminArticleRoutes(mux)
 	h.registerAdminUserRoutes(mux)
+	h.registerAdminAPIKeyRoutes(mux)
 	mux.Handle("GET /", h.requireSession(http.HandlerFunc(h.handleHome)))
 }
 

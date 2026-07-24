@@ -1,0 +1,18 @@
+{{define "content"}}
+<div class="page-head">
+  <h1>API keys</h1>
+  <a class="btn btn-primary" href="/admin/api-keys/new">Nueva API key</a>
+</div>
+{{if .Keys}}
+<table class="table" id="apikeys-table">
+  <thead>
+    <tr><th>Label</th><th>Rol</th><th>Creada</th><th>Estado</th><th>Acciones</th></tr>
+  </thead>
+  <tbody>
+    {{range .Keys}}{{template "apikey_row" .}}{{end}}
+  </tbody>
+</table>
+{{else}}
+<p class="empty">No hay API keys todavía. <a href="/admin/api-keys/new">Creá la primera</a>.</p>
+{{end}}
+{{end}}

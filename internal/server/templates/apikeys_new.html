@@ -1,0 +1,21 @@
+{{define "content"}}
+<div class="card form-card">
+  <h1>Nueva API key</h1>
+  {{if .Error}}<p class="error" role="alert">{{.Error}}</p>{{end}}
+  <form method="post" action="/admin/api-keys" class="form">
+    <label>Label
+      <input type="text" name="label" value="{{.FormLabel}}" required autofocus>
+    </label>
+    <label>Rol
+      <select name="role" required>
+        <option value="" disabled{{if not .SelectedRole}} selected{{end}}>Elegí un rol</option>
+        {{range .Roles}}<option value="{{.}}"{{if eq . $.SelectedRole}} selected{{end}}>{{.}}</option>{{end}}
+      </select>
+    </label>
+    <div class="form-actions">
+      <button type="submit" class="btn btn-primary">Crear API key</button>
+      <a class="btn btn-ghost" href="/admin/api-keys">Cancelar</a>
+    </div>
+  </form>
+</div>
+{{end}}

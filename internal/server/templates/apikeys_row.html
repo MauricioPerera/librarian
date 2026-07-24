@@ -1,0 +1,7 @@
+{{define "apikey_row"}}<tr id="apikey-{{.ID}}">
+  <td class="cell-label">{{.Label}}</td>
+  <td class="cell-role">{{.RoleName}}</td>
+  <td class="cell-date">{{.CreatedAt}}</td>
+  <td>{{if .Revoked}}<span class="badge badge-revoked">Revocada</span>{{else}}<span class="badge badge-active">Activa</span>{{end}}</td>
+  <td class="cell-actions">{{if .Revoked}}<span class="muted">Revocada el {{.RevokedAt}}</span>{{else}}<button class="btn btn-danger" hx-post="/admin/api-keys/{{.ID}}/revoke" hx-target="#apikey-{{.ID}}" hx-swap="outerHTML" hx-confirm="¿Revocar esta API key? No se puede deshacer.">Revocar</button>{{end}}</td>
+</tr>{{end}}

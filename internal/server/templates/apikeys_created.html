@@ -1,0 +1,13 @@
+{{define "content"}}
+<div class="card form-card">
+  <h1>API key creada</h1>
+  <p class="warning" role="alert"><strong>Guardá este secreto ahora.</strong> Es la única vez que se muestra: no se puede volver a ver. Si lo perdés, tendrás que crear una nueva key y revocar esta.</p>
+  <p><strong>Label:</strong> <span class="cell-label">{{.Label}}</span></p>
+  <p><strong>Rol:</strong> <span class="cell-role">{{.RoleName}}</span></p>
+  <p><strong>Secreto:</strong></p>
+  <pre class="secret" id="apikey-secret"><code>{{.Secret}}</code></pre>
+  <div class="form-actions">
+    <a class="btn btn-primary" href="/admin/api-keys">Ir al listado</a>
+  </div>
+</div>
+{{end}}
