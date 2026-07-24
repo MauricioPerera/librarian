@@ -118,6 +118,14 @@ func SeedCatalogs(ctx context.Context, db *sql.DB) error {
 	if err := seedNames(ctx, db, "permissions", schema.Permissions); err != nil {
 		return fmt.Errorf("seed permissions: %w", err)
 	}
+	// CONTRACT-12: taxonomies is a third code-fixed catalog, seeded exactly like
+	// roles/permissions via the same idempotent seedNames helper (INSERT ...
+	// ON CONFLICT(name) DO NOTHING). This is the ONLY change to this file for
+	// CONTRACT-12 — EnsureSchema and its incremental-apply machinery are left
+	// entirely untouched.
+	if err := seedNames(ctx, db, "taxonomies", schema.Taxonomies); err != nil {
+		return fmt.Errorf("seed taxonomies: %w", err)
+	}
 	return nil
 }
 

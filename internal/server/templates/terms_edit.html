@@ -1,0 +1,29 @@
+{{define "content"}}
+<div class="card form-card">
+  <h1>Editar categoría/tag</h1>
+  {{if .Error}}<p class="error" role="alert">{{.Error}}</p>{{end}}
+  <form class="form" hx-put="/admin/terms/{{.Term.ID}}">
+    <label>Taxonomía
+      <select name="taxonomy">
+        {{range .Taxonomies}}<option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Value}}</option>{{end}}
+      </select>
+    </label>
+    <label>Nombre
+      <input type="text" name="name" value="{{.Term.Name}}" required autofocus>
+    </label>
+    <label>Slug
+      <input type="text" name="slug" value="{{.Term.Slug}}" required>
+    </label>
+    <label>Padre (opcional)
+      <select name="parent_id">
+        <option value="">(sin padre)</option>
+        {{range .Parents}}<option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Label}}</option>{{end}}
+      </select>
+    </label>
+    <div class="form-actions">
+      <button type="submit" class="btn btn-primary">Guardar</button>
+      <a class="btn btn-ghost" href="/admin/terms">Cancelar</a>
+    </div>
+  </form>
+</div>
+{{end}}

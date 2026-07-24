@@ -39,6 +39,10 @@ type product struct {
 	SKU       string `json:"sku"`
 	CreatedAt string `json:"created_at"`
 	UpdatedAt string `json:"updated_at"`
+	// Terms are the taxonomy terms assigned to this product (CONTRACT-12 T3).
+	// Populated only on the single-product GET path (fetchProduct), not in the
+	// list; omitempty means a product with no assigned terms omits the field.
+	Terms []assignedTerm `json:"terms,omitempty"`
 }
 
 // productBody is the request body for POST and PUT. Price is a json.RawMessage so
@@ -332,6 +336,13 @@ func (h *handlers) fetchProduct(ctx context.Context, id string) (product, bool, 
 	if err != nil {
 		return product{}, false, err
 	}
+	// CONTRACT-12 T3: attach the assigned terms so GET /products/{id} includes
+	// them. Loaded on the single-row path only, keeping the list shape untouched.
+	terms, err := h.assignedTermsFor(ctx, "product_terms", "product_id", p.ID)
+	if err != nil {
+		return product{}, false, err
+	}
+	p.Terms = terms
 	return p, true, nil
 }
 

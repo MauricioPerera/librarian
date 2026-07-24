@@ -34,6 +34,15 @@ var (
 	// SeedCatalogs) is idempotent and data-driven off this slice, so adding the
 	// row here is the only change required; it needs no seed-logic change and
 	// does not touch the schema DDL (it is a catalog row, not a table).
+	//
+	// terms.manage is added by CONTRACT-12 — the FIRST time in the project that a
+	// genuinely new permission is added to the catalog (every prior contract
+	// reused an existing content.*/users.manage/roles.manage grant). It is
+	// justified because no existing permission covers "administer the catalog of
+	// categories/tags": content.* governs authoring individual pieces of content,
+	// not the shared taxonomy the content is filed under; users.manage/roles.manage
+	// are the account/RBAC domain. terms.manage gates BOTH the CRUD of terms and
+	// the (re)assignment of terms to content.
 	Permissions = []string{
 		"content.create",
 		"content.update",
@@ -41,7 +50,15 @@ var (
 		"content.delete",
 		"users.manage",
 		"roles.manage",
+		"terms.manage",
 	}
+	// Taxonomies is the fixed taxonomy catalog (CONTRACT-12): the kinds of term a
+	// piece of content can be filed under. Like Roles/Permissions it is code-fixed
+	// (not editable at runtime in v1) and seeded data-driven from this slice via
+	// store.SeedCatalogs (the same seedNames helper). "category" is hierarchical
+	// (terms may have a parent), "tag" is flat — but the schema is identical for
+	// both; the distinction is a UI/usage convention, not a structural one.
+	Taxonomies = []string{"category", "tag"}
 )
 
 // column constructors ---------------------------------------------------------
@@ -146,6 +163,24 @@ func foreignKeyCascade(column, refTable, refColumn string) compat.Constraint {
 			Table:    refTable,
 			Columns:  []string{refColumn},
 			OnDelete: compat.Cascade,
+		},
+	}
+}
+
+// foreignKeySetNull is an FK that nulls the referencing column when the
+// referenced row is deleted (compat.SetNull). CONTRACT-12 uses it for
+// terms.parent_id: deleting a parent term must NOT delete its children (unlike
+// cascade); it orphans them by leaving parent_id NULL, exactly as WordPress does
+// when a parent category is removed. The referencing column MUST be nullable for
+// SET NULL to be valid — terms.parent_id is.
+func foreignKeySetNull(column, refTable, refColumn string) compat.Constraint {
+	return compat.Constraint{
+		Kind:    compat.ForeignKey,
+		Columns: []string{column},
+		References: &compat.Reference{
+			Table:    refTable,
+			Columns:  []string{refColumn},
+			OnDelete: compat.SetNull,
 		},
 	}
 }
@@ -261,6 +296,44 @@ func productsTable() compat.Table {
 	return t
 }
 
+// termsTable builds the terms table (CONTRACT-12 T1). Unlike a content type it
+// is NOT built through ContentType: a term is not content — it has no author_id
+// and no created_at/updated_at/metadata trailer; it is admin-managed reference
+// data (like users, created at runtime — as opposed to taxonomies, which are a
+// code-fixed catalog). Columns:
+//   - id: surrogate UUID PK.
+//   - taxonomy_id: which taxonomy this term belongs to (FK cascade — deleting a
+//     taxonomy would delete its terms; taxonomies are code-fixed so this never
+//     happens in practice, but the integrity rule is declared honestly).
+//   - name / slug: the human label and its url-safe handle.
+//   - parent_id: optional self-reference for hierarchy (a category under another
+//     category). NULLABLE, FK to terms.id with SET NULL on delete so removing a
+//     parent orphans (does not delete) its children.
+//
+// The UNIQUE(taxonomy_id, slug) constraint makes a slug unique WITHIN a taxonomy
+// but allows the SAME slug across different taxonomies (a "news" category and a
+// "news" tag can coexist) — the composite is the point. It is a schema-level
+// guarantee (cannot lose a concurrent race), translated to a clean 400 by the
+// server, exactly like products.sku.
+func termsTable() compat.Table {
+	return compat.Table{
+		Name: "terms",
+		Columns: []compat.Column{
+			idColumn(),
+			uuidColumn("taxonomy_id", false),
+			textColumn("name", false),
+			textColumn("slug", false),
+			uuidColumn("parent_id", true),
+		},
+		Constraints: []compat.Constraint{
+			primaryKey("id"),
+			unique("taxonomy_id", "slug"),
+			foreignKeyCascade("taxonomy_id", "taxonomies", "id"),
+			foreignKeySetNull("parent_id", "terms", "id"),
+		},
+	}
+}
+
 // Build returns the complete canonical librarian schema (T1 core tables + the
 // example content type from T2). Tables are ordered so that referenced tables
 // (users, roles, permissions) are created before the tables that reference them
@@ -290,6 +363,16 @@ func Build() compat.Schema {
 			// price and a unique sku). products has no published_at / publish
 			// workflow — it is simple CRUD, unlike articles.
 			productsTable(),
+			// CONTRACT-12 T1: taxonomies + terms + the per-content-type junction
+			// tables. Ordered so every FK target precedes its referrer (required
+			// for FK creation on both engines and for a byte-exact round-trip):
+			// taxonomies before terms (terms.taxonomy_id → taxonomies), terms
+			// before the junctions (both reference terms), and articles/products
+			// already exist above (the junctions reference them too).
+			catalogTable("taxonomies"),
+			termsTable(),
+			junctionTable("article_terms", "article_id", "articles", "term_id", "terms"),
+			junctionTable("product_terms", "product_id", "products", "term_id", "terms"),
 		},
 	}
 }

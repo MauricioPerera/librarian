@@ -106,11 +106,16 @@ type adminListPage struct {
 }
 
 // adminFormPage is the view model for the new/edit forms. Article is zero for
-// the create form; Error holds an optional validation banner.
+// the create form; Error holds an optional validation banner. CONTRACT-12 T4
+// adds the term checkboxes: CanManageTerms controls whether the fieldset is
+// shown at all (only for terms.manage holders), TermGroups are the taxonomy-
+// grouped checkboxes with their checked state.
 type adminFormPage struct {
 	pageData
-	Article articleView
-	Error   string
+	Article        articleView
+	Error          string
+	CanManageTerms bool
+	TermGroups     []termGroup
 }
 
 // registerAdminArticleRoutes wires the /admin/articles HTML surface. Read routes
@@ -150,8 +155,19 @@ func (h *handlers) handleAdminArticlesList(w http.ResponseWriter, r *http.Reques
 // handleAdminArticleNewForm renders the empty create form.
 func (h *handlers) handleAdminArticleNewForm(w http.ResponseWriter, r *http.Request) {
 	id, _ := identityFromContext(r.Context())
+	canManage := h.sessionCanManageTerms(r.Context(), id)
+	var groups []termGroup
+	if canManage {
+		var err error
+		if groups, err = h.termGroupsFor(r.Context(), "article_terms", "article_id", ""); err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+	}
 	renderAdminForm(w, adminNewTmpl, http.StatusOK, adminFormPage{
-		pageData: pageData{Title: "Nuevo artículo — librarian", Authenticated: true, Email: emailOf(id), Path: r.URL.Path},
+		pageData:       pageData{Title: "Nuevo artículo — librarian", Authenticated: true, Email: emailOf(id), Path: r.URL.Path},
+		CanManageTerms: canManage,
+		TermGroups:     groups,
 	})
 }
 
@@ -165,26 +181,39 @@ func (h *handlers) handleAdminArticleCreate(w http.ResponseWriter, r *http.Reque
 		http.Redirect(w, r, "/login", http.StatusFound)
 		return
 	}
+	canManage := h.sessionCanManageTerms(r.Context(), id)
 	if err := r.ParseForm(); err != nil {
 		renderAdminForm(w, adminNewTmpl, http.StatusBadRequest, adminFormPage{
-			pageData: pageData{Title: "Nuevo artículo — librarian", Authenticated: true, Email: id.Email, Path: r.URL.Path},
-			Error:    "Formulario inválido.",
+			pageData:       pageData{Title: "Nuevo artículo — librarian", Authenticated: true, Email: id.Email, Path: r.URL.Path},
+			Error:          "Formulario inválido.",
+			CanManageTerms: canManage,
 		})
 		return
 	}
 	title := r.PostFormValue("title")
 	body := r.PostFormValue("body")
 	if title == "" || body == "" {
+		groups, _ := h.termGroupsFor(r.Context(), "article_terms", "article_id", "")
 		renderAdminForm(w, adminNewTmpl, http.StatusBadRequest, adminFormPage{
-			pageData: pageData{Title: "Nuevo artículo — librarian", Authenticated: true, Email: id.Email, Path: r.URL.Path},
-			Article:  articleView{Title: title, Body: body},
-			Error:    "title and body are required",
+			pageData:       pageData{Title: "Nuevo artículo — librarian", Authenticated: true, Email: id.Email, Path: r.URL.Path},
+			Article:        articleView{Title: title, Body: body},
+			Error:          "title and body are required",
+			CanManageTerms: canManage,
+			TermGroups:     groups,
 		})
 		return
 	}
-	if _, err := h.insertArticleBasic(r.Context(), id.UserID, title, body); err != nil {
+	newID, err := h.insertArticleBasic(r.Context(), id.UserID, title, body)
+	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
+	}
+	// Term assignment is processed only for terms.manage holders (see ui_terms.go).
+	if canManage {
+		if err := h.setContentTerms(r.Context(), "articles", "article_terms", "article_id", newID, r.PostForm["terms"]); err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
 	}
 	http.Redirect(w, r, "/admin/articles", http.StatusSeeOther)
 }
@@ -202,9 +231,19 @@ func (h *handlers) handleAdminArticleEditForm(w http.ResponseWriter, r *http.Req
 		renderNotFound(w, emailOf(id))
 		return
 	}
+	canManage := h.sessionCanManageTerms(r.Context(), id)
+	var groups []termGroup
+	if canManage {
+		if groups, err = h.termGroupsFor(r.Context(), "article_terms", "article_id", a.ID); err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+	}
 	renderAdminForm(w, adminEditTmpl, http.StatusOK, adminFormPage{
-		pageData: pageData{Title: "Editar artículo — librarian", Authenticated: true, Email: emailOf(id), Path: r.URL.Path},
-		Article:  toArticleView(a),
+		pageData:       pageData{Title: "Editar artículo — librarian", Authenticated: true, Email: emailOf(id), Path: r.URL.Path},
+		Article:        toArticleView(a),
+		CanManageTerms: canManage,
+		TermGroups:     groups,
 	})
 }
 
@@ -229,18 +268,34 @@ func (h *handlers) handleAdminArticleUpdate(w http.ResponseWriter, r *http.Reque
 		renderNotFound(w, emailOf(idn))
 		return
 	}
+	canManage := h.sessionCanManageTerms(r.Context(), idn)
 	if title == "" || body == "" {
 		// Re-render the edit form with the error (htmx swaps it back in).
+		var groups []termGroup
+		if canManage {
+			groups, _ = h.termGroupsFor(r.Context(), "article_terms", "article_id", id)
+		}
 		renderAdminForm(w, adminEditTmpl, http.StatusBadRequest, adminFormPage{
-			pageData: pageData{Title: "Editar artículo — librarian", Authenticated: true, Email: emailOf(idn), Path: r.URL.Path},
-			Article:  articleView{ID: id, Title: title, Body: body},
-			Error:    "title and body are required",
+			pageData:       pageData{Title: "Editar artículo — librarian", Authenticated: true, Email: emailOf(idn), Path: r.URL.Path},
+			Article:        articleView{ID: id, Title: title, Body: body},
+			Error:          "title and body are required",
+			CanManageTerms: canManage,
+			TermGroups:     groups,
 		})
 		return
 	}
 	if _, err := h.updateArticleTitleBody(r.Context(), id, title, body); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
+	}
+	// Term assignment processed only for terms.manage holders (see ui_terms.go):
+	// a content-only editor never submits term data, so their edit cannot wipe
+	// the article's existing terms.
+	if canManage {
+		if err := h.setContentTerms(r.Context(), "articles", "article_terms", "article_id", id, r.PostForm["terms"]); err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
 	}
 	w.Header().Set("HX-Redirect", "/admin/articles")
 	w.WriteHeader(http.StatusOK)

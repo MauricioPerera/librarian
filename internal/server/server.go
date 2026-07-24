@@ -57,6 +57,19 @@ func NewMux(deps Deps) (*http.ServeMux, error) {
 	mux.Handle("PUT /products/{id}", h.requirePermission("content.update")(http.HandlerFunc(h.handleUpdateProduct)))
 	mux.Handle("DELETE /products/{id}", h.requirePermission("content.delete")(http.HandlerFunc(h.handleDeleteProduct)))
 
+	// CONTRACT-12 T2/T3: taxonomy terms (categories/tags). CRUD of terms and the
+	// atomic (re)assignment of terms to content are gated by the new terms.manage
+	// permission; listing/reading a term requires only a valid identity (reading
+	// is not permission-gated, like the rest of the project). The two per-content
+	// assignment routes replace the FULL set of a piece of content's terms.
+	mux.Handle("POST /terms", h.requirePermission("terms.manage")(http.HandlerFunc(h.handleCreateTerm)))
+	mux.Handle("GET /terms", h.requireAuth(http.HandlerFunc(h.handleListTerms)))
+	mux.Handle("GET /terms/{id}", h.requireAuth(http.HandlerFunc(h.handleGetTerm)))
+	mux.Handle("PUT /terms/{id}", h.requirePermission("terms.manage")(http.HandlerFunc(h.handleUpdateTerm)))
+	mux.Handle("DELETE /terms/{id}", h.requirePermission("terms.manage")(http.HandlerFunc(h.handleDeleteTerm)))
+	mux.Handle("PUT /articles/{id}/terms", h.requirePermission("terms.manage")(http.HandlerFunc(h.handleSetArticleTerms)))
+	mux.Handle("PUT /products/{id}/terms", h.requirePermission("terms.manage")(http.HandlerFunc(h.handleSetProductTerms)))
+
 	// CONTRACT-06: browser-facing UI (static assets, login/logout, protected
 	// home) on the same mux/handlers. JSON routes above are unaffected.
 	h.registerUIRoutes(mux)

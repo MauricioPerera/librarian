@@ -62,11 +62,14 @@ type adminProductListPage struct {
 }
 
 // adminProductFormPage is the view model for the new/edit forms. Product is zero
-// for the create form; Error holds an optional validation banner.
+// for the create form; Error holds an optional validation banner. CONTRACT-12 T4
+// adds the term checkboxes (CanManageTerms + TermGroups), same as the articles UI.
 type adminProductFormPage struct {
 	pageData
-	Product productView
-	Error   string
+	Product        productView
+	Error          string
+	CanManageTerms bool
+	TermGroups     []termGroup
 }
 
 // registerAdminProductRoutes wires the /admin/products HTML surface. Read routes
@@ -104,8 +107,19 @@ func (h *handlers) handleAdminProductsList(w http.ResponseWriter, r *http.Reques
 // handleAdminProductNewForm renders the empty create form.
 func (h *handlers) handleAdminProductNewForm(w http.ResponseWriter, r *http.Request) {
 	id, _ := identityFromContext(r.Context())
+	canManage := h.sessionCanManageTerms(r.Context(), id)
+	var groups []termGroup
+	if canManage {
+		var err error
+		if groups, err = h.termGroupsFor(r.Context(), "product_terms", "product_id", ""); err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+	}
 	renderProductForm(w, adminProductNewTmpl, http.StatusOK, adminProductFormPage{
-		pageData: pageData{Title: "Nuevo producto — librarian", Authenticated: true, Email: emailOf(id), Path: r.URL.Path},
+		pageData:       pageData{Title: "Nuevo producto — librarian", Authenticated: true, Email: emailOf(id), Path: r.URL.Path},
+		CanManageTerms: canManage,
+		TermGroups:     groups,
 	})
 }
 
@@ -119,28 +133,48 @@ func (h *handlers) handleAdminProductCreate(w http.ResponseWriter, r *http.Reque
 		http.Redirect(w, r, "/login", http.StatusFound)
 		return
 	}
+	canManage := h.sessionCanManageTerms(r.Context(), id)
 	title, body, price, sku, msg, ok := parseProductForm(r)
 	if !ok {
+		var groups []termGroup
+		if canManage {
+			groups, _ = h.termGroupsFor(r.Context(), "product_terms", "product_id", "")
+		}
 		renderProductForm(w, adminProductNewTmpl, http.StatusBadRequest, adminProductFormPage{
-			pageData: pageData{Title: "Nuevo producto — librarian", Authenticated: true, Email: id.Email, Path: r.URL.Path},
-			Product:  productView{Title: title, Body: body, Price: rawPrice(r), SKU: sku},
-			Error:    msg,
+			pageData:       pageData{Title: "Nuevo producto — librarian", Authenticated: true, Email: id.Email, Path: r.URL.Path},
+			Product:        productView{Title: title, Body: body, Price: rawPrice(r), SKU: sku},
+			Error:          msg,
+			CanManageTerms: canManage,
+			TermGroups:     groups,
 		})
 		return
 	}
-	_, err := h.insertProduct(r.Context(), id.UserID, title, body, price, sku)
+	newID, err := h.insertProduct(r.Context(), id.UserID, title, body, price, sku)
 	if err != nil {
 		status, emsg := productWriteError(err)
 		if status == http.StatusInternalServerError {
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
+		var groups []termGroup
+		if canManage {
+			groups, _ = h.termGroupsFor(r.Context(), "product_terms", "product_id", "")
+		}
 		renderProductForm(w, adminProductNewTmpl, status, adminProductFormPage{
-			pageData: pageData{Title: "Nuevo producto — librarian", Authenticated: true, Email: id.Email, Path: r.URL.Path},
-			Product:  productView{Title: title, Body: body, Price: price, SKU: sku},
-			Error:    emsg,
+			pageData:       pageData{Title: "Nuevo producto — librarian", Authenticated: true, Email: id.Email, Path: r.URL.Path},
+			Product:        productView{Title: title, Body: body, Price: price, SKU: sku},
+			Error:          emsg,
+			CanManageTerms: canManage,
+			TermGroups:     groups,
 		})
 		return
+	}
+	// Term assignment processed only for terms.manage holders (see ui_terms.go).
+	if canManage {
+		if err := h.setContentTerms(r.Context(), "products", "product_terms", "product_id", newID, r.PostForm["terms"]); err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
 	}
 	http.Redirect(w, r, "/admin/products", http.StatusSeeOther)
 }
@@ -158,9 +192,19 @@ func (h *handlers) handleAdminProductEditForm(w http.ResponseWriter, r *http.Req
 		renderNotFound(w, emailOf(id))
 		return
 	}
+	canManage := h.sessionCanManageTerms(r.Context(), id)
+	var groups []termGroup
+	if canManage {
+		if groups, err = h.termGroupsFor(r.Context(), "product_terms", "product_id", p.ID); err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+	}
 	renderProductForm(w, adminProductEditTmpl, http.StatusOK, adminProductFormPage{
-		pageData: pageData{Title: "Editar producto — librarian", Authenticated: true, Email: emailOf(id), Path: r.URL.Path},
-		Product:  toProductView(p),
+		pageData:       pageData{Title: "Editar producto — librarian", Authenticated: true, Email: emailOf(id), Path: r.URL.Path},
+		Product:        toProductView(p),
+		CanManageTerms: canManage,
+		TermGroups:     groups,
 	})
 }
 
@@ -171,6 +215,7 @@ func (h *handlers) handleAdminProductEditForm(w http.ResponseWriter, r *http.Req
 func (h *handlers) handleAdminProductUpdate(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	idn, _ := identityFromContext(r.Context())
+	canManage := h.sessionCanManageTerms(r.Context(), idn)
 	title, body, price, sku, msg, ok := parseProductForm(r)
 	present, err := h.productExists(r.Context(), id)
 	if err != nil {
@@ -182,10 +227,16 @@ func (h *handlers) handleAdminProductUpdate(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	if !ok {
+		var groups []termGroup
+		if canManage {
+			groups, _ = h.termGroupsFor(r.Context(), "product_terms", "product_id", id)
+		}
 		renderProductForm(w, adminProductEditTmpl, http.StatusBadRequest, adminProductFormPage{
-			pageData: pageData{Title: "Editar producto — librarian", Authenticated: true, Email: emailOf(idn), Path: r.URL.Path},
-			Product:  productView{ID: id, Title: title, Body: body, Price: rawPrice(r), SKU: sku},
-			Error:    msg,
+			pageData:       pageData{Title: "Editar producto — librarian", Authenticated: true, Email: emailOf(idn), Path: r.URL.Path},
+			Product:        productView{ID: id, Title: title, Body: body, Price: rawPrice(r), SKU: sku},
+			Error:          msg,
+			CanManageTerms: canManage,
+			TermGroups:     groups,
 		})
 		return
 	}
@@ -195,12 +246,25 @@ func (h *handlers) handleAdminProductUpdate(w http.ResponseWriter, r *http.Reque
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
+		var groups []termGroup
+		if canManage {
+			groups, _ = h.termGroupsFor(r.Context(), "product_terms", "product_id", id)
+		}
 		renderProductForm(w, adminProductEditTmpl, status, adminProductFormPage{
-			pageData: pageData{Title: "Editar producto — librarian", Authenticated: true, Email: emailOf(idn), Path: r.URL.Path},
-			Product:  productView{ID: id, Title: title, Body: body, Price: price, SKU: sku},
-			Error:    emsg,
+			pageData:       pageData{Title: "Editar producto — librarian", Authenticated: true, Email: emailOf(idn), Path: r.URL.Path},
+			Product:        productView{ID: id, Title: title, Body: body, Price: price, SKU: sku},
+			Error:          emsg,
+			CanManageTerms: canManage,
+			TermGroups:     groups,
 		})
 		return
+	}
+	// Term assignment processed only for terms.manage holders (see ui_terms.go).
+	if canManage {
+		if err := h.setContentTerms(r.Context(), "products", "product_terms", "product_id", id, r.PostForm["terms"]); err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
 	}
 	w.Header().Set("HX-Redirect", "/admin/products")
 	w.WriteHeader(http.StatusOK)

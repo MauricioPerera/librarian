@@ -151,11 +151,17 @@ func TestSeedCatalogsIdempotent(t *testing.T) {
 	}
 	rolesAfter1 := count(t, db.DB, "SELECT count(*) FROM roles")
 	permsAfter1 := count(t, db.DB, "SELECT count(*) FROM permissions")
+	taxAfter1 := count(t, db.DB, "SELECT count(*) FROM taxonomies")
 	if rolesAfter1 != len(schema.Roles) {
 		t.Fatalf("roles after seed #1 = %d, want %d", rolesAfter1, len(schema.Roles))
 	}
 	if permsAfter1 != len(schema.Permissions) {
 		t.Fatalf("permissions after seed #1 = %d, want %d", permsAfter1, len(schema.Permissions))
+	}
+	// CONTRACT-12 T1: taxonomies is the third code-fixed catalog, seeded the same
+	// idempotent way. After the first seed there must be exactly len(Taxonomies).
+	if taxAfter1 != len(schema.Taxonomies) {
+		t.Fatalf("taxonomies after seed #1 = %d, want %d", taxAfter1, len(schema.Taxonomies))
 	}
 
 	// Second seed on the same file: must be a no-op (no duplicate rows, no error).
@@ -164,11 +170,15 @@ func TestSeedCatalogsIdempotent(t *testing.T) {
 	}
 	rolesAfter2 := count(t, db.DB, "SELECT count(*) FROM roles")
 	permsAfter2 := count(t, db.DB, "SELECT count(*) FROM permissions")
+	taxAfter2 := count(t, db.DB, "SELECT count(*) FROM taxonomies")
 	if rolesAfter2 != rolesAfter1 {
 		t.Fatalf("roles after seed #2 = %d, want %d (no duplicates)", rolesAfter2, rolesAfter1)
 	}
 	if permsAfter2 != permsAfter1 {
 		t.Fatalf("permissions after seed #2 = %d, want %d (no duplicates)", permsAfter2, permsAfter1)
+	}
+	if taxAfter2 != taxAfter1 {
+		t.Fatalf("taxonomies after seed #2 = %d, want %d (no duplicates)", taxAfter2, taxAfter1)
 	}
 }
 

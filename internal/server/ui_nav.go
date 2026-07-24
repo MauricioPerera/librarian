@@ -46,6 +46,10 @@ var navSections = []navSection{
 		{Label: "Todos los productos", Href: "/admin/products"},
 		{Label: "Añadir nuevo", Href: "/admin/products/new"},
 	}},
+	{Label: "Categorías y tags", Href: "/admin/terms", Children: []navItem{
+		{Label: "Todas las categorías y tags", Href: "/admin/terms"},
+		{Label: "Añadir nueva", Href: "/admin/terms/new"},
+	}},
 	{Label: "Usuarios", Href: "/admin/users", Children: []navItem{
 		{Label: "Todos los usuarios", Href: "/admin/users"},
 		{Label: "Añadir nuevo", Href: "/admin/users/new"},

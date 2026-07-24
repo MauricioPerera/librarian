@@ -1,0 +1,18 @@
+{{define "content"}}
+<div class="page-head">
+  <h1>Categorías y tags</h1>
+  <a class="btn btn-primary" href="/admin/terms/new">Nueva categoría/tag</a>
+</div>
+{{if .Terms}}
+<table class="table" id="terms-table">
+  <thead>
+    <tr><th>Nombre</th><th>Taxonomía</th><th>Slug</th><th>Padre</th><th>Acciones</th></tr>
+  </thead>
+  <tbody>
+    {{range .Terms}}{{template "term_row" .}}{{end}}
+  </tbody>
+</table>
+{{else}}
+<p class="empty">No hay categorías ni tags todavía. <a href="/admin/terms/new">Creá el primero</a>.</p>
+{{end}}
+{{end}}

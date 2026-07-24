@@ -39,6 +39,11 @@ type article struct {
 	Embedding   []float64 `json:"embedding,omitempty"`
 	CreatedAt   string    `json:"created_at"`
 	UpdatedAt   string    `json:"updated_at"`
+	// Terms are the taxonomy terms assigned to this article (CONTRACT-12 T3).
+	// Populated only on the single-article GET path (fetchArticle), not in the
+	// list, so a list response is unchanged; omitempty means an article with no
+	// assigned terms omits the field.
+	Terms []assignedTerm `json:"terms,omitempty"`
 }
 
 // articleBody is the request body for POST and PUT. Metadata is an optional
@@ -294,6 +299,14 @@ func (h *handlers) fetchArticle(r *http.Request, id string) (article, bool, erro
 	if err != nil {
 		return article{}, false, err
 	}
+	// CONTRACT-12 T3: attach the assigned terms so GET /articles/{id} includes
+	// them. Loaded here (single-row path) rather than in listArticles so the list
+	// response shape is untouched.
+	terms, err := h.assignedTermsFor(r.Context(), "article_terms", "article_id", a.ID)
+	if err != nil {
+		return article{}, false, err
+	}
+	a.Terms = terms
 	return a, true, nil
 }
 

@@ -1,0 +1,10 @@
+{{define "term_row"}}<tr id="term-{{.ID}}">
+  <td class="cell-title">{{.Name}}</td>
+  <td class="cell-taxonomy"><span class="badge badge-taxonomy-{{.Taxonomy}}">{{.Taxonomy}}</span></td>
+  <td class="cell-slug">{{.Slug}}</td>
+  <td class="cell-parent">{{if .ParentName}}{{.ParentName}}{{else}}<span class="muted">—</span>{{end}}</td>
+  <td class="cell-actions">
+    <a class="btn btn-ghost" href="/admin/terms/{{.ID}}/edit">Editar</a>
+    <button class="btn btn-danger" hx-delete="/admin/terms/{{.ID}}" hx-target="#term-{{.ID}}" hx-swap="outerHTML" hx-confirm="¿Borrar este término? El contenido asociado lo perderá; los términos hijos quedarán sin padre.">Borrar</button>
+  </td>
+</tr>{{end}}
