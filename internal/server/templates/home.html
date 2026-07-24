@@ -2,5 +2,9 @@
 <h1>Hola, {{.Email}}</h1>
 <p>Tu sesión está iniciada como <strong>{{.Email}}</strong>.</p>
 <p>Desde acá se administrarán los contenidos y usuarios en los próximos contratos de la fase 2.</p>
-<p><a class="btn btn-primary" href="/admin/articles">Administrar artículos</a></p>
+<p>
+  <a class="btn btn-primary" href="/admin/articles">Administrar artículos</a>
+  <a class="btn btn-ghost" href="/admin/users">Administrar usuarios</a>
+  <a class="btn btn-ghost" href="/admin/roles">Roles y permisos</a>
+</p>
 {{end}}

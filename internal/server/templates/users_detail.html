@@ -1,0 +1,40 @@
+{{define "content"}}
+<div class="page-head">
+  <h1>Usuario</h1>
+  <a class="btn btn-ghost" href="/admin/users">Volver a usuarios</a>
+</div>
+<div class="card">
+  <p><strong>Email:</strong> <span class="cell-email">{{.User.Email}}</span></p>
+  <p><strong>Estado actual:</strong> <span class="badge badge-status-{{.User.Status}}">{{.User.Status}}</span></p>
+  <p><strong>Roles actuales:</strong> <span class="cell-roles">{{if .User.Roles}}{{range $i, $r := .User.Roles}}{{if $i}}, {{end}}{{$r}}{{end}}{{else}}<span class="muted">(sin roles)</span>{{end}}</span></p>
+</div>
+
+<div class="card form-card">
+  <h2>Cambiar estado</h2>
+  <form class="form" hx-post="/admin/users/{{.User.ID}}/status">
+    <label>Estado
+      <select name="status">
+        {{range .Statuses}}<option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Value}}</option>{{end}}
+      </select>
+    </label>
+    <div class="form-actions">
+      <button type="submit" class="btn btn-primary">Guardar estado</button>
+    </div>
+  </form>
+</div>
+
+<div class="card form-card">
+  <h2>Asignar roles</h2>
+  <form class="form" hx-post="/admin/users/{{.User.ID}}/roles">
+    <fieldset class="roles-fieldset">
+      <legend>Roles</legend>
+      {{range .Roles}}
+      <label class="checkbox"><input type="checkbox" name="roles" value="{{.Name}}"{{if .Checked}} checked{{end}}> {{.Name}}</label>
+      {{end}}
+    </fieldset>
+    <div class="form-actions">
+      <button type="submit" class="btn btn-primary">Guardar roles</button>
+    </div>
+  </form>
+</div>
+{{end}}

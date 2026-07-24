@@ -1,0 +1,24 @@
+{{define "content"}}
+<div class="card form-card">
+  <h1>Nuevo usuario</h1>
+  {{if .Error}}<p class="error" role="alert">{{.Error}}</p>{{end}}
+  <form method="post" action="/admin/users" class="form">
+    <label>Email
+      <input type="email" name="email" value="{{.FormEmail}}" required autofocus>
+    </label>
+    <label>Contraseña
+      <input type="password" name="password" required>
+    </label>
+    <fieldset class="roles-fieldset">
+      <legend>Roles iniciales</legend>
+      {{range .Roles}}
+      <label class="checkbox"><input type="checkbox" name="roles" value="{{.Name}}"{{if .Checked}} checked{{end}}> {{.Name}}</label>
+      {{end}}
+    </fieldset>
+    <div class="form-actions">
+      <button type="submit" class="btn btn-primary">Crear</button>
+      <a class="btn btn-ghost" href="/admin/users">Cancelar</a>
+    </div>
+  </form>
+</div>
+{{end}}

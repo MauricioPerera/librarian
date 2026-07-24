@@ -214,6 +214,31 @@ html, body {
 .badge-published { background: #e6f4ea; color: #1e7e34; }
 .badge-draft { background: #eef0f3; color: var(--muted); }
 
+/* CONTRACT-08: user status badges + roles/permissions view. */
+.badge-status-active { background: #e6f4ea; color: #1e7e34; }
+.badge-status-suspended { background: #fdecea; color: #b71c1c; }
+.badge-status-invited { background: #fff4e5; color: #a15c00; }
+
+.cell-email { font-weight: 600; }
+.cell-roles, .cell-perms, .cell-role { font-size: 0.9rem; }
+.muted { color: var(--muted); }
+
+.roles-fieldset {
+  border: 1px solid var(--border, #d7dbe0);
+  border-radius: 8px;
+  padding: 0.6rem 0.9rem;
+  margin: 0.4rem 0;
+}
+.roles-fieldset legend { padding: 0 0.4rem; font-weight: 600; }
+.checkbox {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-weight: 400;
+  margin: 0.2rem 0;
+}
+.checkbox input { width: auto; }
+
 .empty { color: var(--muted); }
 
 .error-card { max-width: 480px; }

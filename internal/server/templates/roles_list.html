@@ -1,0 +1,20 @@
+{{define "content"}}
+<div class="page-head">
+  <h1>Roles y permisos</h1>
+  <a class="btn btn-ghost" href="/admin/users">Volver a usuarios</a>
+</div>
+<p class="muted">Vista de solo lectura. El catálogo de roles y permisos se define en código y no se edita desde acá.</p>
+<table class="table" id="roles-table">
+  <thead>
+    <tr><th>Rol</th><th>Permisos otorgados</th></tr>
+  </thead>
+  <tbody>
+    {{range .Roles}}
+    <tr id="role-{{.Name}}">
+      <td class="cell-role">{{.Name}}</td>
+      <td class="cell-perms">{{if .Permissions}}{{range $i, $p := .Permissions}}{{if $i}}, {{end}}{{$p}}{{end}}{{else}}<span class="muted">(sin permisos)</span>{{end}}</td>
+    </tr>
+    {{end}}
+  </tbody>
+</table>
+{{end}}

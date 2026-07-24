@@ -1,0 +1,27 @@
+{{define "content"}}
+<div class="page-head">
+  <h1>Usuarios</h1>
+  <a class="btn btn-primary" href="/admin/users/new">Nuevo usuario</a>
+</div>
+{{if .Users}}
+<table class="table" id="users-table">
+  <thead>
+    <tr><th>Email</th><th>Estado</th><th>Roles</th><th>Acciones</th></tr>
+  </thead>
+  <tbody>
+    {{range .Users}}
+    <tr id="user-{{.ID}}">
+      <td class="cell-email">{{.Email}}</td>
+      <td><span class="badge badge-status-{{.Status}}">{{.Status}}</span></td>
+      <td class="cell-roles">{{if .Roles}}{{range $i, $r := .Roles}}{{if $i}}, {{end}}{{$r}}{{end}}{{else}}<span class="muted">(sin roles)</span>{{end}}</td>
+      <td class="cell-actions">
+        <a class="btn btn-ghost" href="/admin/users/{{.ID}}">Ver / editar</a>
+      </td>
+    </tr>
+    {{end}}
+  </tbody>
+</table>
+{{else}}
+<p class="empty">No hay usuarios todavía. <a href="/admin/users/new">Creá el primero</a>.</p>
+{{end}}
+{{end}}
