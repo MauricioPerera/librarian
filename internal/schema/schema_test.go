@@ -104,12 +104,110 @@ func TestExpectedTables(t *testing.T) {
 		got[tbl.Name] = true
 	}
 	for _, want := range []string{
-		"users", "roles", "permissions", "role_permissions", "user_roles", "api_keys", "articles",
+		"users", "roles", "permissions", "role_permissions", "user_roles", "api_keys", "articles", "products",
 	} {
 		if !got[want] {
 			t.Errorf("missing expected table %q", want)
 		}
 	}
+}
+
+// TestProductsTable covers CONTRACT-11 T1: the products content type carries the
+// own columns beyond title/body (a decimal price and a sku), a table-level
+// UNIQUE(sku), the schema Validate()s, and CompileDDL renders the price column
+// for BOTH engines — NUMERIC on Postgres, TEXT on SQLite (the canonical carrier).
+// This is the no-DB acceptance test for the decimalColumn helper + unique(sku).
+func TestProductsTable(t *testing.T) {
+	s := schema.Build()
+	var tbl *compat.Table
+	for i := range s.Tables {
+		if s.Tables[i].Name == "products" {
+			tbl = &s.Tables[i]
+			break
+		}
+	}
+	if tbl == nil {
+		t.Fatal("products table not in schema")
+	}
+
+	// Own columns present, plus the ContentType-injected trailer.
+	cols := make(map[string]compat.Column, len(tbl.Columns))
+	for _, c := range tbl.Columns {
+		cols[c.Name] = c
+	}
+	for _, want := range []string{"id", "author_id", "title", "body", "price", "sku", "created_at", "updated_at", "metadata"} {
+		if _, ok := cols[want]; !ok {
+			t.Errorf("products missing column %q", want)
+		}
+	}
+
+	// price is a decimal column, NOT NULL, with no fixed precision/scale.
+	price := cols["price"]
+	if price.Type.Family != compat.DecimalType {
+		t.Errorf("price family = %q, want decimal", price.Type.Family)
+	}
+	if len(price.Type.Arguments) != 0 {
+		t.Errorf("price arguments = %v, want none (unbounded NUMERIC)", price.Type.Arguments)
+	}
+	if price.Nullable {
+		t.Error("price must be NOT NULL")
+	}
+
+	// products has NO published_at (it is not articles — simple CRUD, no publish).
+	if _, ok := cols["published_at"]; ok {
+		t.Error("products must NOT have a published_at column (no publish workflow)")
+	}
+
+	// Table-level UNIQUE(sku) must be present (schema-level dup guarantee).
+	var hasSKUUnique bool
+	for _, c := range tbl.Constraints {
+		if c.Kind == compat.UniqueKey && len(c.Columns) == 1 && c.Columns[0] == "sku" {
+			hasSKUUnique = true
+		}
+	}
+	if !hasSKUUnique {
+		t.Error("products has no UNIQUE(sku)")
+	}
+
+	// Schema.Validate must pass with the products table.
+	if err := s.Validate(); err != nil {
+		t.Fatalf("schema with products does not validate: %v", err)
+	}
+
+	// CompileDDL for both engines must succeed and render price per engine.
+	sqlite, err := compat.CompileDDL(schema.SQLiteTarget, s)
+	if err != nil {
+		t.Fatalf("CompileDDL(sqlite) with products: %v", err)
+	}
+	postgres, err := compat.CompileDDL(schema.PostgresTarget, s)
+	if err != nil {
+		t.Fatalf("CompileDDL(postgres) with products: %v", err)
+	}
+	var sqliteStmt, pgStmt string
+	for _, stmt := range sqlite {
+		if strings.Contains(stmt, `CREATE TABLE "products"`) {
+			sqliteStmt = stmt
+		}
+	}
+	for _, stmt := range postgres {
+		if strings.Contains(stmt, `CREATE TABLE "products"`) {
+			pgStmt = stmt
+		}
+	}
+	if sqliteStmt == "" || !strings.Contains(sqliteStmt, `"price" TEXT`) {
+		t.Fatalf("sqlite DDL did not compile price as TEXT: %v", sqlite)
+	}
+	if pgStmt == "" || !strings.Contains(pgStmt, `"price" NUMERIC`) {
+		t.Fatalf("postgres DDL did not compile price as NUMERIC: %v", postgres)
+	}
+	if !strings.Contains(sqliteStmt, `UNIQUE ("sku")`) {
+		t.Errorf("sqlite products DDL missing UNIQUE(sku): %s", sqliteStmt)
+	}
+	if !strings.Contains(pgStmt, `UNIQUE ("sku")`) {
+		t.Errorf("postgres products DDL missing UNIQUE(sku): %s", pgStmt)
+	}
+	t.Logf("SQLite products DDL: %s", sqliteStmt)
+	t.Logf("Postgres products DDL: %s", pgStmt)
 }
 
 // TestAPIKeysTable guards the CONTRACT-02 T4 model shape: api_keys carries the

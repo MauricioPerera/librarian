@@ -48,6 +48,15 @@ func NewMux(deps Deps) (*http.ServeMux, error) {
 	mux.Handle("POST /articles/{id}/publish", h.requirePermission("content.publish")(http.HandlerFunc(h.handlePublishArticle)))
 	mux.Handle("DELETE /articles/{id}", h.requirePermission("content.delete")(http.HandlerFunc(h.handleDeleteArticle)))
 
+	// CONTRACT-11 T2: CRUD over the products content type — the exact same
+	// pattern as articles, gated by the SAME generic content.* permissions.
+	// products has no publish route (no published_at column); it is simple CRUD.
+	mux.Handle("POST /products", h.requirePermission("content.create")(http.HandlerFunc(h.handleCreateProduct)))
+	mux.Handle("GET /products", h.requireAuth(http.HandlerFunc(h.handleListProducts)))
+	mux.Handle("GET /products/{id}", h.requireAuth(http.HandlerFunc(h.handleGetProduct)))
+	mux.Handle("PUT /products/{id}", h.requirePermission("content.update")(http.HandlerFunc(h.handleUpdateProduct)))
+	mux.Handle("DELETE /products/{id}", h.requirePermission("content.delete")(http.HandlerFunc(h.handleDeleteProduct)))
+
 	// CONTRACT-06: browser-facing UI (static assets, login/logout, protected
 	// home) on the same mux/handlers. JSON routes above are unaffected.
 	h.registerUIRoutes(mux)

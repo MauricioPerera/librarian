@@ -1,0 +1,10 @@
+{{define "product_row"}}<tr id="product-{{.ID}}">
+  <td class="cell-title">{{.Title}}</td>
+  <td class="cell-price">{{.Price}}</td>
+  <td class="cell-sku">{{.SKU}}</td>
+  <td class="cell-date">{{.CreatedAt}}</td>
+  <td class="cell-actions">
+    <a class="btn btn-ghost" href="/admin/products/{{.ID}}/edit">Editar</a>
+    <button class="btn btn-danger" hx-delete="/admin/products/{{.ID}}" hx-target="#product-{{.ID}}" hx-swap="outerHTML" hx-confirm="¿Borrar este producto?">Borrar</button>
+  </td>
+</tr>{{end}}

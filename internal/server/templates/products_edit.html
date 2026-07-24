@@ -1,0 +1,24 @@
+{{define "content"}}
+<div class="card form-card">
+  <h1>Editar producto</h1>
+  {{if .Error}}<p class="error" role="alert">{{.Error}}</p>{{end}}
+  <form class="form" hx-put="/admin/products/{{.Product.ID}}">
+    <label>Título
+      <input type="text" name="title" value="{{.Product.Title}}" required autofocus>
+    </label>
+    <label>Descripción
+      <textarea name="body" rows="8" required>{{.Product.Body}}</textarea>
+    </label>
+    <label>Precio
+      <input type="text" name="price" value="{{.Product.Price}}" inputmode="decimal" required>
+    </label>
+    <label>SKU
+      <input type="text" name="sku" value="{{.Product.SKU}}" required>
+    </label>
+    <div class="form-actions">
+      <button type="submit" class="btn btn-primary">Guardar</button>
+      <a class="btn btn-ghost" href="/admin/products">Cancelar</a>
+    </div>
+  </form>
+</div>
+{{end}}

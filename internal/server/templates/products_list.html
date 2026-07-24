@@ -1,0 +1,18 @@
+{{define "content"}}
+<div class="page-head">
+  <h1>Productos</h1>
+  <a class="btn btn-primary" href="/admin/products/new">Nuevo producto</a>
+</div>
+{{if .Products}}
+<table class="table" id="products-table">
+  <thead>
+    <tr><th>Título</th><th>Precio</th><th>SKU</th><th>Creado</th><th>Acciones</th></tr>
+  </thead>
+  <tbody>
+    {{range .Products}}{{template "product_row" .}}{{end}}
+  </tbody>
+</table>
+{{else}}
+<p class="empty">No hay productos todavía. <a href="/admin/products/new">Creá el primero</a>.</p>
+{{end}}
+{{end}}

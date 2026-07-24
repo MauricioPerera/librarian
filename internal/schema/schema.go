@@ -62,6 +62,20 @@ func timestampColumn(name string, nullable bool) compat.Column {
 	return compat.Column{Name: name, Type: compat.Type{Family: compat.TimestampType}, Nullable: nullable}
 }
 
+// decimalColumn builds a decimal/NUMERIC column with NO fixed precision/scale
+// (CONTRACT-11 T1). compat compiles compat.DecimalType with zero type arguments
+// to NUMERIC (arbitrary precision) on Postgres and to TEXT — the canonical
+// textual carrier — on SQLite, because SQLite's only numeric affinity able to
+// hold a value here (REAL) is IEEE-754 and cannot preserve arbitrary-precision
+// decimals byte-for-byte. Storing the canonical decimal text keeps the value
+// identical across both engines (the exportability invariant). Precision/scale
+// is deliberately left unset: this contract does not require a bounded money
+// type, and an unbounded NUMERIC is the safest cross-engine default. Mirrors the
+// textColumn/jsonColumn helper shape exactly.
+func decimalColumn(name string, nullable bool) compat.Column {
+	return compat.Column{Name: name, Type: compat.Type{Family: compat.DecimalType}, Nullable: nullable}
+}
+
 // EmbeddingDimension is the fixed dimension of the articles.embedding vector
 // column. CONTRACT-05 T1: a concrete, justified value, not an arbitrary one.
 // 1536 is the output dimension of OpenAI's text-embedding-3-small and the
@@ -227,6 +241,26 @@ func junctionTable(name, leftCol, leftTable, rightCol, rightTable string) compat
 	}
 }
 
+// productsTable builds the products content type (CONTRACT-11 T1) through the
+// same reusable ContentType helper articles uses — proving the pattern
+// generalizes to a second type with own columns BEYOND title/body (price, sku).
+// The unique("sku") constraint is appended after ContentType returns: ContentType
+// intentionally takes only a name + own columns (its signature is fixed and is
+// NOT touched here), so a table-level UNIQUE is added by extending the table's
+// Constraints — the same way api_keys/users add their own uniques. A duplicate
+// sku is thereby rejected at the schema level (not merely by the application),
+// which is the real concurrency guarantee (an app-level check can lose a race).
+func productsTable() compat.Table {
+	t := ContentType("products", []compat.Column{
+		textColumn("title", false),
+		textColumn("body", false), // product description
+		decimalColumn("price", false),
+		textColumn("sku", false),
+	})
+	t.Constraints = append(t.Constraints, unique("sku"))
+	return t
+}
+
 // Build returns the complete canonical librarian schema (T1 core tables + the
 // example content type from T2). Tables are ordered so that referenced tables
 // (users, roles, permissions) are created before the tables that reference them
@@ -251,6 +285,11 @@ func Build() compat.Schema {
 				timestampColumn("published_at", true),
 				vectorColumn("embedding", EmbeddingDimension, true),
 			}),
+			// CONTRACT-11 T1: a SECOND content type, built through the SAME
+			// ContentType helper, with own columns beyond title/body (a decimal
+			// price and a unique sku). products has no published_at / publish
+			// workflow — it is simple CRUD, unlike articles.
+			productsTable(),
 		},
 	}
 }
