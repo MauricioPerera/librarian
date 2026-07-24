@@ -62,6 +62,32 @@ func timestampColumn(name string, nullable bool) compat.Column {
 	return compat.Column{Name: name, Type: compat.Type{Family: compat.TimestampType}, Nullable: nullable}
 }
 
+// EmbeddingDimension is the fixed dimension of the articles.embedding vector
+// column. CONTRACT-05 T1: a concrete, justified value, not an arbitrary one.
+// 1536 is the output dimension of OpenAI's text-embedding-3-small and the
+// earlier text-embedding-ada-002 — the most widely deployed production
+// embedding API. v1 only stores vectors the client already computed (no
+// generation pipeline, per DEFINITION.md), so the dimension is whatever the
+// client's model produces; 1536 pins the schema to a real, common model so the
+// column is declared as vector(1536) on Postgres (and TEXT on SQLite) and the
+// server can validate the exact component count on write.
+const EmbeddingDimension = 1536
+
+// vectorColumn builds a vector(N) column. compat compiles it to TEXT on SQLite
+// (the interoperable carrier, '[c1,c2,...]') and to native vector(N) on
+// Postgres (which requires the pgvector extension on the destination — see
+// CONTRACT-05). The single argument is the fixed dimension; Schema.Validate
+// rejects a non-positive or multi-argument vector. nullable controls whether
+// an unset vector is allowed (articles.embedding is nullable: an article with
+// no embedding computed yet is valid — the client adds it later).
+func vectorColumn(name string, dimension int, nullable bool) compat.Column {
+	return compat.Column{
+		Name:     name,
+		Type:     compat.Type{Family: compat.VectorType, Arguments: []int{dimension}},
+		Nullable: nullable,
+	}
+}
+
 // idColumn is the standard surrogate primary-key column: a UUID defaulting to
 // gen_random_uuid() (supported by both engines through compat's grammar).
 func idColumn() compat.Column {
@@ -215,10 +241,15 @@ func Build() compat.Schema {
 			junctionTable("user_roles", "user_id", "users", "role_id", "roles"),
 			apiKeysTable(),
 			// T2 example content type, built through the reusable helper.
+			// CONTRACT-05 T1: an embedding vector(1536) column is added as one
+			// more own column via ContentType (its signature is unchanged — adding
+			// a column is adding a compat.Column, not a new parameter). It is
+			// nullable: an article with no embedding yet is valid.
 			ContentType("articles", []compat.Column{
 				textColumn("title", false),
 				textColumn("body", false),
 				timestampColumn("published_at", true),
+				vectorColumn("embedding", EmbeddingDimension, true),
 			}),
 		},
 	}

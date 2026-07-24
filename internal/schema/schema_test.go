@@ -2,7 +2,9 @@ package schema_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/MauricioPerera/librarian/internal/schema"
@@ -149,6 +151,79 @@ func TestAPIKeysTable(t *testing.T) {
 	if !hasRoleFK {
 		t.Error("api_keys has no role_id FK to roles")
 	}
+}
+
+// TestArticlesEmbeddingVectorColumn covers CONTRACT-05 T1: the articles table
+// carries a nullable vector(N) embedding column, the schema Validate()s, and
+// CompileDDL renders it for BOTH engines without error — TEXT on SQLite (the
+// interoperable carrier) and native vector(N) on Postgres. This is the no-PG
+// acceptance test for the vector column.
+func TestArticlesEmbeddingVectorColumn(t *testing.T) {
+	s := schema.Build()
+	var tbl *compat.Table
+	for i := range s.Tables {
+		if s.Tables[i].Name == "articles" {
+			tbl = &s.Tables[i]
+			break
+		}
+	}
+	if tbl == nil {
+		t.Fatal("articles table not in schema")
+	}
+	var emb *compat.Column
+	for i := range tbl.Columns {
+		if tbl.Columns[i].Name == "embedding" {
+			emb = &tbl.Columns[i]
+			break
+		}
+	}
+	if emb == nil {
+		t.Fatal("articles has no embedding column")
+	}
+	if emb.Type.Family != compat.VectorType {
+		t.Fatalf("embedding family = %q, want vector", emb.Type.Family)
+	}
+	if !emb.Nullable {
+		t.Error("embedding must be nullable (an article with no embedding is valid)")
+	}
+	if !reflect.DeepEqual(emb.Type.Arguments, []int{schema.EmbeddingDimension}) {
+		t.Fatalf("embedding dimension = %v, want [%d]", emb.Type.Arguments, schema.EmbeddingDimension)
+	}
+
+	// Schema.Validate must pass with the vector column.
+	if err := s.Validate(); err != nil {
+		t.Fatalf("schema with vector column does not validate: %v", err)
+	}
+
+	// CompileDDL for both engines must succeed; on Postgres the column renders
+	// as native vector(N).
+	sqlite, err := compat.CompileDDL(schema.SQLiteTarget, s)
+	if err != nil {
+		t.Fatalf("CompileDDL(sqlite) with vector: %v", err)
+	}
+	postgres, err := compat.CompileDDL(schema.PostgresTarget, s)
+	if err != nil {
+		t.Fatalf("CompileDDL(postgres) with vector: %v", err)
+	}
+	var sqliteStmt, pgStmt string
+	for _, stmt := range sqlite {
+		if strings.Contains(stmt, `"embedding" TEXT`) {
+			sqliteStmt = stmt
+		}
+	}
+	for _, stmt := range postgres {
+		if strings.Contains(stmt, fmt.Sprintf(`"embedding" vector(%d)`, schema.EmbeddingDimension)) {
+			pgStmt = stmt
+		}
+	}
+	if sqliteStmt == "" {
+		t.Fatalf("sqlite DDL did not compile embedding as TEXT: %v", sqlite)
+	}
+	if pgStmt == "" {
+		t.Fatalf("postgres DDL did not compile embedding as vector(%d): %v", schema.EmbeddingDimension, postgres)
+	}
+	t.Logf("SQLite articles DDL: %s", sqliteStmt)
+	t.Logf("Postgres articles DDL: %s", pgStmt)
 }
 
 // TestContentTypeHelper checks the reusable helper injects the shared columns

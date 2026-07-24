@@ -6,6 +6,8 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+
+	"github.com/MauricioPerera/librarian/internal/schema"
 )
 
 // articles.go implements CONTRACT-03 T3: a REST CRUD surface over the
@@ -24,14 +26,18 @@ import (
 // article is the row view returned by the read handlers. PublishedAt is
 // nullable; on SQLite the timestamp driver returns it as a string, so it is
 // scanned into NullString (the same approach apikey.go uses for revoked_at).
+// Embedding (CONTRACT-05 T2) is the parsed vector: a nil slice (omitempty)
+// represents a NULL column; a non-nil slice serializes as a JSON array of
+// numbers — never the raw carrier text '[c1,c2,...]'.
 type article struct {
-	ID          string  `json:"id"`
-	AuthorID    string  `json:"author_id"`
-	Title       string  `json:"title"`
-	Body        string  `json:"body"`
-	PublishedAt *string `json:"published_at,omitempty"`
-	CreatedAt   string  `json:"created_at"`
-	UpdatedAt   string  `json:"updated_at"`
+	ID          string    `json:"id"`
+	AuthorID    string    `json:"author_id"`
+	Title       string    `json:"title"`
+	Body        string    `json:"body"`
+	PublishedAt *string   `json:"published_at,omitempty"`
+	Embedding   []float64 `json:"embedding,omitempty"`
+	CreatedAt   string    `json:"created_at"`
+	UpdatedAt   string    `json:"updated_at"`
 }
 
 // articleBody is the request body for POST and PUT. Metadata is an optional
@@ -40,10 +46,19 @@ type article struct {
 // real JSON value produced by the app end-to-end. It is omitempty and optional
 // — existing callers that omit it keep the original NULL-default behavior, so
 // the CONTRACT-03 surface is unchanged for them.
+//
+// Embedding (CONTRACT-05 T2) is an optional JSON array of N numbers (N =
+// schema.EmbeddingDimension). It is a json.RawMessage so the handler can
+// distinguish absent (leave the column NULL/unchanged) from explicit null
+// (clear on update) from an array (validate dimension + canonicalize). A
+// wrong dimension or a non-numeric component is rejected with 400 — never
+// 500, never silent truncation. Omitting it is backward compatible with
+// CONTRACT-03/04.
 type articleBody struct {
-	Title    string          `json:"title"`
-	Body     string          `json:"body"`
-	Metadata json.RawMessage `json:"metadata,omitempty"`
+	Title     string          `json:"title"`
+	Body      string          `json:"body"`
+	Metadata  json.RawMessage `json:"metadata,omitempty"`
+	Embedding json.RawMessage `json:"embedding,omitempty"`
 }
 
 // handleCreateArticle creates a draft (published_at NULL). Requires
@@ -76,25 +91,43 @@ func (h *handlers) handleCreateArticle(w http.ResponseWriter, r *http.Request) {
 	// JSONType to TEXT to preserve the payload byte-for-byte), so the raw JSON
 	// text is bound as a parameter just like title/body — no string interpolation.
 	hasMeta := len(req.Metadata) > 0 && string(req.Metadata) != "null"
+	// embedding is an optional vector(N). An absent field or explicit null
+	// leaves the column NULL (create default); a present array is validated
+	// against the exact declared dimension and canonicalized to '[c1,c2,...]'.
+	// Validation failures (wrong dimension, non-numeric component) are 400 —
+	// they surface here, before any SQL, so they never become a 500.
+	embCanonical, embPresent, _, err := validateEmbedding(req.Embedding, schema.EmbeddingDimension)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	hasEmbedding := embPresent && embCanonical != ""
 	var articleID string
-	if hasMeta {
-		err := h.db.QueryRowContext(r.Context(),
+	switch {
+	case hasMeta && hasEmbedding:
+		err = h.db.QueryRowContext(r.Context(),
+			`INSERT INTO articles (author_id, title, body, metadata, embedding) VALUES (?, ?, ?, ?, ?) RETURNING id`,
+			id.UserID, req.Title, req.Body, string(req.Metadata), embCanonical,
+		).Scan(&articleID)
+	case hasMeta:
+		err = h.db.QueryRowContext(r.Context(),
 			`INSERT INTO articles (author_id, title, body, metadata) VALUES (?, ?, ?, ?) RETURNING id`,
 			id.UserID, req.Title, req.Body, string(req.Metadata),
 		).Scan(&articleID)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "could not create article")
-			return
-		}
-	} else {
-		err := h.db.QueryRowContext(r.Context(),
+	case hasEmbedding:
+		err = h.db.QueryRowContext(r.Context(),
+			`INSERT INTO articles (author_id, title, body, embedding) VALUES (?, ?, ?, ?) RETURNING id`,
+			id.UserID, req.Title, req.Body, embCanonical,
+		).Scan(&articleID)
+	default:
+		err = h.db.QueryRowContext(r.Context(),
 			`INSERT INTO articles (author_id, title, body) VALUES (?, ?, ?) RETURNING id`,
 			id.UserID, req.Title, req.Body,
 		).Scan(&articleID)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "could not create article")
-			return
-		}
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not create article")
+		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"id":        articleID,
@@ -111,7 +144,7 @@ func (h *handlers) handleListArticles(w http.ResponseWriter, r *http.Request) {
 	limit := queryIntDefault(r, "limit", 20)
 	offset := queryIntDefault(r, "offset", 0)
 	rows, err := h.db.QueryContext(r.Context(),
-		`SELECT id, author_id, title, body, published_at, created_at, updated_at
+		`SELECT id, author_id, title, body, published_at, embedding, created_at, updated_at
 		   FROM articles
 		  ORDER BY created_at DESC
 		  LIMIT ? OFFSET ?`,
@@ -167,10 +200,50 @@ func (h *handlers) handleUpdateArticle(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "title and body are required")
 		return
 	}
-	res, err := h.db.ExecContext(r.Context(),
-		`UPDATE articles SET title = ?, body = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-		req.Title, req.Body, id,
-	)
+	// embedding on update: absent (raw empty) leaves the column untouched
+	// (backward compatible with CONTRACT-03/04, which never touched it);
+	// explicit null clears it to NULL; a present array is validated against
+	// the exact declared dimension and canonicalized. Validation failures are
+	// 400, surfaced before any SQL — never 500, never silent.
+	embCanonical, embPresent, embIsNull, err := validateEmbedding(req.Embedding, schema.EmbeddingDimension)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// Existence check first so a dimension-validated but missing id still
+	// returns 404 (not a silent no-op), and so the update below can rely on
+	// RowsAffected == 0 ⇒ not found.
+	var exists int
+	if err := h.db.QueryRowContext(r.Context(),
+		`SELECT 1 FROM articles WHERE id = ?`, id,
+	).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "article not found")
+		return
+	} else if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not update article")
+		return
+	}
+
+	setEmbedding := embPresent && !embIsNull
+	clearEmbedding := embPresent && embIsNull
+	var res sql.Result
+	switch {
+	case setEmbedding:
+		res, err = h.db.ExecContext(r.Context(),
+			`UPDATE articles SET title = ?, body = ?, embedding = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+			req.Title, req.Body, embCanonical, id,
+		)
+	case clearEmbedding:
+		res, err = h.db.ExecContext(r.Context(),
+			`UPDATE articles SET title = ?, body = ?, embedding = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+			req.Title, req.Body, id,
+		)
+	default:
+		res, err = h.db.ExecContext(r.Context(),
+			`UPDATE articles SET title = ?, body = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+			req.Title, req.Body, id,
+		)
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "could not update article")
 		return
@@ -269,7 +342,7 @@ func (h *handlers) handleDeleteArticle(w http.ResponseWriter, r *http.Request) {
 // surfaces as a raw SQL error.
 func (h *handlers) fetchArticle(r *http.Request, id string) (article, bool, error) {
 	row := h.db.QueryRowContext(r.Context(),
-		`SELECT id, author_id, title, body, published_at, created_at, updated_at
+		`SELECT id, author_id, title, body, published_at, embedding, created_at, updated_at
 		   FROM articles
 		  WHERE id = ?`,
 		id,
@@ -293,13 +366,25 @@ func scanArticle(s interface {
 	var (
 		a         article
 		published sql.NullString
+		embedding sql.NullString
 	)
-	if err := s.Scan(&a.ID, &a.AuthorID, &a.Title, &a.Body, &published, &a.CreatedAt, &a.UpdatedAt); err != nil {
+	if err := s.Scan(&a.ID, &a.AuthorID, &a.Title, &a.Body, &published, &embedding, &a.CreatedAt, &a.UpdatedAt); err != nil {
 		return article{}, err
 	}
 	if published.Valid && published.String != "" {
 		s := published.String
 		a.PublishedAt = &s
+	}
+	// embedding is stored as the canonical carrier text '[c1,c2,...]' on both
+	// engines. GET returns it as a JSON array of numbers, never the raw text;
+	// a NULL column stays a nil slice (omitempty) — backward compatible with
+	// CONTRACT-03/04 which had no embedding field.
+	if embedding.Valid && embedding.String != "" {
+		components, err := ParseVector(embedding.String)
+		if err != nil {
+			return article{}, err
+		}
+		a.Embedding = components
 	}
 	return a, nil
 }

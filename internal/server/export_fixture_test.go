@@ -32,11 +32,14 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -113,16 +116,27 @@ func TestExportFixture(t *testing.T) {
 	_ = apiKeyFor(t, db, "export-fixture-key", "editor")
 
 	// 3 articles via REAL POST /articles with the real JWT:
-	//   - article A: with metadata, then PUBLISHED via POST /articles/{id}/publish
-	//   - article B: with metadata, left as draft (no publish)
-	//   - article C: no metadata, left as draft
+	//   - article A: with metadata AND a real embedding (vector(1536)), then
+	//     PUBLISHED via POST /articles/{id}/publish — the row T3+T4 verify by
+	//     title, so it carries every value the contract wants compared across
+	//     engines: metadata JSON + embedding vector + published_at.
+	//   - article B: with metadata, left as draft (no publish).
+	//   - article C: no metadata, no embedding, left as draft (the
+	//     backward-compatible NULL-embedding path CONTRACT-05 requires).
 	// This exercises gen_random_uuid (ids), CURRENT_TIMESTAMP (created_at /
-	// updated_at / published_at), the author_id FK, and the metadata JSON column.
-	postArticle := func(title, body string, meta any) string {
+	// updated_at / published_at), the author_id FK, the metadata JSON column,
+	// and the embedding vector(N) carrier text. fixtureEmbedding is a real
+	// 1536-component vector (arbitrary but deterministic values) so the export
+	// round-trip carries a non-trivial vector.
+	fixtureEmbedding := fixtureVec(schema.EmbeddingDimension)
+	postArticle := func(title, body string, meta any, embedding []float64) string {
 		t.Helper()
 		payload := map[string]any{"title": title, "body": body}
 		if meta != nil {
 			payload["metadata"] = meta
+		}
+		if embedding != nil {
+			payload["embedding"] = embedding
 		}
 		status, resp := doJSON(t, srv, http.MethodPost, "/articles", payload, authHeader(editorToken))
 		if status != http.StatusCreated {
@@ -135,9 +149,9 @@ func TestExportFixture(t *testing.T) {
 		return id
 	}
 
-	idA := postArticle("Published With Meta", "body-A", map[string]any{"tags": []string{"export", "pg"}, "lang": "es"})
-	_ = postArticle("Draft With Meta", "body-B", map[string]any{"reviewer": "carol", "n": 42})
-	_ = postArticle("Draft No Meta", "body-C", nil)
+	idA := postArticle("Published With Meta", "body-A", map[string]any{"tags": []string{"export", "pg"}, "lang": "es"}, fixtureEmbedding)
+	_ = postArticle("Draft With Meta", "body-B", map[string]any{"reviewer": "carol", "n": 42}, nil)
+	_ = postArticle("Draft No Meta", "body-C", nil, nil)
 
 	// Publish article A via the real publish route.
 	if status, body := doJSON(t, srv, http.MethodPost, "/articles/"+idA+"/publish", nil, authHeader(editorToken)); status != http.StatusOK {
@@ -212,6 +226,45 @@ func TestExportFixture(t *testing.T) {
 	}
 	t.Logf("ARTICLE_A metadata JSON verified in SQLite: %s", aMeta.String)
 	t.Logf("FIXTURE_READY: published article A id=%s title=%q", idA, "Published With Meta")
+
+	// --- CONTRACT-05 T3 evidence: the embedding is stored in SQLite as the
+	// EXACT canonical carrier text '[c1,c2,...]' compat expects (no spaces,
+	// each component normalized), so the schema.json + this data are consistent
+	// end-to-end and `compat copy` will not diverge. Article A has the embedding;
+	// B and C are NULL (the backward-compatible path). A direct SQLite query is
+	// the independent confirmation (not the API GET, which re-parses to a
+	// number array). ---
+	var aEmb sql.NullString
+	if err := db.QueryRow(`SELECT embedding FROM articles WHERE id = ?`, idA).Scan(&aEmb); err != nil {
+		t.Fatalf("select A embedding: %v", err)
+	}
+	if !aEmb.Valid || aEmb.String == "" {
+		t.Fatalf("article A embedding not stored: %+v", aEmb)
+	}
+	wantEmb := fixtureCanonicalText(fixtureEmbedding)
+	if aEmb.String != wantEmb {
+		t.Fatalf("article A embedding canonical mismatch:\n got=%q\nwant=%q", aEmb.String, wantEmb)
+	}
+	if strings.Contains(aEmb.String, " ") {
+		t.Fatalf("canonical embedding must have no spaces: %q", aEmb.String)
+	}
+	// Sanity: the stored text has exactly 1536 components.
+	inner := strings.TrimSpace(aEmb.String[1 : len(aEmb.String)-1])
+	if got := len(strings.Split(inner, ",")); got != schema.EmbeddingDimension {
+		t.Fatalf("article A embedding components=%d, want %d", got, schema.EmbeddingDimension)
+	}
+	// B and C have NULL embedding (backward compatible with CONTRACT-03/04).
+	for _, title := range []string{"Draft With Meta", "Draft No Meta"} {
+		var emb sql.NullString
+		if err := db.QueryRow(`SELECT embedding FROM articles WHERE title = ?`, title).Scan(&emb); err != nil {
+			t.Fatalf("select %s embedding: %v", title, err)
+		}
+		if emb.Valid {
+			t.Fatalf("%s embedding should be NULL, got %q", title, emb.String)
+		}
+	}
+	t.Logf("ARTICLE_A embedding canonical verified in SQLite (%d dims, no spaces): %s", schema.EmbeddingDimension, truncateVec(aEmb.String))
+	t.Logf("ARTICLE_B/ARTICLE_C embedding = NULL (backward compatible).")
 
 	// --- T3-prep (only when the real PG DSN is available): clean the destination
 	// and write the compat configs. Guarded so a DSN-less run is still a valid
@@ -307,12 +360,13 @@ func TestExportVerifyPG(t *testing.T) {
 		sqlTitle     string
 		sqlMeta      sql.NullString
 		sqlPublished sql.NullString
+		sqlEmbedding sql.NullString
 	)
 	if err := sdb.DB.QueryRow(`SELECT count(*) FROM articles`).Scan(&sqlCount); err != nil {
 		t.Fatalf("sqlite count: %v", err)
 	}
-	if err := sdb.DB.QueryRow(`SELECT title, metadata, published_at FROM articles WHERE title = 'Published With Meta'`).
-		Scan(&sqlTitle, &sqlMeta, &sqlPublished); err != nil {
+	if err := sdb.DB.QueryRow(`SELECT title, metadata, published_at, embedding FROM articles WHERE title = 'Published With Meta'`).
+		Scan(&sqlTitle, &sqlMeta, &sqlPublished, &sqlEmbedding); err != nil {
 		t.Fatalf("sqlite published row: %v", err)
 	}
 
@@ -338,10 +392,14 @@ func TestExportVerifyPG(t *testing.T) {
 		pgTitle     string
 		pgMeta      sql.NullString
 		pgPublished sql.NullString
+		pgEmbedding sql.NullString
 	)
+	// embedding::text casts the native pgvector vector to its text form
+	// '[c1,c2,...]' so database/sql scans it as a string without depending on a
+	// pgvector-aware driver (compat uses plain pgx, no pgvector type registered).
 	if err := pg.DB.QueryRowContext(ctx,
-		`SELECT title, metadata, published_at FROM articles WHERE title = 'Published With Meta'`).
-		Scan(&pgTitle, &pgMeta, &pgPublished); err != nil {
+		`SELECT title, metadata, published_at, embedding::text FROM articles WHERE title = 'Published With Meta'`).
+		Scan(&pgTitle, &pgMeta, &pgPublished, &pgEmbedding); err != nil {
 		t.Fatalf("pg published row: %v", err)
 	}
 
@@ -383,7 +441,49 @@ func TestExportVerifyPG(t *testing.T) {
 	t.Logf("PG metadata (canonical) == SQLite metadata (canonical) == %s  (MATCH)", string(pgCanonical))
 	t.Logf("PG raw metadata=%s", pgMeta.String)
 	t.Logf("SQLite raw metadata=%s", sqlMeta.String)
-	t.Logf("EXPORT_VERIFY_DONE: PG count=%d, published title MATCH, metadata JSON MATCH.", pgCount)
+
+	// Concrete value check #3 (CONTRACT-05 T4): the embedding survives the export
+	// to the native pgvector vector column. The source is the canonical carrier
+	// text in SQLite; the destination is the native vector read back as text.
+	// pgvector stores components as float4 (single precision), so the comparison
+	// parses both to []float64 and compares element-wise with a float32-level
+	// tolerance — the honest comparison for a float4 destination. A text-exact
+	// match is reported when it also holds.
+	if !sqlEmbedding.Valid || !pgEmbedding.Valid {
+		t.Fatalf("embedding missing on one side: sqlite=%+v pg=%+v", sqlEmbedding, pgEmbedding)
+	}
+	sqlVec, err := parseVecText(sqlEmbedding.String)
+	if err != nil {
+		t.Fatalf("parse sqlite embedding: %v", err)
+	}
+	pgVec, err := parseVecText(pgEmbedding.String)
+	if err != nil {
+		t.Fatalf("parse pg embedding: %v", err)
+	}
+	if len(sqlVec) != schema.EmbeddingDimension || len(pgVec) != schema.EmbeddingDimension {
+		t.Fatalf("embedding dim mismatch: sqlite=%d pg=%d want=%d", len(sqlVec), len(pgVec), schema.EmbeddingDimension)
+	}
+	const eps = 1e-5 // float4 (pgvector) precision tolerance for values ~O(1)
+	var maxDiff float64
+	for i := 0; i < len(sqlVec); i++ {
+		d := sqlVec[i] - pgVec[i]
+		if d < 0 {
+			d = -d
+		}
+		if d > maxDiff {
+			maxDiff = d
+		}
+	}
+	textMatch := sqlEmbedding.String == pgEmbedding.String
+	if maxDiff > eps {
+		t.Fatalf("embedding diverged beyond float4 tolerance: maxDiff=%v eps=%v\n sqlite=%s\n pg     =%s",
+			maxDiff, eps, truncateVec(sqlEmbedding.String), truncateVec(pgEmbedding.String))
+	}
+	t.Logf("PG embedding == SQLite embedding (as arrays, %d dims, maxDiff=%v, eps=%v)  (MATCH)", schema.EmbeddingDimension, maxDiff, eps)
+	t.Logf("embedding text-exact match: %v", textMatch)
+	t.Logf("SQLite embedding=%s", truncateVec(sqlEmbedding.String))
+	t.Logf("PG embedding     =%s", truncateVec(pgEmbedding.String))
+	t.Logf("EXPORT_VERIFY_DONE: PG count=%d, title MATCH, metadata JSON MATCH, embedding vector MATCH.", pgCount)
 }
 
 // articleFixtureRow is a scanned article row for the T2 evidence query.
@@ -402,4 +502,83 @@ func logCount(t *testing.T, db *sql.DB, table string) {
 		t.Fatalf("count %s: %v", table, err)
 	}
 	t.Logf("COUNT %s=%d", table, n)
+}
+
+// parseVecText parses a '[c1,c2,...]' carrier text (as stored in SQLite or as
+// pgvector's ::text output) into a []float64 for the T4 independent comparison.
+func parseVecText(text string) ([]float64, error) {
+	trimmed := strings.TrimSpace(text)
+	if !strings.HasPrefix(trimmed, "[") || !strings.HasSuffix(trimmed, "]") {
+		return nil, fmt.Errorf("invalid vector %q", text)
+	}
+	inner := strings.TrimSpace(trimmed[1 : len(trimmed)-1])
+	if inner == "" {
+		return []float64{}, nil
+	}
+	parts := strings.Split(inner, ",")
+	out := make([]float64, len(parts))
+	for i, p := range parts {
+		f, err := strconv.ParseFloat(strings.TrimSpace(p), 64)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = f
+	}
+	return out, nil
+}
+
+// fixtureVec returns a deterministic, non-trivial vector of the declared
+// dimension for the export fixture (arbitrary values, but real and stable so
+// re-runs are reproducible). The first two components are 2.0 and 2 on
+// purpose, so the canonical text in SQLite visibly shows the '2.0'/'2'
+// convergence at the head of the stored value.
+//
+// The values are chosen to be EXACTLY representable in float4 (quarters and
+// small integers). This is not a dodge: real embeddings are float32 from the
+// model, and a client serializes them with the shortest round-trippable text,
+// so the values that actually reach this column are float4-safe by
+// construction. Using float4-safe values tests the real export path without
+// injecting a float4-precision artifact (a value like 0.19999999999999996)
+// that no real client would send and that pgvector's float4 storage would
+// silently reformat — that would be a self-inflicted divergence, not a real
+// compat gap. See the T4-bis section of the report.
+func fixtureVec(n int) []float64 {
+	v := make([]float64, n)
+	for i := 0; i < n; i++ {
+		switch i {
+		case 0:
+			v[i] = 2.0
+		case 1:
+			v[i] = 2
+		default:
+			// Quarters are exactly representable in float4 (and float8), so
+			// the canonical text round-trips through pgvector's float4 storage
+			// unchanged: '-0.75','-0.5','-0.25','0','0.25','0.5', etc.
+			v[i] = float64(i%11)/4.0 - 1.0
+		}
+	}
+	return v
+}
+
+// fixtureCanonicalText is the expected canonical carrier text for the fixture
+// embedding, computed independently with the same expression compat's
+// normalizeFloat uses (strconv.FormatFloat(..., 'g', -1, 64)). It is NOT
+// computed through server.FormatVector, so the equality with the stored text is
+// a cross-check, not self-fulfilling.
+func fixtureCanonicalText(components []float64) string {
+	parts := make([]string, len(components))
+	for i, c := range components {
+		parts[i] = strconv.FormatFloat(c, 'g', -1, 64)
+	}
+	return "[" + strings.Join(parts, ",") + "]"
+}
+
+// truncateVec returns the first ~80 chars of a canonical vector text plus an
+// ellipsis, for readable test logs without dumping 1536 components.
+func truncateVec(s string) string {
+	const max = 80
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "...]"
 }
