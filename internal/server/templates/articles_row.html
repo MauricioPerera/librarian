@@ -1,0 +1,10 @@
+{{define "article_row"}}<tr id="article-{{.ID}}">
+  <td class="cell-title">{{.Title}}</td>
+  <td>{{if .Published}}<span class="badge badge-published">Publicado</span>{{else}}<span class="badge badge-draft">Borrador</span>{{end}}</td>
+  <td class="cell-date">{{.CreatedAt}}</td>
+  <td class="cell-actions">
+    <a class="btn btn-ghost" href="/admin/articles/{{.ID}}/edit">Editar</a>
+    {{if not .Published}}<button class="btn btn-ghost" hx-post="/admin/articles/{{.ID}}/publish" hx-target="#article-{{.ID}}" hx-swap="outerHTML">Publicar</button>{{end}}
+    <button class="btn btn-danger" hx-delete="/admin/articles/{{.ID}}" hx-target="#article-{{.ID}}" hx-swap="outerHTML" hx-confirm="¿Borrar este artículo?">Borrar</button>
+  </td>
+</tr>{{end}}

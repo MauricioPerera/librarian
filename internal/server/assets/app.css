@@ -128,3 +128,92 @@ html, body {
 }
 
 .logout-form { margin: 0; }
+
+/* CONTRACT-07 — admin articles UI. */
+
+.form textarea {
+  padding: 0.6rem 0.7rem;
+  font-size: 1rem;
+  font-family: inherit;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--text);
+  resize: vertical;
+}
+
+.form textarea:focus {
+  outline: 2px solid var(--primary);
+  outline-offset: 1px;
+  border-color: var(--primary);
+}
+
+.page-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1.25rem;
+}
+
+.page-head h1 { margin: 0; }
+
+.form-card { max-width: 640px; }
+
+.form-actions {
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+}
+
+.btn-danger {
+  background: transparent;
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+}
+
+.table th, .table td {
+  text-align: left;
+  padding: 0.7rem 0.9rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.table th {
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  color: var(--muted);
+  background: var(--bg);
+}
+
+.table tbody tr:last-child td { border-bottom: none; }
+
+.cell-title { font-weight: 600; }
+.cell-date { color: var(--muted); font-size: 0.85rem; }
+.cell-actions { display: flex; gap: 0.4rem; }
+.cell-actions .btn { padding: 0.35rem 0.7rem; font-size: 0.85rem; }
+
+.badge {
+  display: inline-block;
+  padding: 0.15rem 0.6rem;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 600;
+}
+
+.badge-published { background: #e6f4ea; color: #1e7e34; }
+.badge-draft { background: #eef0f3; color: var(--muted); }
+
+.empty { color: var(--muted); }
+
+.error-card { max-width: 480px; }

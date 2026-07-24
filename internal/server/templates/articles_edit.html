@@ -1,0 +1,18 @@
+{{define "content"}}
+<div class="card form-card">
+  <h1>Editar artículo</h1>
+  {{if .Error}}<p class="error" role="alert">{{.Error}}</p>{{end}}
+  <form class="form" hx-put="/admin/articles/{{.Article.ID}}">
+    <label>Título
+      <input type="text" name="title" value="{{.Article.Title}}" required autofocus>
+    </label>
+    <label>Cuerpo
+      <textarea name="body" rows="10" required>{{.Article.Body}}</textarea>
+    </label>
+    <div class="form-actions">
+      <button type="submit" class="btn btn-primary">Guardar</button>
+      <a class="btn btn-ghost" href="/admin/articles">Cancelar</a>
+    </div>
+  </form>
+</div>
+{{end}}

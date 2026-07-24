@@ -36,7 +36,7 @@ const sessionMaxAgeSeconds = 24 * 60 * 60
 //go:embed assets/htmx.min.js assets/app.css
 var assetsFS embed.FS
 
-//go:embed templates/layout.html templates/login.html templates/home.html
+//go:embed templates/layout.html templates/login.html templates/home.html templates/articles_list.html templates/articles_row.html templates/articles_new.html templates/articles_edit.html templates/error_403.html templates/error_404.html
 var templatesFS embed.FS
 
 // Each page is its own template set (layout + one page). Parsing pages into
@@ -75,6 +75,7 @@ func (h *handlers) registerUIRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /login", h.handleLoginForm)
 	mux.HandleFunc("POST /login", h.handleLoginSubmit)
 	mux.HandleFunc("POST /logout", h.handleLogout)
+	h.registerAdminArticleRoutes(mux)
 	mux.Handle("GET /", h.requireSession(http.HandlerFunc(h.handleHome)))
 }
 
@@ -195,25 +196,73 @@ func (h *handlers) handleHome(w http.ResponseWriter, r *http.Request) {
 // plumbing rather than a parallel one.
 func (h *handlers) requireSession(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c, err := r.Cookie(sessionCookieName)
-		if err != nil {
+		id, ok := h.sessionIdentity(r)
+		if !ok {
 			http.Redirect(w, r, "/login", http.StatusFound)
 			return
-		}
-		claims, err := auth.VerifyJWT(h.jwtSecret, c.Value)
-		if err != nil {
-			http.Redirect(w, r, "/login", http.StatusFound)
-			return
-		}
-		id := &Identity{
-			Kind:   "jwt",
-			UserID: claims.Subject,
-			Email:  claims.Email,
-			Roles:  claims.Roles,
 		}
 		r2 := r.WithContext(context.WithValue(r.Context(), identityKey{}, id))
 		next.ServeHTTP(w, r2)
 	})
+}
+
+// sessionIdentity resolves the browser-session Identity from the session cookie:
+// it reads the cookie, validates the JWT, and builds the SAME Identity type /
+// identityKey{} the API uses. ok is false when the cookie is absent, malformed,
+// wrong-signed, or expired — the caller decides what a failure means (redirect
+// to /login for a read route, or the permission middleware below). It is the
+// single cookie→Identity resolver shared by requireSession and
+// requireSessionPermission, so neither duplicates the cookie/JWT plumbing.
+func (h *handlers) sessionIdentity(r *http.Request) (*Identity, bool) {
+	c, err := r.Cookie(sessionCookieName)
+	if err != nil {
+		return nil, false
+	}
+	claims, err := auth.VerifyJWT(h.jwtSecret, c.Value)
+	if err != nil {
+		return nil, false
+	}
+	return &Identity{
+		Kind:   "jwt",
+		UserID: claims.Subject,
+		Email:  claims.Email,
+		Roles:  claims.Roles,
+	}, true
+}
+
+// requireSessionPermission is the CONTRACT-07 T1 middleware: it gates an HTML
+// write route on BOTH a valid browser session AND a specific permission. This
+// is the gap CONTRACT-07 closes — requirePermission (authz.go) reads only the
+// Authorization header (JSON API), and requireSession (above) checks only the
+// session, not any permission. This one combines the cookie-resolved Identity
+// with permissionsFor, and on failure it NEVER writes the JSON writeError
+// envelope (that is the API's contract): no session → 302 redirect to /login
+// (a human, not a 401); valid session but missing the permission → a simple 403
+// HTML page. It reuses sessionIdentity + permissionsFor, so it shares the exact
+// authorization plumbing rather than a parallel one.
+func (h *handlers) requireSessionPermission(permission string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			id, ok := h.sessionIdentity(r)
+			if !ok {
+				http.Redirect(w, r, "/login", http.StatusFound)
+				return
+			}
+			perms, err := h.permissionsFor(r.Context(), id)
+			if err != nil {
+				// The caller IS authenticated; we just could not load grants.
+				// A plain-text 500 (not the JSON API envelope) for a human.
+				http.Error(w, "internal error", http.StatusInternalServerError)
+				return
+			}
+			if !containsString(perms, permission) {
+				renderForbidden(w, id.Email)
+				return
+			}
+			r2 := r.WithContext(context.WithValue(r.Context(), identityKey{}, id))
+			next.ServeHTTP(w, r2)
+		})
+	}
 }
 
 // renderLogin writes the login page with the given status and optional error.

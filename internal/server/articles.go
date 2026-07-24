@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -120,10 +121,7 @@ func (h *handlers) handleCreateArticle(w http.ResponseWriter, r *http.Request) {
 			id.UserID, req.Title, req.Body, embCanonical,
 		).Scan(&articleID)
 	default:
-		err = h.db.QueryRowContext(r.Context(),
-			`INSERT INTO articles (author_id, title, body) VALUES (?, ?, ?) RETURNING id`,
-			id.UserID, req.Title, req.Body,
-		).Scan(&articleID)
+		articleID, err = h.insertArticleBasic(r.Context(), id.UserID, req.Title, req.Body)
 	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "could not create article")
@@ -143,29 +141,9 @@ func (h *handlers) handleCreateArticle(w http.ResponseWriter, r *http.Request) {
 func (h *handlers) handleListArticles(w http.ResponseWriter, r *http.Request) {
 	limit := queryIntDefault(r, "limit", 20)
 	offset := queryIntDefault(r, "offset", 0)
-	rows, err := h.db.QueryContext(r.Context(),
-		`SELECT id, author_id, title, body, published_at, embedding, created_at, updated_at
-		   FROM articles
-		  ORDER BY created_at DESC
-		  LIMIT ? OFFSET ?`,
-		limit, offset,
-	)
+	out, err := h.listArticles(r.Context(), limit, offset)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "could not list articles")
-		return
-	}
-	defer rows.Close()
-	out := make([]article, 0)
-	for rows.Next() {
-		a, err := scanArticle(rows)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "could not read articles")
-			return
-		}
-		out = append(out, a)
-	}
-	if err := rows.Err(); err != nil {
-		writeError(w, http.StatusInternalServerError, "could not read articles")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"articles": out})
@@ -213,14 +191,13 @@ func (h *handlers) handleUpdateArticle(w http.ResponseWriter, r *http.Request) {
 	// Existence check first so a dimension-validated but missing id still
 	// returns 404 (not a silent no-op), and so the update below can rely on
 	// RowsAffected == 0 ⇒ not found.
-	var exists int
-	if err := h.db.QueryRowContext(r.Context(),
-		`SELECT 1 FROM articles WHERE id = ?`, id,
-	).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
-		writeError(w, http.StatusNotFound, "article not found")
-		return
-	} else if err != nil {
+	present, err := h.articleExists(r.Context(), id)
+	if err != nil {
 		writeError(w, http.StatusInternalServerError, "could not update article")
+		return
+	}
+	if !present {
+		writeError(w, http.StatusNotFound, "article not found")
 		return
 	}
 
@@ -239,10 +216,7 @@ func (h *handlers) handleUpdateArticle(w http.ResponseWriter, r *http.Request) {
 			req.Title, req.Body, id,
 		)
 	default:
-		res, err = h.db.ExecContext(r.Context(),
-			`UPDATE articles SET title = ?, body = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-			req.Title, req.Body, id,
-		)
+		res, err = h.updateArticleTitleBody(r.Context(), id, req.Title, req.Body)
 	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "could not update article")
@@ -271,41 +245,14 @@ func (h *handlers) handleUpdateArticle(w http.ResponseWriter, r *http.Request) {
 // 404 when the id does not exist; 200 on both first publish and repeat.
 func (h *handlers) handlePublishArticle(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	// Existence check first: an already-published row must still return 200
-	// (idempotent), so we cannot rely on UPDATE rows-affected to distinguish
-	// "not found" from "already published".
-	var exists int
-	if err := h.db.QueryRowContext(r.Context(),
-		`SELECT 1 FROM articles WHERE id = ?`, id,
-	).Scan(&exists); errors.Is(err, sql.ErrNoRows) {
+	pub, found, err := h.publishArticleByID(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not publish article")
+		return
+	}
+	if !found {
 		writeError(w, http.StatusNotFound, "article not found")
 		return
-	} else if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not publish article")
-		return
-	}
-	// Only set published_at when it is still NULL; an already-published row is
-	// untouched (published_at and updated_at both unchanged) → idempotent.
-	if _, err := h.db.ExecContext(r.Context(),
-		`UPDATE articles SET published_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND published_at IS NULL`,
-		id,
-	); err != nil {
-		writeError(w, http.StatusInternalServerError, "could not publish article")
-		return
-	}
-	// Return the current (post-publish) published_at so callers can confirm it
-	// did not change on a repeat call.
-	var published sql.NullString
-	if err := h.db.QueryRowContext(r.Context(),
-		`SELECT published_at FROM articles WHERE id = ?`, id,
-	).Scan(&published); err != nil {
-		writeError(w, http.StatusInternalServerError, "could not publish article")
-		return
-	}
-	var pub *string
-	if published.Valid && published.String != "" {
-		s := published.String
-		pub = &s
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id":           id,
@@ -317,14 +264,7 @@ func (h *handlers) handlePublishArticle(w http.ResponseWriter, r *http.Request) 
 // the id does not exist. 204 on success.
 func (h *handlers) handleDeleteArticle(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	res, err := h.db.ExecContext(r.Context(),
-		`DELETE FROM articles WHERE id = ?`, id,
-	)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not delete article")
-		return
-	}
-	n, err := res.RowsAffected()
+	n, err := h.deleteArticleByID(r.Context(), id)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "could not delete article")
 		return
@@ -355,6 +295,121 @@ func (h *handlers) fetchArticle(r *http.Request, id string) (article, bool, erro
 		return article{}, false, err
 	}
 	return a, true, nil
+}
+
+// --- Shared data-access helpers (CONTRACT-07 T1) ----------------------------
+//
+// These wrap the parameterized SQL for the articles table so BOTH the JSON API
+// handlers (CONTRACT-03) and the new admin UI handlers (CONTRACT-07) reuse the
+// exact same queries instead of duplicating them. Extracting them here does not
+// change the JSON contract: each JSON handler now calls a helper that runs the
+// identical SQL it ran inline before.
+
+// insertArticleBasic inserts a draft with only author/title/body (the common
+// case shared by the JSON default branch and the admin UI create form) and
+// returns the generated id.
+func (h *handlers) insertArticleBasic(ctx context.Context, authorID, title, body string) (string, error) {
+	var id string
+	err := h.db.QueryRowContext(ctx,
+		`INSERT INTO articles (author_id, title, body) VALUES (?, ?, ?) RETURNING id`,
+		authorID, title, body,
+	).Scan(&id)
+	return id, err
+}
+
+// listArticles returns a page of articles ordered by created_at DESC. Shared by
+// the JSON list route and the admin UI list page.
+func (h *handlers) listArticles(ctx context.Context, limit, offset int) ([]article, error) {
+	rows, err := h.db.QueryContext(ctx,
+		`SELECT id, author_id, title, body, published_at, embedding, created_at, updated_at
+		   FROM articles
+		  ORDER BY created_at DESC
+		  LIMIT ? OFFSET ?`,
+		limit, offset,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make([]article, 0)
+	for rows.Next() {
+		a, err := scanArticle(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// articleExists reports whether a row with the given id is present. A missing or
+// malformed id yields (false, nil) — never a raw SQL error — so callers map it
+// to 404 rather than 500.
+func (h *handlers) articleExists(ctx context.Context, id string) (bool, error) {
+	var x int
+	err := h.db.QueryRowContext(ctx, `SELECT 1 FROM articles WHERE id = ?`, id).Scan(&x)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// updateArticleTitleBody updates only title/body (not published_at). It returns
+// the sql.Result so the caller can inspect RowsAffected. Shared by the JSON
+// default update branch and the admin UI edit form.
+func (h *handlers) updateArticleTitleBody(ctx context.Context, id, title, body string) (sql.Result, error) {
+	return h.db.ExecContext(ctx,
+		`UPDATE articles SET title = ?, body = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+		title, body, id,
+	)
+}
+
+// publishArticleByID sets published_at when still NULL (idempotent). found is
+// false when the id does not exist (→ 404). On success it returns the current
+// published_at so callers can confirm idempotency. Shared by the JSON publish
+// route and the admin UI publish button.
+func (h *handlers) publishArticleByID(ctx context.Context, id string) (publishedAt *string, found bool, err error) {
+	present, err := h.articleExists(ctx, id)
+	if err != nil {
+		return nil, false, err
+	}
+	if !present {
+		return nil, false, nil
+	}
+	if _, err := h.db.ExecContext(ctx,
+		`UPDATE articles SET published_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND published_at IS NULL`,
+		id,
+	); err != nil {
+		return nil, true, err
+	}
+	var published sql.NullString
+	if err := h.db.QueryRowContext(ctx,
+		`SELECT published_at FROM articles WHERE id = ?`, id,
+	).Scan(&published); err != nil {
+		return nil, true, err
+	}
+	var pub *string
+	if published.Valid && published.String != "" {
+		s := published.String
+		pub = &s
+	}
+	return pub, true, nil
+}
+
+// deleteArticleByID deletes one row and returns RowsAffected (0 ⇒ 404). Shared
+// by the JSON delete route and the admin UI delete button.
+func (h *handlers) deleteArticleByID(ctx context.Context, id string) (int64, error) {
+	res, err := h.db.ExecContext(ctx, `DELETE FROM articles WHERE id = ?`, id)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // scanArticle scans an article row from either a *sql.Rows or a *sql.Row (both

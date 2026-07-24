@@ -1,0 +1,18 @@
+{{define "content"}}
+<div class="page-head">
+  <h1>Artículos</h1>
+  <a class="btn btn-primary" href="/admin/articles/new">Nuevo artículo</a>
+</div>
+{{if .Articles}}
+<table class="table" id="articles-table">
+  <thead>
+    <tr><th>Título</th><th>Estado</th><th>Creado</th><th>Acciones</th></tr>
+  </thead>
+  <tbody>
+    {{range .Articles}}{{template "article_row" .}}{{end}}
+  </tbody>
+</table>
+{{else}}
+<p class="empty">No hay artículos todavía. <a href="/admin/articles/new">Creá el primero</a>.</p>
+{{end}}
+{{end}}
