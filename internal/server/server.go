@@ -82,6 +82,19 @@ func NewMux(deps Deps) (*http.ServeMux, error) {
 	mux.Handle("GET /content-types", h.requireAuth(http.HandlerFunc(h.handleListContentTypes)))
 	mux.Handle("GET /content-types/{name}", h.requireAuth(http.HandlerFunc(h.handleGetContentType)))
 
+	// CONTRACT-14: the GENERIC JSON CRUD over any dynamic content type, driven
+	// entirely by its persisted definition — no Go file per type. It lives under
+	// a dedicated /content/ prefix so the dynamic namespace can never collide
+	// with an existing or future static route. Gating reuses the SAME generic
+	// content.* permissions that already gate articles/products;
+	// content_types.manage gates DEFINING a type (CONTRACT-13), not loading
+	// CONTENT into one — they are different actions and are not mixed.
+	mux.Handle("GET /content/{type}", h.requireAuth(http.HandlerFunc(h.handleListContent)))
+	mux.Handle("GET /content/{type}/{id}", h.requireAuth(http.HandlerFunc(h.handleGetContent)))
+	mux.Handle("POST /content/{type}", h.requirePermission("content.create")(http.HandlerFunc(h.handleCreateContent)))
+	mux.Handle("PUT /content/{type}/{id}", h.requirePermission("content.update")(http.HandlerFunc(h.handleUpdateContent)))
+	mux.Handle("DELETE /content/{type}/{id}", h.requirePermission("content.delete")(http.HandlerFunc(h.handleDeleteContent)))
+
 	// CONTRACT-06: browser-facing UI (static assets, login/logout, protected
 	// home) on the same mux/handlers. JSON routes above are unaffected.
 	h.registerUIRoutes(mux)
