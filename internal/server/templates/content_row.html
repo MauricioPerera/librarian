@@ -1,0 +1,8 @@
+{{define "content_row"}}<tr id="content-{{.ID}}">
+  {{range .Cells}}<td class="cell-value">{{.}}</td>{{end}}
+  <td class="cell-date">{{.CreatedAt}}</td>
+  <td class="cell-actions">
+    <a class="btn btn-ghost" href="/admin/content/{{.Type}}/{{.ID}}/edit">Editar</a>
+    <button class="btn btn-danger" hx-delete="/admin/content/{{.Type}}/{{.ID}}" hx-target="#content-{{.ID}}" hx-swap="outerHTML" hx-confirm="¿Borrar esta fila?">Borrar</button>
+  </td>
+</tr>{{end}}

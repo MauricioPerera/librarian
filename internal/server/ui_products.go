@@ -86,7 +86,6 @@ func (h *handlers) registerAdminProductRoutes(mux *http.ServeMux) {
 
 // handleAdminProductsList renders the product list (title, price, sku, created).
 func (h *handlers) handleAdminProductsList(w http.ResponseWriter, r *http.Request) {
-	id, _ := identityFromContext(r.Context())
 	rows, err := h.listProducts(r.Context(), 100, 0)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -99,7 +98,7 @@ func (h *handlers) handleAdminProductsList(w http.ResponseWriter, r *http.Reques
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_ = adminProductListTmpl.ExecuteTemplate(w, "layout", adminProductListPage{
-		pageData: pageData{Title: "Productos — librarian", Authenticated: true, Email: emailOf(id), Path: r.URL.Path},
+		pageData: h.page(r, "Productos — librarian"),
 		Products: views,
 	})
 }
@@ -117,7 +116,7 @@ func (h *handlers) handleAdminProductNewForm(w http.ResponseWriter, r *http.Requ
 		}
 	}
 	renderProductForm(w, adminProductNewTmpl, http.StatusOK, adminProductFormPage{
-		pageData:       pageData{Title: "Nuevo producto — librarian", Authenticated: true, Email: emailOf(id), Path: r.URL.Path},
+		pageData:       h.page(r, "Nuevo producto — librarian"),
 		CanManageTerms: canManage,
 		TermGroups:     groups,
 	})
@@ -141,7 +140,7 @@ func (h *handlers) handleAdminProductCreate(w http.ResponseWriter, r *http.Reque
 			groups, _ = h.termGroupsFor(r.Context(), "product_terms", "product_id", "")
 		}
 		renderProductForm(w, adminProductNewTmpl, http.StatusBadRequest, adminProductFormPage{
-			pageData:       pageData{Title: "Nuevo producto — librarian", Authenticated: true, Email: id.Email, Path: r.URL.Path},
+			pageData:       h.page(r, "Nuevo producto — librarian"),
 			Product:        productView{Title: title, Body: body, Price: rawPrice(r), SKU: sku},
 			Error:          msg,
 			CanManageTerms: canManage,
@@ -161,7 +160,7 @@ func (h *handlers) handleAdminProductCreate(w http.ResponseWriter, r *http.Reque
 			groups, _ = h.termGroupsFor(r.Context(), "product_terms", "product_id", "")
 		}
 		renderProductForm(w, adminProductNewTmpl, status, adminProductFormPage{
-			pageData:       pageData{Title: "Nuevo producto — librarian", Authenticated: true, Email: id.Email, Path: r.URL.Path},
+			pageData:       h.page(r, "Nuevo producto — librarian"),
 			Product:        productView{Title: title, Body: body, Price: price, SKU: sku},
 			Error:          emsg,
 			CanManageTerms: canManage,
@@ -189,7 +188,7 @@ func (h *handlers) handleAdminProductEditForm(w http.ResponseWriter, r *http.Req
 		return
 	}
 	if !found {
-		renderNotFound(w, emailOf(id))
+		h.renderNotFound(w, r)
 		return
 	}
 	canManage := h.sessionCanManageTerms(r.Context(), id)
@@ -201,7 +200,7 @@ func (h *handlers) handleAdminProductEditForm(w http.ResponseWriter, r *http.Req
 		}
 	}
 	renderProductForm(w, adminProductEditTmpl, http.StatusOK, adminProductFormPage{
-		pageData:       pageData{Title: "Editar producto — librarian", Authenticated: true, Email: emailOf(id), Path: r.URL.Path},
+		pageData:       h.page(r, "Editar producto — librarian"),
 		Product:        toProductView(p),
 		CanManageTerms: canManage,
 		TermGroups:     groups,
@@ -213,8 +212,8 @@ func (h *handlers) handleAdminProductEditForm(w http.ResponseWriter, r *http.Req
 // re-renders the edit form (400) with the error. On success it sets HX-Redirect
 // so htmx navigates to the list without a full page reload.
 func (h *handlers) handleAdminProductUpdate(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
 	idn, _ := identityFromContext(r.Context())
+	id := r.PathValue("id")
 	canManage := h.sessionCanManageTerms(r.Context(), idn)
 	title, body, price, sku, msg, ok := parseProductForm(r)
 	present, err := h.productExists(r.Context(), id)
@@ -223,7 +222,7 @@ func (h *handlers) handleAdminProductUpdate(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	if !present {
-		renderNotFound(w, emailOf(idn))
+		h.renderNotFound(w, r)
 		return
 	}
 	if !ok {
@@ -232,7 +231,7 @@ func (h *handlers) handleAdminProductUpdate(w http.ResponseWriter, r *http.Reque
 			groups, _ = h.termGroupsFor(r.Context(), "product_terms", "product_id", id)
 		}
 		renderProductForm(w, adminProductEditTmpl, http.StatusBadRequest, adminProductFormPage{
-			pageData:       pageData{Title: "Editar producto — librarian", Authenticated: true, Email: emailOf(idn), Path: r.URL.Path},
+			pageData:       h.page(r, "Editar producto — librarian"),
 			Product:        productView{ID: id, Title: title, Body: body, Price: rawPrice(r), SKU: sku},
 			Error:          msg,
 			CanManageTerms: canManage,
@@ -251,7 +250,7 @@ func (h *handlers) handleAdminProductUpdate(w http.ResponseWriter, r *http.Reque
 			groups, _ = h.termGroupsFor(r.Context(), "product_terms", "product_id", id)
 		}
 		renderProductForm(w, adminProductEditTmpl, status, adminProductFormPage{
-			pageData:       pageData{Title: "Editar producto — librarian", Authenticated: true, Email: emailOf(idn), Path: r.URL.Path},
+			pageData:       h.page(r, "Editar producto — librarian"),
 			Product:        productView{ID: id, Title: title, Body: body, Price: price, SKU: sku},
 			Error:          emsg,
 			CanManageTerms: canManage,
@@ -275,14 +274,13 @@ func (h *handlers) handleAdminProductUpdate(w http.ResponseWriter, r *http.Reque
 // htmx's outerHTML swap removes the row.
 func (h *handlers) handleAdminProductDelete(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	idn, _ := identityFromContext(r.Context())
 	n, err := h.deleteProductByID(r.Context(), id)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 	if n == 0 {
-		renderNotFound(w, emailOf(idn))
+		h.renderNotFound(w, r)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")

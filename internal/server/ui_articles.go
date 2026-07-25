@@ -50,26 +50,22 @@ func renderAdminForm(w http.ResponseWriter, tmpl *template.Template, status int,
 // renderForbidden writes the simple 403 HTML page (valid session, missing the
 // required permission). It is NEVER the JSON writeError envelope — a human in a
 // browser must not see raw API JSON.
-func renderForbidden(w http.ResponseWriter, email string) {
+// CONTRACT-15 T1: it is a METHOD taking the request so it renders through
+// h.page(r, …) like every other page — the 403 keeps the caller's sidebar,
+// dynamic content types included.
+func (h *handlers) renderForbidden(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusForbidden)
-	_ = forbiddenTmpl.ExecuteTemplate(w, "layout", pageData{
-		Title:         "Sin permiso — librarian",
-		Authenticated: email != "",
-		Email:         email,
-	})
+	_ = forbiddenTmpl.ExecuteTemplate(w, "layout", h.page(r, "Sin permiso — librarian"))
 }
 
 // renderNotFound writes the simple 404 HTML page for a missing/malformed article
-// id on an admin route — never a 500 and never raw JSON.
-func renderNotFound(w http.ResponseWriter, email string) {
+// id on an admin route — never a 500 and never raw JSON. Same CONTRACT-15 T1
+// note as renderForbidden: a method, rendered through h.page(r, …).
+func (h *handlers) renderNotFound(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusNotFound)
-	_ = notFoundTmpl.ExecuteTemplate(w, "layout", pageData{
-		Title:         "No encontrado — librarian",
-		Authenticated: email != "",
-		Email:         email,
-	})
+	_ = notFoundTmpl.ExecuteTemplate(w, "layout", h.page(r, "No encontrado — librarian"))
 }
 
 // articleView is the row/detail view model for the admin templates. Published is
@@ -134,7 +130,6 @@ func (h *handlers) registerAdminArticleRoutes(mux *http.ServeMux) {
 
 // handleAdminArticlesList renders the article list (title, status, created).
 func (h *handlers) handleAdminArticlesList(w http.ResponseWriter, r *http.Request) {
-	id, _ := identityFromContext(r.Context())
 	rows, err := h.listArticles(r.Context(), 100, 0)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -147,7 +142,7 @@ func (h *handlers) handleAdminArticlesList(w http.ResponseWriter, r *http.Reques
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_ = adminListTmpl.ExecuteTemplate(w, "layout", adminListPage{
-		pageData: pageData{Title: "Artículos — librarian", Authenticated: true, Email: emailOf(id), Path: r.URL.Path},
+		pageData: h.page(r, "Artículos — librarian"),
 		Articles: views,
 	})
 }
@@ -165,7 +160,7 @@ func (h *handlers) handleAdminArticleNewForm(w http.ResponseWriter, r *http.Requ
 		}
 	}
 	renderAdminForm(w, adminNewTmpl, http.StatusOK, adminFormPage{
-		pageData:       pageData{Title: "Nuevo artículo — librarian", Authenticated: true, Email: emailOf(id), Path: r.URL.Path},
+		pageData:       h.page(r, "Nuevo artículo — librarian"),
 		CanManageTerms: canManage,
 		TermGroups:     groups,
 	})
@@ -184,7 +179,7 @@ func (h *handlers) handleAdminArticleCreate(w http.ResponseWriter, r *http.Reque
 	canManage := h.sessionCanManageTerms(r.Context(), id)
 	if err := r.ParseForm(); err != nil {
 		renderAdminForm(w, adminNewTmpl, http.StatusBadRequest, adminFormPage{
-			pageData:       pageData{Title: "Nuevo artículo — librarian", Authenticated: true, Email: id.Email, Path: r.URL.Path},
+			pageData:       h.page(r, "Nuevo artículo — librarian"),
 			Error:          "Formulario inválido.",
 			CanManageTerms: canManage,
 		})
@@ -195,7 +190,7 @@ func (h *handlers) handleAdminArticleCreate(w http.ResponseWriter, r *http.Reque
 	if title == "" || body == "" {
 		groups, _ := h.termGroupsFor(r.Context(), "article_terms", "article_id", "")
 		renderAdminForm(w, adminNewTmpl, http.StatusBadRequest, adminFormPage{
-			pageData:       pageData{Title: "Nuevo artículo — librarian", Authenticated: true, Email: id.Email, Path: r.URL.Path},
+			pageData:       h.page(r, "Nuevo artículo — librarian"),
 			Article:        articleView{Title: title, Body: body},
 			Error:          "title and body are required",
 			CanManageTerms: canManage,
@@ -228,7 +223,7 @@ func (h *handlers) handleAdminArticleEditForm(w http.ResponseWriter, r *http.Req
 		return
 	}
 	if !found {
-		renderNotFound(w, emailOf(id))
+		h.renderNotFound(w, r)
 		return
 	}
 	canManage := h.sessionCanManageTerms(r.Context(), id)
@@ -240,7 +235,7 @@ func (h *handlers) handleAdminArticleEditForm(w http.ResponseWriter, r *http.Req
 		}
 	}
 	renderAdminForm(w, adminEditTmpl, http.StatusOK, adminFormPage{
-		pageData:       pageData{Title: "Editar artículo — librarian", Authenticated: true, Email: emailOf(id), Path: r.URL.Path},
+		pageData:       h.page(r, "Editar artículo — librarian"),
 		Article:        toArticleView(a),
 		CanManageTerms: canManage,
 		TermGroups:     groups,
@@ -251,8 +246,8 @@ func (h *handlers) handleAdminArticleEditForm(w http.ResponseWriter, r *http.Req
 // missing/malformed id → 404 HTML. On success it sets HX-Redirect so htmx
 // navigates to the list without a full reload of the current page.
 func (h *handlers) handleAdminArticleUpdate(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
 	idn, _ := identityFromContext(r.Context())
+	id := r.PathValue("id")
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "invalid form", http.StatusBadRequest)
 		return
@@ -265,7 +260,7 @@ func (h *handlers) handleAdminArticleUpdate(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	if !present {
-		renderNotFound(w, emailOf(idn))
+		h.renderNotFound(w, r)
 		return
 	}
 	canManage := h.sessionCanManageTerms(r.Context(), idn)
@@ -276,7 +271,7 @@ func (h *handlers) handleAdminArticleUpdate(w http.ResponseWriter, r *http.Reque
 			groups, _ = h.termGroupsFor(r.Context(), "article_terms", "article_id", id)
 		}
 		renderAdminForm(w, adminEditTmpl, http.StatusBadRequest, adminFormPage{
-			pageData:       pageData{Title: "Editar artículo — librarian", Authenticated: true, Email: emailOf(idn), Path: r.URL.Path},
+			pageData:       h.page(r, "Editar artículo — librarian"),
 			Article:        articleView{ID: id, Title: title, Body: body},
 			Error:          "title and body are required",
 			CanManageTerms: canManage,
@@ -306,14 +301,13 @@ func (h *handlers) handleAdminArticleUpdate(w http.ResponseWriter, r *http.Reque
 // fragment so htmx swaps the row in place.
 func (h *handlers) handleAdminArticlePublish(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	idn, _ := identityFromContext(r.Context())
 	_, found, err := h.publishArticleByID(r.Context(), id)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 	if !found {
-		renderNotFound(w, emailOf(idn))
+		h.renderNotFound(w, r)
 		return
 	}
 	// Re-fetch so the row reflects the persisted published_at.
@@ -332,14 +326,13 @@ func (h *handlers) handleAdminArticlePublish(w http.ResponseWriter, r *http.Requ
 // htmx's outerHTML swap removes the row.
 func (h *handlers) handleAdminArticleDelete(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	idn, _ := identityFromContext(r.Context())
 	n, err := h.deleteArticleByID(r.Context(), id)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 	if n == 0 {
-		renderNotFound(w, emailOf(idn))
+		h.renderNotFound(w, r)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")

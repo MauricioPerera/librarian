@@ -1,0 +1,6 @@
+{{define "content_type_field_row"}}<div class="field-row">
+  <input type="text" name="field_name" value="{{.Name}}" placeholder="nombre_del_campo" class="field-row-name">
+  <select name="field_type" class="field-row-type">
+    {{range .Types}}<option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Value}}</option>{{end}}
+  </select>
+</div>{{end}}

@@ -1,0 +1,27 @@
+{{define "content"}}
+<div class="card form-card">
+  <h1>Nuevo tipo de contenido</h1>
+  {{if .Error}}<p class="error" role="alert">{{.Error}}</p>{{end}}
+  <form method="post" action="/admin/content-types" class="form">
+    <label>Nombre del tipo
+      <input type="text" name="name" value="{{.Name}}" placeholder="recetas" required autofocus>
+    </label>
+    <p class="muted">Solo minúsculas, números y guion bajo, empezando por una letra (por ejemplo <code>recetas</code> o <code>notas_internas</code>).</p>
+    <fieldset class="fields-fieldset">
+      <legend>Campos</legend>
+      <div id="content-type-fields">
+        {{range .Fields}}{{template "content_type_field_row" .}}{{end}}
+      </div>
+      <button type="button" class="btn btn-ghost" id="add-field"
+              hx-get="/admin/content-types/new/field"
+              hx-target="#content-type-fields"
+              hx-swap="beforeend">Agregar campo</button>
+      <p class="muted">Las filas con el nombre vacío se ignoran. Un tipo sin campos también es válido.</p>
+    </fieldset>
+    <div class="form-actions">
+      <button type="submit" class="btn btn-primary">Crear tipo</button>
+      <a class="btn btn-ghost" href="/admin/content-types">Cancelar</a>
+    </div>
+  </form>
+</div>
+{{end}}

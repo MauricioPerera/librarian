@@ -1,0 +1,30 @@
+{{define "content"}}
+<div class="page-head">
+  <h1>Tipos de contenido</h1>
+  <a class="btn btn-primary" href="/admin/content-types/new">Nuevo tipo</a>
+</div>
+{{if .Types}}
+<div class="table-scroll">
+<table class="table" id="content-types-table">
+  <thead>
+    <tr><th>Nombre</th><th>Campos</th><th>Contenido</th></tr>
+  </thead>
+  <tbody>
+    {{range .Types}}
+    <tr id="content-type-{{.Name}}">
+      <td class="cell-title">{{.Name}}</td>
+      <td>
+        {{if .Fields}}{{range .Fields}}<code>{{.Name}}</code> <span class="muted">({{.Type}})</span> {{end}}
+        {{else}}<span class="muted">sin campos propios</span>{{end}}
+      </td>
+      <td class="cell-actions"><a class="btn btn-ghost" href="/admin/content/{{.Name}}">Ver contenido</a></td>
+    </tr>
+    {{end}}
+  </tbody>
+</table>
+</div>
+{{else}}
+<p class="empty">No hay tipos de contenido dinámicos todavía. <a href="/admin/content-types/new">Creá el primero</a>.</p>
+{{end}}
+<p class="muted">Los campos de un tipo quedan congelados al crearlo: para cambiarlos hay que crear un tipo nuevo.</p>
+{{end}}

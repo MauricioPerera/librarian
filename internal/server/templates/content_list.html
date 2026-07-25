@@ -1,0 +1,20 @@
+{{define "content"}}
+<div class="page-head">
+  <h1>{{.Type}}</h1>
+  <a class="btn btn-primary" href="/admin/content/{{.Type}}/new">Nuevo</a>
+</div>
+{{if .Rows}}
+<div class="table-scroll">
+<table class="table" id="content-table">
+  <thead>
+    <tr>{{range .Columns}}<th>{{.}}</th>{{end}}<th>Creado</th><th>Acciones</th></tr>
+  </thead>
+  <tbody>
+    {{range .Rows}}{{template "content_row" .}}{{end}}
+  </tbody>
+</table>
+</div>
+{{else}}
+<p class="empty">No hay contenido de tipo «{{.Type}}» todavía. <a href="/admin/content/{{.Type}}/new">Creá el primero</a>.</p>
+{{end}}
+{{end}}

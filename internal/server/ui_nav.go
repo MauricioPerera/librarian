@@ -17,7 +17,20 @@ package server
 // not itself a menu entry) still resolve to the right section by prefix without
 // any extra bookkeeping in the handler.
 
-import "strings"
+// CONTRACT-15 T1 — the menu stops being purely static. The sidebar must also
+// list the DYNAMIC content types, and those live in the database, so Nav() is
+// now "static sections + the per-request dynamic sections carried on
+// pageData.dynamic". The dynamic half is filled EXCLUSIVELY by h.page(r, …)
+// (ui.go), the single constructor every admin page goes through; see the long
+// comment on pageData for why a page cannot silently lose those entries.
+
+import (
+	"context"
+	"strings"
+
+	"github.com/MauricioPerera/librarian/internal/schema"
+	"github.com/MauricioPerera/librarian/internal/store"
+)
 
 // navItem is one sub-option (leaf) under a section.
 type navItem struct {
@@ -59,6 +72,48 @@ var navSections = []navSection{
 		{Label: "Todas las keys", Href: "/admin/api-keys"},
 		{Label: "Crear nueva", Href: "/admin/api-keys/new"},
 	}},
+	// CONTRACT-15 T2: managing the DEFINITIONS is a fixed pair of routes, so it
+	// belongs in the static half. Only the per-type entries below it are dynamic.
+	{Label: "Tipos de contenido", Href: "/admin/content-types", Children: []navItem{
+		{Label: "Todos los tipos", Href: "/admin/content-types"},
+		{Label: "Añadir nuevo", Href: "/admin/content-types/new"},
+	}},
+}
+
+// dynamicNavSections turns the PERSISTED dynamic content-type definitions into
+// sidebar sections, one per type, each with the same "list / add new" submenu
+// the code-defined types have. The labels and hrefs are built from the type
+// NAME, which is `[a-z][a-z0-9_]*` by the CONTRACT-13 gate and was re-validated
+// on load, so nothing hostile can reach an href.
+//
+// A read failure yields NO dynamic entries rather than an error: this is the
+// sidebar, and a database hiccup must not turn every admin page into a 500. The
+// static sections (including "Tipos de contenido", from which the admin can see
+// the real list) always render.
+func (h *handlers) dynamicNavSections(ctx context.Context) []navSection {
+	defs, err := store.LoadDefinitions(ctx, store.FromDB(h.db))
+	if err != nil {
+		return nil
+	}
+	return navSectionsForTypes(defs)
+}
+
+// navSectionsForTypes is the pure half of dynamicNavSections (no database), so
+// the mapping definition→menu entry is testable on its own.
+func navSectionsForTypes(defs []schema.ContentTypeDefinition) []navSection {
+	out := make([]navSection, 0, len(defs))
+	for _, d := range defs {
+		base := "/admin/content/" + d.Name
+		out = append(out, navSection{
+			Label: d.Name,
+			Href:  base,
+			Children: []navItem{
+				{Label: "Todo el contenido", Href: base},
+				{Label: "Añadir nuevo", Href: base + "/new"},
+			},
+		})
+	}
+	return out
 }
 
 // navItemView / navSectionView are the per-request view models the layout ranges
@@ -92,9 +147,16 @@ func sectionActive(sectionHref, path string) bool {
 // template stays declarative (range + .Active). A submenu item is active only on
 // an exact path match, so "Todos los artículos" (/admin/articles) and "Añadir
 // nuevo" (/admin/articles/new) never both highlight.
+// CONTRACT-15 T1: it ranges over the static sections FOLLOWED BY p.dynamic (the
+// per-request entries filled by h.page). Active-state inference is identical for
+// both halves — a dynamic type's section lights up on /admin/content/{type} and
+// any path beneath it, exactly like Artículos or Productos.
 func (p pageData) Nav() []navSectionView {
-	out := make([]navSectionView, 0, len(navSections))
-	for _, s := range navSections {
+	sections := make([]navSection, 0, len(navSections)+len(p.dynamic))
+	sections = append(sections, navSections...)
+	sections = append(sections, p.dynamic...)
+	out := make([]navSectionView, 0, len(sections))
+	for _, s := range sections {
 		sv := navSectionView{
 			Label:  s.Label,
 			Href:   s.Href,

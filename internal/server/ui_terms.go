@@ -76,7 +76,6 @@ func (h *handlers) registerAdminTermRoutes(mux *http.ServeMux) {
 
 // handleAdminTermsList renders the term list (name, taxonomy, slug, parent).
 func (h *handlers) handleAdminTermsList(w http.ResponseWriter, r *http.Request) {
-	id, _ := identityFromContext(r.Context())
 	terms, err := h.listTerms(r.Context())
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -90,21 +89,20 @@ func (h *handlers) handleAdminTermsList(w http.ResponseWriter, r *http.Request) 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_ = adminTermListTmpl.ExecuteTemplate(w, "layout", adminTermListPage{
-		pageData: pageData{Title: "Categorías y tags — librarian", Authenticated: true, Email: emailOf(id), Path: r.URL.Path},
+		pageData: h.page(r, "Categorías y tags — librarian"),
 		Terms:    views,
 	})
 }
 
 // handleAdminTermNewForm renders the empty create form.
 func (h *handlers) handleAdminTermNewForm(w http.ResponseWriter, r *http.Request) {
-	id, _ := identityFromContext(r.Context())
 	parents, err := h.parentOptions(r.Context(), "", "")
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 	renderTermForm(w, adminTermNewTmpl, http.StatusOK, adminTermFormPage{
-		pageData:   pageData{Title: "Nueva categoría/tag — librarian", Authenticated: true, Email: emailOf(id), Path: r.URL.Path},
+		pageData:   h.page(r, "Nueva categoría/tag — librarian"),
 		Taxonomies: taxonomyOptions(""),
 		Parents:    parents,
 	})
@@ -113,10 +111,9 @@ func (h *handlers) handleAdminTermNewForm(w http.ResponseWriter, r *http.Request
 // handleAdminTermCreate handles the create form POST (terms.manage). A validation
 // failure or duplicate slug re-renders the form with the error (no row created).
 func (h *handlers) handleAdminTermCreate(w http.ResponseWriter, r *http.Request) {
-	id, _ := identityFromContext(r.Context())
 	req, msg, ok := parseTermForm(r)
 	if !ok {
-		h.rerenderTermForm(w, r, adminTermNewTmpl, "Nueva categoría/tag — librarian", termView{Taxonomy: req.Taxonomy, Name: req.Name, Slug: req.Slug, ParentID: ptrString(req.ParentID)}, msg, emailOf(id))
+		h.rerenderTermForm(w, r, adminTermNewTmpl, "Nueva categoría/tag — librarian", termView{Taxonomy: req.Taxonomy, Name: req.Name, Slug: req.Slug, ParentID: ptrString(req.ParentID)}, msg)
 		return
 	}
 	if _, err := h.insertTerm(r.Context(), req); err != nil {
@@ -125,7 +122,7 @@ func (h *handlers) handleAdminTermCreate(w http.ResponseWriter, r *http.Request)
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
-		h.rerenderTermForm(w, r, adminTermNewTmpl, "Nueva categoría/tag — librarian", termView{Taxonomy: req.Taxonomy, Name: req.Name, Slug: req.Slug, ParentID: ptrString(req.ParentID)}, emsg, emailOf(id))
+		h.rerenderTermForm(w, r, adminTermNewTmpl, "Nueva categoría/tag — librarian", termView{Taxonomy: req.Taxonomy, Name: req.Name, Slug: req.Slug, ParentID: ptrString(req.ParentID)}, emsg)
 		return
 	}
 	http.Redirect(w, r, "/admin/terms", http.StatusSeeOther)
@@ -134,14 +131,13 @@ func (h *handlers) handleAdminTermCreate(w http.ResponseWriter, r *http.Request)
 // handleAdminTermEditForm renders the edit form preloaded with the term. A
 // missing/malformed id → 404 HTML.
 func (h *handlers) handleAdminTermEditForm(w http.ResponseWriter, r *http.Request) {
-	id, _ := identityFromContext(r.Context())
 	t, found, err := h.fetchTerm(r.Context(), r.PathValue("id"))
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 	if !found {
-		renderNotFound(w, emailOf(id))
+		h.renderNotFound(w, r)
 		return
 	}
 	// A term cannot be its own parent, so it is excluded from the parent options.
@@ -151,7 +147,7 @@ func (h *handlers) handleAdminTermEditForm(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	renderTermForm(w, adminTermEditTmpl, http.StatusOK, adminTermFormPage{
-		pageData:   pageData{Title: "Editar categoría/tag — librarian", Authenticated: true, Email: emailOf(id), Path: r.URL.Path},
+		pageData:   h.page(r, "Editar categoría/tag — librarian"),
 		Term:       termView{ID: t.ID, Taxonomy: t.Taxonomy, Name: t.Name, Slug: t.Slug, ParentID: ptrString(t.ParentID)},
 		Taxonomies: taxonomyOptions(t.Taxonomy),
 		Parents:    parents,
@@ -163,15 +159,14 @@ func (h *handlers) handleAdminTermEditForm(w http.ResponseWriter, r *http.Reques
 // sets HX-Redirect to the list.
 func (h *handlers) handleAdminTermUpdate(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	idn, _ := identityFromContext(r.Context())
 	req, msg, ok := parseTermForm(r)
 	if !ok {
-		h.rerenderTermForm(w, r, adminTermEditTmpl, "Editar categoría/tag — librarian", termView{ID: id, Taxonomy: req.Taxonomy, Name: req.Name, Slug: req.Slug, ParentID: ptrString(req.ParentID)}, msg, emailOf(idn))
+		h.rerenderTermForm(w, r, adminTermEditTmpl, "Editar categoría/tag — librarian", termView{ID: id, Taxonomy: req.Taxonomy, Name: req.Name, Slug: req.Slug, ParentID: ptrString(req.ParentID)}, msg)
 		return
 	}
 	if _, err := h.updateTerm(r.Context(), id, req); err != nil {
 		if errors.Is(err, errTermNotFound) {
-			renderNotFound(w, emailOf(idn))
+			h.renderNotFound(w, r)
 			return
 		}
 		status, emsg := termWriteError(err)
@@ -179,7 +174,7 @@ func (h *handlers) handleAdminTermUpdate(w http.ResponseWriter, r *http.Request)
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
 		}
-		h.rerenderTermForm(w, r, adminTermEditTmpl, "Editar categoría/tag — librarian", termView{ID: id, Taxonomy: req.Taxonomy, Name: req.Name, Slug: req.Slug, ParentID: ptrString(req.ParentID)}, emsg, emailOf(idn))
+		h.rerenderTermForm(w, r, adminTermEditTmpl, "Editar categoría/tag — librarian", termView{ID: id, Taxonomy: req.Taxonomy, Name: req.Name, Slug: req.Slug, ParentID: ptrString(req.ParentID)}, emsg)
 		return
 	}
 	w.Header().Set("HX-Redirect", "/admin/terms")
@@ -190,14 +185,13 @@ func (h *handlers) handleAdminTermUpdate(w http.ResponseWriter, r *http.Request)
 // missing id → 404. On success it returns an empty 200 body so htmx removes the
 // row.
 func (h *handlers) handleAdminTermDelete(w http.ResponseWriter, r *http.Request) {
-	idn, _ := identityFromContext(r.Context())
 	n, err := h.deleteTermByID(r.Context(), r.PathValue("id"))
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 	if n == 0 {
-		renderNotFound(w, emailOf(idn))
+		h.renderNotFound(w, r)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -230,7 +224,7 @@ func parseTermForm(r *http.Request) (termBody, string, bool) {
 // rerenderTermForm re-renders a term form (new or edit) after a validation or
 // write error, rebuilding the taxonomy + parent option lists so the page is
 // consistent.
-func (h *handlers) rerenderTermForm(w http.ResponseWriter, r *http.Request, tmpl *template.Template, title string, tv termView, errMsg, email string) {
+func (h *handlers) rerenderTermForm(w http.ResponseWriter, r *http.Request, tmpl *template.Template, title string, tv termView, errMsg string) {
 	parents, err := h.parentOptions(r.Context(), tv.ID, tv.ParentID)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -238,7 +232,7 @@ func (h *handlers) rerenderTermForm(w http.ResponseWriter, r *http.Request, tmpl
 	}
 	status := http.StatusBadRequest
 	renderTermForm(w, tmpl, status, adminTermFormPage{
-		pageData:   pageData{Title: title, Authenticated: true, Email: email, Path: r.URL.Path},
+		pageData:   h.page(r, title),
 		Term:       tv,
 		Taxonomies: taxonomyOptions(tv.Taxonomy),
 		Parents:    parents,

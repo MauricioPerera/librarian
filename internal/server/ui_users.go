@@ -125,7 +125,6 @@ func (h *handlers) registerAdminUserRoutes(mux *http.ServeMux) {
 
 // handleAdminUsersList renders the user list (email, status, roles).
 func (h *handlers) handleAdminUsersList(w http.ResponseWriter, r *http.Request) {
-	idn, _ := identityFromContext(r.Context())
 	users, err := auth.ListUsers(r.Context(), h.db)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -138,7 +137,7 @@ func (h *handlers) handleAdminUsersList(w http.ResponseWriter, r *http.Request) 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_ = adminUsersListTmpl.ExecuteTemplate(w, "layout", adminUsersListPage{
-		pageData: pageData{Title: "Usuarios — librarian", Authenticated: true, Email: emailOf(idn), Path: r.URL.Path},
+		pageData: h.page(r, "Usuarios — librarian"),
 		Users:    views,
 	})
 }
@@ -146,9 +145,8 @@ func (h *handlers) handleAdminUsersList(w http.ResponseWriter, r *http.Request) 
 // handleAdminUserNewForm renders the empty create-user form with all catalog
 // roles unchecked.
 func (h *handlers) handleAdminUserNewForm(w http.ResponseWriter, r *http.Request) {
-	idn, _ := identityFromContext(r.Context())
 	renderUserNew(w, http.StatusOK, adminUserNewPage{
-		pageData: pageData{Title: "Nuevo usuario — librarian", Authenticated: true, Email: emailOf(idn), Path: r.URL.Path},
+		pageData: h.page(r, "Nuevo usuario — librarian"),
 		Roles:    roleChecks(nil),
 	})
 }
@@ -159,10 +157,9 @@ func (h *handlers) handleAdminUserNewForm(w http.ResponseWriter, r *http.Request
 // An unknown role in the crafted POST or a duplicate email re-renders the form
 // with a 400 and the error, preserving the entered email and role selection.
 func (h *handlers) handleAdminUserCreate(w http.ResponseWriter, r *http.Request) {
-	idn, _ := identityFromContext(r.Context())
 	if err := r.ParseForm(); err != nil {
 		renderUserNew(w, http.StatusBadRequest, adminUserNewPage{
-			pageData: pageData{Title: "Nuevo usuario — librarian", Authenticated: true, Email: emailOf(idn), Path: r.URL.Path},
+			pageData: h.page(r, "Nuevo usuario — librarian"),
 			Roles:    roleChecks(nil),
 			Error:    "Formulario inválido.",
 		})
@@ -173,7 +170,7 @@ func (h *handlers) handleAdminUserCreate(w http.ResponseWriter, r *http.Request)
 	roles := r.PostForm["roles"]
 	if email == "" || password == "" {
 		renderUserNew(w, http.StatusBadRequest, adminUserNewPage{
-			pageData:  pageData{Title: "Nuevo usuario — librarian", Authenticated: true, Email: emailOf(idn), Path: r.URL.Path},
+			pageData:  h.page(r, "Nuevo usuario — librarian"),
 			FormEmail: email,
 			Roles:     roleChecks(roles),
 			Error:     "email and password are required",
@@ -184,7 +181,7 @@ func (h *handlers) handleAdminUserCreate(w http.ResponseWriter, r *http.Request)
 		// Unknown role (crafted request) or duplicate email — a client error, not
 		// a 500. Re-render with the reason and the user's input preserved.
 		renderUserNew(w, http.StatusBadRequest, adminUserNewPage{
-			pageData:  pageData{Title: "Nuevo usuario — librarian", Authenticated: true, Email: emailOf(idn), Path: r.URL.Path},
+			pageData:  h.page(r, "Nuevo usuario — librarian"),
 			FormEmail: email,
 			Roles:     roleChecks(roles),
 			Error:     userCreateErrorMessage(err),
@@ -197,20 +194,19 @@ func (h *handlers) handleAdminUserCreate(w http.ResponseWriter, r *http.Request)
 // handleAdminUserDetail renders the combined detail + edit page. A missing or
 // malformed id → 404 HTML (never 500), the same pattern as the articles UI.
 func (h *handlers) handleAdminUserDetail(w http.ResponseWriter, r *http.Request) {
-	idn, _ := identityFromContext(r.Context())
 	u, found, err := auth.GetUser(r.Context(), h.db, r.PathValue("id"))
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 	if !found {
-		renderNotFound(w, emailOf(idn))
+		h.renderNotFound(w, r)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_ = adminUsersDetailTmpl.ExecuteTemplate(w, "layout", adminUserDetailPage{
-		pageData: pageData{Title: "Usuario — librarian", Authenticated: true, Email: emailOf(idn), Path: r.URL.Path},
+		pageData: h.page(r, "Usuario — librarian"),
 		User:     userView{ID: u.ID, Email: u.Email, Status: u.Status, Roles: u.Roles},
 		Statuses: statusOptions(u.Status),
 		Roles:    roleChecks(u.Roles),
@@ -222,7 +218,6 @@ func (h *handlers) handleAdminUserDetail(w http.ResponseWriter, r *http.Request)
 // only offers valid ones) → 400. On success it sets HX-Redirect back to the
 // detail page so htmx re-navigates and the page shows the persisted status.
 func (h *handlers) handleAdminUserStatus(w http.ResponseWriter, r *http.Request) {
-	idn, _ := identityFromContext(r.Context())
 	uid := r.PathValue("id")
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "invalid form", http.StatusBadRequest)
@@ -231,7 +226,7 @@ func (h *handlers) handleAdminUserStatus(w http.ResponseWriter, r *http.Request)
 	err := auth.UpdateUserStatus(r.Context(), h.db, uid, r.PostFormValue("status"))
 	switch {
 	case errors.Is(err, auth.ErrUserNotFound):
-		renderNotFound(w, emailOf(idn))
+		h.renderNotFound(w, r)
 		return
 	case errors.Is(err, auth.ErrInvalidStatus):
 		http.Error(w, "invalid status", http.StatusBadRequest)
@@ -250,7 +245,6 @@ func (h *handlers) handleAdminUserStatus(w http.ResponseWriter, r *http.Request)
 // assignment is rejected and nothing changes). On success it sets HX-Redirect
 // back to the detail page.
 func (h *handlers) handleAdminUserRoles(w http.ResponseWriter, r *http.Request) {
-	idn, _ := identityFromContext(r.Context())
 	uid := r.PathValue("id")
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "invalid form", http.StatusBadRequest)
@@ -259,7 +253,7 @@ func (h *handlers) handleAdminUserRoles(w http.ResponseWriter, r *http.Request) 
 	err := auth.SetUserRoles(r.Context(), h.db, uid, r.PostForm["roles"])
 	switch {
 	case errors.Is(err, auth.ErrUserNotFound):
-		renderNotFound(w, emailOf(idn))
+		h.renderNotFound(w, r)
 		return
 	case errors.Is(err, auth.ErrUnknownRole):
 		http.Error(w, "unknown role", http.StatusBadRequest)
@@ -276,7 +270,6 @@ func (h *handlers) handleAdminUserRoles(w http.ResponseWriter, r *http.Request) 
 // live role_permissions table (via rolesWithPermissions), NOT a hardcoded map, so
 // a grant made elsewhere shows up here. Requires only a session — no write.
 func (h *handlers) handleAdminRolesList(w http.ResponseWriter, r *http.Request) {
-	idn, _ := identityFromContext(r.Context())
 	roles, err := h.rolesWithPermissions(r.Context())
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -285,7 +278,7 @@ func (h *handlers) handleAdminRolesList(w http.ResponseWriter, r *http.Request) 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_ = adminRolesTmpl.ExecuteTemplate(w, "layout", adminRolesPage{
-		pageData: pageData{Title: "Roles y permisos — librarian", Authenticated: true, Email: emailOf(idn), Path: r.URL.Path},
+		pageData: h.page(r, "Roles y permisos — librarian"),
 		Roles:    roles,
 	})
 }

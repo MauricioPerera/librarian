@@ -1,0 +1,26 @@
+{{define "content_fields"}}
+{{range .Fields}}
+<div class="content-field">
+  <label>{{.Name}} <span class="muted">({{.Kind}})</span>
+    {{if eq .Kind "boolean"}}
+      {{/* The hidden companion is what makes an UNCHECKED box arrive as false
+           instead of not arriving at all (which CONTRACT-14 would store as
+           NULL). The server takes the LAST submitted value for the name. */}}
+      <input type="hidden" name="{{.Name}}" value="false">
+      <input type="checkbox" name="{{.Name}}" value="true"{{if .Checked}} checked{{end}}>
+      {{if .IsNull}}<span class="muted">(sin valor / NULL — al guardar quedará en «no»)</span>{{end}}
+    {{else if eq .Kind "integer"}}
+      <input type="number" step="1" name="{{.Name}}" value="{{.Value}}">
+    {{else if eq .Kind "date"}}
+      <input type="date" name="{{.Name}}" value="{{.Value}}">
+    {{else if eq .Kind "decimal"}}
+      <input type="text" inputmode="decimal" name="{{.Name}}" value="{{.Value}}">
+    {{else}}
+      <input type="text" name="{{.Name}}" value="{{.Value}}">
+    {{end}}
+  </label>
+</div>
+{{end}}
+{{if not .Fields}}<p class="muted">Este tipo no declara campos propios.</p>{{end}}
+<p class="muted">Un campo vacío se guarda como NULL (sin valor).</p>
+{{end}}

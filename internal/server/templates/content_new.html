@@ -1,0 +1,13 @@
+{{define "content"}}
+<div class="card form-card">
+  <h1>Nuevo — {{.Type}}</h1>
+  {{if .Error}}<p class="error" role="alert">{{.Error}}</p>{{end}}
+  <form method="post" action="/admin/content/{{.Type}}" class="form">
+    {{template "content_fields" .}}
+    <div class="form-actions">
+      <button type="submit" class="btn btn-primary">Crear</button>
+      <a class="btn btn-ghost" href="/admin/content/{{.Type}}">Cancelar</a>
+    </div>
+  </form>
+</div>
+{{end}}

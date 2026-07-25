@@ -38,7 +38,7 @@ const sessionMaxAgeSeconds = 24 * 60 * 60
 //go:embed assets/htmx.min.js assets/app.css
 var assetsFS embed.FS
 
-//go:embed templates/layout.html templates/login.html templates/home.html templates/articles_list.html templates/articles_row.html templates/articles_new.html templates/articles_edit.html templates/products_list.html templates/products_row.html templates/products_new.html templates/products_edit.html templates/terms_list.html templates/terms_row.html templates/terms_new.html templates/terms_edit.html templates/error_403.html templates/error_404.html templates/users_list.html templates/users_new.html templates/users_detail.html templates/roles_list.html templates/apikeys_list.html templates/apikeys_row.html templates/apikeys_new.html templates/apikeys_created.html
+//go:embed templates/layout.html templates/login.html templates/home.html templates/articles_list.html templates/articles_row.html templates/articles_new.html templates/articles_edit.html templates/products_list.html templates/products_row.html templates/products_new.html templates/products_edit.html templates/terms_list.html templates/terms_row.html templates/terms_new.html templates/terms_edit.html templates/error_403.html templates/error_404.html templates/users_list.html templates/users_new.html templates/users_detail.html templates/roles_list.html templates/apikeys_list.html templates/apikeys_row.html templates/apikeys_new.html templates/apikeys_created.html templates/content_types_list.html templates/content_types_new.html templates/content_type_field_row.html templates/content_list.html templates/content_row.html templates/content_fields.html templates/content_new.html templates/content_edit.html
 var templatesFS embed.FS
 
 // assetVersion is a short hash of the embedded static assets' content,
@@ -98,11 +98,52 @@ const genericLoginError = "Email o contraseña incorrectos."
 // (CONTRACT-10) from which the shared layout infers the active sidebar
 // section/sub-item via the Nav() method — presentation only, no route or
 // authorization data.
+//
+// CONTRACT-15 T1 — the dynamic sidebar, and why this struct is no longer built
+// by hand. The sidebar must list the DYNAMIC content types, and that list lives
+// in the database, so Nav() can no longer be a pure function of a static
+// package var. The list is carried in the unexported `dynamic` field, which
+// only h.page() (below) can fill — a handler in another file cannot even name
+// it in a composite literal without going through the constructor, and
+// TestPageDataIsBuiltOnlyByTheConstructor (server_ui_content_test.go) fails the
+// build's test suite if any file other than ui.go writes a `pageData{` literal.
+// That is the mechanism that makes "a new page silently loses the dynamic
+// entries" impossible-by-default and LOUD if attempted: the only ergonomic way
+// to render an admin page is h.page(r, title), which is also shorter than the
+// literal it replaced, so there is no incentive to hand-roll one.
 type pageData struct {
 	Title         string
 	Authenticated bool
 	Email         string
 	Path          string
+	// dynamic holds the sidebar sections derived from the PERSISTED dynamic
+	// content-type definitions, read fresh on every render (see h.page). It is
+	// unexported on purpose: templates never touch it, only Nav() does.
+	dynamic []navSection
+}
+
+// page is THE constructor for every authenticated admin page's view model. It
+// takes the request (never loose strings), reads the session Identity from the
+// context that requireSession/requireSessionPermission already put there, and
+// loads the dynamic content-type definitions for the sidebar.
+//
+// Reading the definitions per request (rather than caching them in a package
+// var) is deliberate and cheap: it is one indexed query on an administrative
+// page, and it makes a type created in another tab appear in the sidebar of the
+// very next page load, with no restart and no cache invalidation. A failure to
+// read them degrades to "no dynamic entries" instead of failing the page: the
+// sidebar is decoration, and a database hiccup must not turn a working admin
+// page into a 500.
+func (h *handlers) page(r *http.Request, title string) pageData {
+	id, _ := identityFromContext(r.Context())
+	email := emailOf(id)
+	return pageData{
+		Title:         title,
+		Authenticated: email != "",
+		Email:         email,
+		Path:          r.URL.Path,
+		dynamic:       h.dynamicNavSections(r.Context()),
+	}
 }
 
 // loginPage adds the optional error banner shown after a failed submit.
@@ -125,6 +166,10 @@ func (h *handlers) registerUIRoutes(mux *http.ServeMux) {
 	h.registerAdminTermRoutes(mux)
 	h.registerAdminUserRoutes(mux)
 	h.registerAdminAPIKeyRoutes(mux)
+	// CONTRACT-15: the dynamic-content-type admin surface — T2 (the definitions)
+	// and T3 (the generic content UI of any type).
+	h.registerAdminContentTypeRoutes(mux)
+	h.registerAdminContentRoutes(mux)
 	mux.Handle("GET /", h.requireSession(http.HandlerFunc(h.handleHome)))
 }
 
@@ -228,12 +273,11 @@ func (h *handlers) handleHome(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	id, ok := identityFromContext(r.Context())
-	if !ok {
+	if _, ok := identityFromContext(r.Context()); !ok {
 		http.Redirect(w, r, "/login", http.StatusFound)
 		return
 	}
-	renderHome(w, id.Email)
+	h.renderHome(w, r)
 }
 
 // requireSession is the browser-session middleware for HTML routes. It reads the
@@ -304,11 +348,15 @@ func (h *handlers) requireSessionPermission(permission string) func(http.Handler
 				http.Error(w, "internal error", http.StatusInternalServerError)
 				return
 			}
+			// The Identity goes into the context BEFORE the permission decision,
+			// so the 403 page is rendered by the same h.page(r, …) constructor
+			// every other page uses (CONTRACT-15 T1) and therefore still shows
+			// the sidebar of the logged-in user, dynamic entries included.
+			r2 := r.WithContext(context.WithValue(r.Context(), identityKey{}, id))
 			if !containsString(perms, permission) {
-				renderForbidden(w, id.Email)
+				h.renderForbidden(w, r2)
 				return
 			}
-			r2 := r.WithContext(context.WithValue(r.Context(), identityKey{}, id))
 			next.ServeHTTP(w, r2)
 		})
 	}
@@ -324,14 +372,9 @@ func renderLogin(w http.ResponseWriter, status int, errMsg string) {
 	})
 }
 
-// renderHome writes the protected home page for the given authenticated email.
-func renderHome(w http.ResponseWriter, email string) {
+// renderHome writes the protected home page for the current session.
+func (h *handlers) renderHome(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	_ = homeTmpl.ExecuteTemplate(w, "layout", pageData{
-		Title:         "Inicio — librarian",
-		Authenticated: true,
-		Email:         email,
-		Path:          "/",
-	})
+	_ = homeTmpl.ExecuteTemplate(w, "layout", h.page(r, "Inicio — librarian"))
 }

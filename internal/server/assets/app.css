@@ -361,3 +361,38 @@ html, body {
   margin: 1.5rem;
   padding: 0;
 }
+
+/* CONTRACT-15 — generic dynamic-content admin UI.
+   A dynamic type can declare many fields, so its listing table can be much
+   wider than the content column. .table-scroll keeps the OVERFLOW inside its
+   own box: the table scrolls horizontally instead of blowing the page layout
+   apart. It is the "many fields must not explode the page" guarantee, not a
+   claim that a 30-column table looks pretty. */
+.table-scroll {
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+/* One row of the field editor in the content-type create form: name + type
+   selector side by side. New rows are appended by htmx and reuse this class. */
+.field-row {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  margin-bottom: 0.5rem;
+}
+
+.field-row-name {
+  flex: 1 1 auto;
+}
+
+.fields-fieldset {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.75rem 1rem;
+  margin: 0.5rem 0;
+}
+
+.content-field {
+  margin-bottom: 0.75rem;
+}

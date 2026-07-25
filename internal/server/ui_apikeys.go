@@ -111,7 +111,6 @@ func (h *handlers) registerAdminAPIKeyRoutes(mux *http.ServeMux) {
 // handleAdminAPIKeysList renders the API-key list (label, role name, created,
 // status). It never shows the secret or the hash.
 func (h *handlers) handleAdminAPIKeysList(w http.ResponseWriter, r *http.Request) {
-	idn, _ := identityFromContext(r.Context())
 	keys, err := auth.ListAPIKeys(r.Context(), h.db)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -124,7 +123,7 @@ func (h *handlers) handleAdminAPIKeysList(w http.ResponseWriter, r *http.Request
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_ = adminAPIKeysListTmpl.ExecuteTemplate(w, "layout", adminAPIKeysListPage{
-		pageData: pageData{Title: "API keys — librarian", Authenticated: true, Email: emailOf(idn), Path: r.URL.Path},
+		pageData: h.page(r, "API keys — librarian"),
 		Keys:     views,
 	})
 }
@@ -132,9 +131,8 @@ func (h *handlers) handleAdminAPIKeysList(w http.ResponseWriter, r *http.Request
 // handleAdminAPIKeyNewForm renders the empty create form with the fixed role
 // catalog in the selector.
 func (h *handlers) handleAdminAPIKeyNewForm(w http.ResponseWriter, r *http.Request) {
-	idn, _ := identityFromContext(r.Context())
 	renderAPIKeyNew(w, http.StatusOK, adminAPIKeyNewPage{
-		pageData: pageData{Title: "Nueva API key — librarian", Authenticated: true, Email: emailOf(idn), Path: r.URL.Path},
+		pageData: h.page(r, "Nueva API key — librarian"),
 		Roles:    schema.Roles,
 	})
 }
@@ -146,8 +144,7 @@ func (h *handlers) handleAdminAPIKeyNewForm(w http.ResponseWriter, r *http.Reque
 // or an unknown role (crafted POST) re-renders the form with a 400 and the
 // error, preserving the entered label and role selection.
 func (h *handlers) handleAdminAPIKeyCreate(w http.ResponseWriter, r *http.Request) {
-	idn, _ := identityFromContext(r.Context())
-	title := pageData{Title: "Nueva API key — librarian", Authenticated: true, Email: emailOf(idn), Path: r.URL.Path}
+	title := h.page(r, "Nueva API key — librarian")
 	if err := r.ParseForm(); err != nil {
 		renderAPIKeyNew(w, http.StatusBadRequest, adminAPIKeyNewPage{
 			pageData: title, Roles: schema.Roles, Error: "Formulario inválido.",
@@ -185,7 +182,7 @@ func (h *handlers) handleAdminAPIKeyCreate(w http.ResponseWriter, r *http.Reques
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_ = adminAPIKeysCreatedTmpl.ExecuteTemplate(w, "layout", adminAPIKeyCreatedPage{
-		pageData: pageData{Title: "API key creada — librarian", Authenticated: true, Email: emailOf(idn), Path: r.URL.Path},
+		pageData: h.page(r, "API key creada — librarian"),
 		Label:    label,
 		RoleName: role,
 		Secret:   secret,
@@ -198,7 +195,6 @@ func (h *handlers) handleAdminAPIKeyCreate(w http.ResponseWriter, r *http.Reques
 // swaps it in place — the row flips Activa→Revocada and stays in the list. A
 // genuinely unknown id (no such row) → 404 HTML, never a 500.
 func (h *handlers) handleAdminAPIKeyRevoke(w http.ResponseWriter, r *http.Request) {
-	idn, _ := identityFromContext(r.Context())
 	id := r.PathValue("id")
 	if err := auth.RevokeAPIKeyByID(r.Context(), h.db, id); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -210,7 +206,7 @@ func (h *handlers) handleAdminAPIKeyRevoke(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if !found {
-		renderNotFound(w, emailOf(idn))
+		h.renderNotFound(w, r)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
