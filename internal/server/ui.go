@@ -38,7 +38,7 @@ const sessionMaxAgeSeconds = 24 * 60 * 60
 //go:embed assets/htmx.min.js assets/app.css
 var assetsFS embed.FS
 
-//go:embed templates/layout.html templates/login.html templates/home.html templates/articles_list.html templates/articles_row.html templates/articles_new.html templates/articles_edit.html templates/products_list.html templates/products_row.html templates/products_new.html templates/products_edit.html templates/terms_list.html templates/terms_row.html templates/terms_new.html templates/terms_edit.html templates/error_403.html templates/error_404.html templates/users_list.html templates/users_new.html templates/users_detail.html templates/roles_list.html templates/apikeys_list.html templates/apikeys_row.html templates/apikeys_new.html templates/apikeys_created.html templates/content_types_list.html templates/content_types_new.html templates/content_type_field_row.html templates/content_list.html templates/content_row.html templates/content_fields.html templates/content_new.html templates/content_edit.html
+//go:embed templates/layout.html templates/login.html templates/home.html templates/articles_list.html templates/articles_row.html templates/articles_new.html templates/articles_edit.html templates/products_list.html templates/products_row.html templates/products_new.html templates/products_edit.html templates/terms_list.html templates/terms_row.html templates/terms_new.html templates/terms_edit.html templates/error_403.html templates/error_404.html templates/users_list.html templates/users_new.html templates/users_detail.html templates/roles_list.html templates/roles_edit.html templates/apikeys_list.html templates/apikeys_row.html templates/apikeys_new.html templates/apikeys_created.html templates/content_types_list.html templates/content_types_new.html templates/content_type_field_row.html templates/content_list.html templates/content_row.html templates/content_fields.html templates/content_new.html templates/content_edit.html
 var templatesFS embed.FS
 
 // assetVersion is a short hash of the embedded static assets' content,
@@ -165,6 +165,9 @@ func (h *handlers) registerUIRoutes(mux *http.ServeMux) {
 	h.registerAdminProductRoutes(mux)
 	h.registerAdminTermRoutes(mux)
 	h.registerAdminUserRoutes(mux)
+	// CONTRACT-16: the per-role permission editor, extending the read-only
+	// /admin/roles view registered above with registerAdminUserRoutes.
+	h.registerAdminRoleRoutes(mux)
 	h.registerAdminAPIKeyRoutes(mux)
 	// CONTRACT-15: the dynamic-content-type admin surface — T2 (the definitions)
 	// and T3 (the generic content UI of any type).

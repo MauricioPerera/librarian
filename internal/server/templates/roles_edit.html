@@ -1,0 +1,22 @@
+{{define "content"}}
+<div class="page-head">
+  <h1>Permisos del rol {{.RoleName}}</h1>
+  <a class="btn btn-ghost" href="/admin/roles">Volver a roles</a>
+</div>
+<div class="card form-card">
+  {{if .Error}}<p class="error" role="alert">{{.Error}}</p>{{end}}
+  <p class="muted">Marcá los permisos que tendrá el rol. Al guardar se reemplaza el conjunto completo: lo que quede sin marcar se revoca.</p>
+  <form class="form" method="post" action="/admin/roles/{{.RoleName}}/permissions">
+    <fieldset class="permissions-fieldset">
+      <legend>Permisos</legend>
+      {{range .Permissions}}
+      <label class="checkbox"><input type="checkbox" name="permissions" value="{{.Name}}"{{if .Checked}} checked{{end}}> {{.Name}}</label>
+      {{end}}
+    </fieldset>
+    <div class="form-actions">
+      <button type="submit" class="btn btn-primary">Guardar permisos</button>
+      <a class="btn btn-ghost" href="/admin/roles">Cancelar</a>
+    </div>
+  </form>
+</div>
+{{end}}

@@ -3,16 +3,17 @@
   <h1>Roles y permisos</h1>
   <a class="btn btn-ghost" href="/admin/users">Volver a usuarios</a>
 </div>
-<p class="muted">Vista de solo lectura. El catálogo de roles y permisos se define en código y no se edita desde acá.</p>
+<p class="muted">El catálogo de roles y permisos se define en código y no se edita desde acá. Lo que sí se edita son los permisos otorgados a cada rol.</p>
 <table class="table" id="roles-table">
   <thead>
-    <tr><th>Rol</th><th>Permisos otorgados</th></tr>
+    <tr><th>Rol</th><th>Permisos otorgados</th>{{if .CanManage}}<th>Acciones</th>{{end}}</tr>
   </thead>
   <tbody>
     {{range .Roles}}
     <tr id="role-{{.Name}}">
       <td class="cell-role">{{.Name}}</td>
       <td class="cell-perms">{{if .Permissions}}{{range $i, $p := .Permissions}}{{if $i}}, {{end}}{{$p}}{{end}}{{else}}<span class="muted">(sin permisos)</span>{{end}}</td>
+      {{if $.CanManage}}<td class="cell-actions"><a class="btn btn-ghost" href="/admin/roles/{{.Name}}/edit">Editar permisos</a></td>{{end}}
     </tr>
     {{end}}
   </tbody>

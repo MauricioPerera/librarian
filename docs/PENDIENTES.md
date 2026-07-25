@@ -6,7 +6,13 @@ operando el sistema de verdad.
 
 ## 1. No hay forma de otorgar permisos a un rol desde el producto (ALTA)
 
-**Estado:** sin resolver. Workaround aplicado a mano en producción.
+**Estado:** RESUELTO por CONTRACT-16 (`specs/CONTRACT-16-gestion-de-permisos.md`,
+reporte en `docs/reports/CONTRACT-16-REPORT.md`). Ya existe una vía de escritura
+real: `GET /admin/roles/{name}/edit` + `POST /admin/roles/{name}/permissions`,
+gateada por `roles.manage` (que por fin tiene consumidor), con reemplazo atómico
+del conjunto (`auth.SetRolePermissions`) y una guarda anti-bloqueo que impide que
+quien ejecuta el cambio se quede sin `roles.manage`. Ya no hace falta SQL manual.
+El texto de abajo se conserva como registro de cómo se descubrió el hueco.
 
 **Qué pasa:** el catálogo de permisos es fijo en código y se siembra solo
 (`schema.Permissions` → `store.SeedCatalogs`, idempotente), y los roles también

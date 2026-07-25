@@ -223,13 +223,15 @@ html, body {
 .cell-roles, .cell-perms, .cell-role { font-size: 0.9rem; }
 .muted { color: var(--muted); }
 
-.roles-fieldset {
+.roles-fieldset,
+.permissions-fieldset {
   border: 1px solid var(--border, #d7dbe0);
   border-radius: 8px;
   padding: 0.6rem 0.9rem;
   margin: 0.4rem 0;
 }
-.roles-fieldset legend { padding: 0 0.4rem; font-weight: 600; }
+.roles-fieldset legend,
+.permissions-fieldset legend { padding: 0 0.4rem; font-weight: 600; }
 .checkbox {
   display: flex;
   align-items: center;

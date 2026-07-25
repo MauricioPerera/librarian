@@ -104,10 +104,15 @@ type adminUserDetailPage struct {
 	Roles    []roleCheck
 }
 
-// adminRolesPage is the view model for the read-only roles/permissions view.
+// adminRolesPage is the view model for the roles/permissions view. CanManage
+// (CONTRACT-16) tells the template whether to offer the per-role "Editar" link:
+// the listing itself is still session-only, so a viewer without roles.manage
+// sees the grants but no way in. It is presentation only — the authoritative
+// gate lives on the edit routes (requireSessionPermission).
 type adminRolesPage struct {
 	pageData
-	Roles []rolePermsView
+	Roles     []rolePermsView
+	CanManage bool
 }
 
 // registerAdminUserRoutes wires the /admin/users HTML surface plus the read-only
@@ -266,20 +271,23 @@ func (h *handlers) handleAdminUserRoles(w http.ResponseWriter, r *http.Request) 
 	w.WriteHeader(http.StatusOK)
 }
 
-// handleAdminRolesList renders the read-only roles/permissions view. It reads the
-// live role_permissions table (via rolesWithPermissions), NOT a hardcoded map, so
-// a grant made elsewhere shows up here. Requires only a session — no write.
+// handleAdminRolesList renders the roles/permissions view. It reads the live
+// role_permissions table (via rolesWithPermissions), NOT a hardcoded map, so a
+// grant made elsewhere shows up here. Requires only a session; CONTRACT-16 adds
+// the per-role edit link, shown only to a session holding roles.manage.
 func (h *handlers) handleAdminRolesList(w http.ResponseWriter, r *http.Request) {
 	roles, err := h.rolesWithPermissions(r.Context())
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
+	id, _ := identityFromContext(r.Context())
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_ = adminRolesTmpl.ExecuteTemplate(w, "layout", adminRolesPage{
-		pageData: h.page(r, "Roles y permisos — librarian"),
-		Roles:    roles,
+		pageData:  h.page(r, "Roles y permisos — librarian"),
+		Roles:     roles,
+		CanManage: h.sessionCanManageRoles(r.Context(), id),
 	})
 }
 
