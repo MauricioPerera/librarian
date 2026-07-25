@@ -28,12 +28,12 @@ package server
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"net/http"
 
 	"github.com/MauricioPerera/librarian/internal/auth"
 	"github.com/MauricioPerera/librarian/internal/schema"
+	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
 
 // permRolesManage is the permission that gates every write in this file. It has
@@ -79,7 +79,7 @@ func (h *handlers) registerAdminRoleRoutes(mux *http.ServeMux) {
 // A role name outside the catalog → 404 HTML (never a 500).
 func (h *handlers) handleAdminRoleEditForm(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	current, found, err := auth.RolePermissions(r.Context(), h.authStore, name)
+	current, found, err := auth.RolePermissions(r.Context(), h.store, name)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -117,7 +117,7 @@ func (h *handlers) handleAdminRolePermissions(w http.ResponseWriter, r *http.Req
 	selected := r.PostForm["permissions"]
 
 	// (1) Unknown role → 404, before anything else.
-	_, found, err := auth.RolePermissions(r.Context(), h.authStore, name)
+	_, found, err := auth.RolePermissions(r.Context(), h.store, name)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -151,7 +151,7 @@ func (h *handlers) handleAdminRolePermissions(w http.ResponseWriter, r *http.Req
 	}
 
 	// (4) Atomic replacement.
-	switch err := auth.SetRolePermissions(r.Context(), h.authStore, name, selected); {
+	switch err := auth.SetRolePermissions(r.Context(), h.store, name, selected); {
 	case errors.Is(err, auth.ErrRoleNotFound):
 		h.renderNotFound(w, r)
 		return
@@ -222,7 +222,7 @@ func (h *handlers) actorKeepsRolesManage(ctx context.Context, id *Identity, edit
 	if len(others) == 0 {
 		return false, nil
 	}
-	perms, err := permissionsForRoles(ctx, h.db, others)
+	perms, err := h.permissionsForRoles(ctx, others)
 	if err != nil {
 		return false, err
 	}
@@ -238,15 +238,12 @@ func (h *handlers) actorRoleNames(ctx context.Context, id *Identity) ([]string, 
 	if id.Kind == "jwt" {
 		return id.Roles, nil
 	}
-	var name string
-	err := h.db.QueryRowContext(ctx, `SELECT name FROM roles WHERE id = ?`, id.RoleID).Scan(&name)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
-	}
-	if err != nil {
+	row, found, err := h.queryOne(ctx, schema.RoutineRoleNameByID,
+		map[string]compat.Value{"role_id": uuidValue(id.RoleID)})
+	if err != nil || !found {
 		return nil, err
 	}
-	return []string{name}, nil
+	return []string{rowText(row, "name")}, nil
 }
 
 // lockoutMessage is the guard's user-facing explanation: why it was refused and

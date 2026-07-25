@@ -524,7 +524,11 @@ func Build() compat.Schema {
 		// JOINs and the routines (read + single-write) it executes. They are
 		// part of the canonical schema like the tables, so they travel with
 		// --dump-schema / `compat copy` and are covered by the JSON round-trip.
-		Views:    authViews(),
-		Routines: authRoutines(),
+		// CONTRACT-20 T1 appends internal/server's own views and read routines
+		// (server_dual.go) to internal/auth's. They are separate functions, and
+		// separately prefixed, so each contract's objects stay legible; they are
+		// one schema because there is only one canonical schema.
+		Views:    append(authViews(), serverViews()...),
+		Routines: append(authRoutines(), serverRoutines()...),
 	}
 }

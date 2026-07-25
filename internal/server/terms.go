@@ -25,6 +25,9 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+
+	"github.com/MauricioPerera/librarian/internal/schema"
+	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
 
 // term is the JSON view of a terms row. ParentID is nullable (a top-level term
@@ -75,17 +78,27 @@ var (
 	errTermNotFound    = errors.New("term not found")
 )
 
-// isUniqueSlugViolation reports whether err is the SQLite UNIQUE(taxonomy_id,
-// slug) constraint failure on terms. SQLite (modernc driver) phrases it as
-// "UNIQUE constraint failed: terms.taxonomy_id, terms.slug". Matching the message
-// keeps this dependency-free and is stable — the same technique as
-// isUniqueSKUViolation for products. The schema constraint is the real guarantee
-// (it cannot lose a race); this only turns the DB error into a clean 400.
-func isUniqueSlugViolation(err error) bool {
-	if err == nil {
-		return false
-	}
-	return strings.Contains(err.Error(), "UNIQUE constraint failed") && strings.Contains(err.Error(), "terms.slug")
+// isUniqueSlugViolation reports whether err is the UNIQUE(taxonomy_id, slug)
+// constraint failure on terms.
+//
+// CONTRACT-20 REPLACED THE MECHANISM, and this is one of the two places in the
+// package where the old code was silently single-engine. It used to match the
+// TEXT "UNIQUE constraint failed" — which is SQLite's wording. PostgreSQL says
+// "duplicate key value violates unique constraint", so on PostgreSQL the match
+// would simply never fire: the duplicate would stop being a clean 400 and become
+// a 500, with no compiler signal, until a user reused a slug in production.
+// compat.Store.IsUniqueViolation classifies by the DRIVER'S STRUCTURED CODE
+// (SQLITE_CONSTRAINT_UNIQUE/PRIMARYKEY, SQLSTATE 23505) through errors.As, so it
+// gives the same answer on both engines and survives wrapping.
+//
+// The documented limitation of that primitive (it cannot say WHICH constraint)
+// is not a problem here: terms has exactly two unique keys, the primary key and
+// (taxonomy_id, slug), and the primary key is a v4 UUID this package generates
+// per insert. The slug is the only one a caller can collide with. The schema
+// constraint — not this check — remains the real guarantee; this only turns the
+// resulting DB error into a clean 400.
+func (h *handlers) isUniqueSlugViolation(err error) bool {
+	return h.store.IsUniqueViolation(err)
 }
 
 // --- CRUD handlers (T2) ------------------------------------------------------
@@ -258,11 +271,22 @@ var errContentNotFound = errors.New("content not found")
 
 // --- data-access helpers -----------------------------------------------------
 
-// taxonomyIDForName resolves a taxonomy name to its catalog id inside q (a *sql.DB
-// or *sql.Tx). Returns errUnknownTaxonomy when the name is not in the catalog.
-func taxonomyIDForName(ctx context.Context, q queryer, name string) (string, error) {
+// taxonomyIDForName resolves a taxonomy name to its catalog id inside q (the
+// caller's transaction). Returns errUnknownTaxonomy when the name is not in the
+// catalog.
+//
+// CONTRACT-20: this stays RAW SQL rather than becoming a read routine, for the
+// same structural reason CONTRACT-19 kept auth's roleIDsForNames raw:
+// QueryRoutine opens its OWN transaction, so calling it from here would resolve
+// the catalog OUTSIDE the transaction that is about to insert against it, and
+// the "resolve before mutating" guarantee this file depends on would be read
+// from a different snapshot than the one it writes into. It is composed with
+// compat.Placeholder, so it is dual-engine.
+func taxonomyIDForName(ctx context.Context, q queryer, engine compat.Engine, name string) (string, error) {
+	statement := `SELECT ` + quote("id") + ` FROM ` + quote("taxonomies") +
+		` WHERE ` + quote("name") + ` = ` + bind(engine, 1)
 	var id string
-	err := q.QueryRowContext(ctx, `SELECT id FROM taxonomies WHERE name = ?`, name).Scan(&id)
+	err := q.QueryRowContext(ctx, statement, name).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", errUnknownTaxonomy
 	}
@@ -274,9 +298,22 @@ func taxonomyIDForName(ctx context.Context, q queryer, name string) (string, err
 
 // queryer is the tiny shared surface of *sql.DB and *sql.Tx used by the term
 // helpers so the same resolver works inside or outside a transaction.
-type queryer interface {
-	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
-	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+type queryer = txQuerier
+
+// termExists reports whether a term id is present, inside the caller's
+// transaction. Raw SQL for the same reason taxonomyIDForName is.
+func termExists(ctx context.Context, q queryer, engine compat.Engine, id string) (bool, error) {
+	statement := `SELECT ` + quote("id") + ` FROM ` + quote("terms") +
+		` WHERE ` + quote("id") + ` = ` + bind(engine, 1)
+	var found string
+	err := q.QueryRowContext(ctx, statement, id).Scan(&found)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // insertTerm resolves the taxonomy + optional parent and inserts the term,
@@ -289,20 +326,29 @@ func (h *handlers) insertTerm(ctx context.Context, req termBody) (term, error) {
 	}
 	defer tx.Rollback()
 
-	taxID, err := taxonomyIDForName(ctx, tx, req.Taxonomy)
+	engine := h.engine()
+	taxID, err := taxonomyIDForName(ctx, tx, engine, req.Taxonomy)
 	if err != nil {
 		return term{}, err
 	}
-	parent, err := resolveParent(ctx, tx, "", req.ParentID)
+	parent, err := resolveParent(ctx, tx, engine, "", req.ParentID)
 	if err != nil {
 		return term{}, err
 	}
-	var id string
-	err = tx.QueryRowContext(ctx,
-		`INSERT INTO terms (taxonomy_id, name, slug, parent_id) VALUES (?, ?, ?, ?) RETURNING id`,
-		taxID, req.Name, req.Slug, parent,
-	).Scan(&id)
-	if isUniqueSlugViolation(err) {
+	// CONTRACT-20: the id is generated here instead of being read back with
+	// RETURNING (compat deliberately has no RETURNING; the column DEFAULT
+	// gen_random_uuid() stays as a safety net for writes not coming from the app).
+	id, err := newUUID()
+	if err != nil {
+		return term{}, err
+	}
+	statement := `INSERT INTO ` + quote("terms") + ` (` +
+		quote("id") + `, ` + quote("taxonomy_id") + `, ` + quote("name") + `, ` +
+		quote("slug") + `, ` + quote("parent_id") + `) VALUES (` +
+		bindList(engine, 1, 5) + `)`
+	// parent is a *string so a nil parent binds as SQL NULL on both engines.
+	_, err = tx.ExecContext(ctx, statement, id, taxID, req.Name, req.Slug, parent)
+	if h.isUniqueSlugViolation(err) {
 		return term{}, errDuplicateSlug
 	}
 	if err != nil {
@@ -324,26 +370,30 @@ func (h *handlers) updateTerm(ctx context.Context, id string, req termBody) (ter
 	}
 	defer tx.Rollback()
 
-	var exists string
-	if err := tx.QueryRowContext(ctx, `SELECT id FROM terms WHERE id = ?`, id).Scan(&exists); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return term{}, errTermNotFound
-		}
-		return term{}, err
-	}
-	taxID, err := taxonomyIDForName(ctx, tx, req.Taxonomy)
+	engine := h.engine()
+	present, err := termExists(ctx, tx, engine, id)
 	if err != nil {
 		return term{}, err
 	}
-	parent, err := resolveParent(ctx, tx, id, req.ParentID)
+	if !present {
+		return term{}, errTermNotFound
+	}
+	taxID, err := taxonomyIDForName(ctx, tx, engine, req.Taxonomy)
 	if err != nil {
 		return term{}, err
 	}
-	_, err = tx.ExecContext(ctx,
-		`UPDATE terms SET taxonomy_id = ?, name = ?, slug = ?, parent_id = ? WHERE id = ?`,
-		taxID, req.Name, req.Slug, parent, id,
-	)
-	if isUniqueSlugViolation(err) {
+	parent, err := resolveParent(ctx, tx, engine, id, req.ParentID)
+	if err != nil {
+		return term{}, err
+	}
+	statement := `UPDATE ` + quote("terms") + ` SET ` +
+		quote("taxonomy_id") + ` = ` + bind(engine, 1) + `, ` +
+		quote("name") + ` = ` + bind(engine, 2) + `, ` +
+		quote("slug") + ` = ` + bind(engine, 3) + `, ` +
+		quote("parent_id") + ` = ` + bind(engine, 4) +
+		` WHERE ` + quote("id") + ` = ` + bind(engine, 5)
+	_, err = tx.ExecContext(ctx, statement, taxID, req.Name, req.Slug, parent, id)
+	if h.isUniqueSlugViolation(err) {
 		return term{}, errDuplicateSlug
 	}
 	if err != nil {
@@ -360,7 +410,7 @@ func (h *handlers) updateTerm(ctx context.Context, id string, req termBody) (ter
 // when the parent equals the term itself (a trivial 1-cycle — the only cycle the
 // application prevents; see the CONTRACT-12 report for deeper-cycle behavior),
 // and errUnknownTerm when the parent id does not reference an existing term.
-func resolveParent(ctx context.Context, q queryer, selfID string, parentID *string) (*string, error) {
+func resolveParent(ctx context.Context, q queryer, engine compat.Engine, selfID string, parentID *string) (*string, error) {
 	if parentID == nil {
 		return nil, nil
 	}
@@ -371,87 +421,77 @@ func resolveParent(ctx context.Context, q queryer, selfID string, parentID *stri
 	if p == selfID {
 		return nil, errParentIsSelf
 	}
-	var found string
-	err := q.QueryRowContext(ctx, `SELECT id FROM terms WHERE id = ?`, p).Scan(&found)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, errUnknownTerm
-	}
+	present, err := termExists(ctx, q, engine, p)
 	if err != nil {
 		return nil, err
+	}
+	if !present {
+		return nil, errUnknownTerm
 	}
 	return &p, nil
 }
 
-// listTerms returns every term with its taxonomy name, ordered by taxonomy then
-// name for a stable listing.
+// listTerms returns every term with its taxonomy name.
+//
+// CONTRACT-20: the JOIN moved into the canonical view schema.ViewTermRecords and
+// the read is schema.RoutineListTerms. The declared order gained a third key:
+// it was (taxonomy, name), which is NOT total — two terms with the same name in
+// the same taxonomy tie, and each engine settles a tie its own way. slug is
+// UNIQUE within a taxonomy, so (taxonomy, name, slug) is total. The sequence of
+// any set that had no tie is unchanged, which is why no existing assertion moves.
 func (h *handlers) listTerms(ctx context.Context) ([]term, error) {
-	rows, err := h.db.QueryContext(ctx,
-		`SELECT t.id, x.name, t.name, t.slug, t.parent_id
-		   FROM terms t
-		   JOIN taxonomies x ON x.id = t.taxonomy_id
-		  ORDER BY x.name, t.name`,
-	)
+	rows, err := h.queryRoutine(ctx, schema.RoutineListTerms, nil)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	out := make([]term, 0)
-	for rows.Next() {
-		t, err := scanTerm(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, t)
+	out := make([]term, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, termFromRow(row))
 	}
-	return out, rows.Err()
+	// The final order is imposed HERE, not by the engine. taxonomy/name/slug are
+	// arbitrary user text, and PostgreSQL orders text by the database collation
+	// while SQLite orders it by bytes. See the COLLATION note in dual.go.
+	sortByKeys(out, func(t term) []string { return []string{t.Taxonomy, t.Name, t.Slug} })
+	return out, nil
 }
 
 // fetchTerm loads one term by id. ok is false when no row matches (missing or
-// malformed id) — never a raw SQL error.
+// malformed id) — never a raw SQL error, because the id is a bound value and a
+// non-UUID simply matches nothing.
 func (h *handlers) fetchTerm(ctx context.Context, id string) (term, bool, error) {
-	row := h.db.QueryRowContext(ctx,
-		`SELECT t.id, x.name, t.name, t.slug, t.parent_id
-		   FROM terms t
-		   JOIN taxonomies x ON x.id = t.taxonomy_id
-		  WHERE t.id = ?`,
-		id,
-	)
-	t, err := scanTerm(row)
-	if errors.Is(err, sql.ErrNoRows) {
-		return term{}, false, nil
-	}
-	if err != nil {
+	row, found, err := h.queryOne(ctx, schema.RoutineTermByID,
+		map[string]compat.Value{"term_id": uuidValue(id)})
+	if err != nil || !found {
 		return term{}, false, err
 	}
-	return t, true, nil
+	return termFromRow(row), true, nil
 }
 
-// deleteTermByID deletes one term and returns RowsAffected (0 ⇒ 404).
+// deleteTermByID deletes one term and returns RowsAffected (0 ⇒ 404). It stays
+// raw SQL because CallRoutine returns only error: the row count IS the answer
+// here, and simulating it with a prior read would add a round trip and a race.
 func (h *handlers) deleteTermByID(ctx context.Context, id string) (int64, error) {
-	res, err := h.db.ExecContext(ctx, `DELETE FROM terms WHERE id = ?`, id)
+	engine := h.engine()
+	statement := `DELETE FROM ` + quote("terms") + ` WHERE ` + quote("id") + ` = ` + bind(engine, 1)
+	res, err := h.db.ExecContext(ctx, statement, id)
 	if err != nil {
 		return 0, err
 	}
 	return res.RowsAffected()
 }
 
-// scanTerm scans a term row (id, taxonomy name, name, slug, parent_id) from a
-// *sql.Rows or *sql.Row. parent_id is nullable.
-func scanTerm(s interface {
-	Scan(dest ...any) error
-}) (term, error) {
-	var (
-		t      term
-		parent sql.NullString
-	)
-	if err := s.Scan(&t.ID, &t.Taxonomy, &t.Name, &t.Slug, &parent); err != nil {
-		return term{}, err
+// termFromRow maps one canonicalized routine row to the JSON view. parent_id is
+// nullable and its NULL-ness is read from the canonical KIND, not from an empty
+// string — so a term with no parent and a term with an empty parent text (which
+// the schema forbids anyway) can never be confused.
+func termFromRow(row compat.Row) term {
+	return term{
+		ID:       rowText(row, "id"),
+		Taxonomy: rowText(row, "taxonomy"),
+		Name:     rowText(row, "name"),
+		Slug:     rowText(row, "slug"),
+		ParentID: rowTextPointer(row, "parent_id"),
 	}
-	if parent.Valid && parent.String != "" {
-		p := parent.String
-		t.ParentID = &p
-	}
-	return t, nil
 }
 
 // setContentTerms replaces the complete term set assigned to a piece of content,
@@ -468,8 +508,11 @@ func (h *handlers) setContentTerms(ctx context.Context, contentTable, junction, 
 	}
 	defer tx.Rollback()
 
+	engine := h.engine()
 	var exists string
-	if err := tx.QueryRowContext(ctx, `SELECT id FROM `+contentTable+` WHERE id = ?`, contentID).Scan(&exists); err != nil {
+	existsStatement := `SELECT ` + quote("id") + ` FROM ` + quote(contentTable) +
+		` WHERE ` + quote("id") + ` = ` + bind(engine, 1)
+	if err := tx.QueryRowContext(ctx, existsStatement, contentID).Scan(&exists); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return errContentNotFound
 		}
@@ -478,53 +521,86 @@ func (h *handlers) setContentTerms(ctx context.Context, contentTable, junction, 
 
 	// Resolve BEFORE mutating so an unknown term id aborts with nothing changed.
 	for _, tid := range termIDs {
-		var found string
-		if err := tx.QueryRowContext(ctx, `SELECT id FROM terms WHERE id = ?`, tid).Scan(&found); err != nil {
-			if errors.Is(err, sql.ErrNoRows) {
-				return errUnknownTerm
-			}
+		present, err := termExists(ctx, tx, engine, tid)
+		if err != nil {
 			return err
+		}
+		if !present {
+			return errUnknownTerm
 		}
 	}
 
-	if _, err := tx.ExecContext(ctx, `DELETE FROM `+junction+` WHERE `+idCol+` = ?`, contentID); err != nil {
+	deleteStatement := `DELETE FROM ` + quote(junction) +
+		` WHERE ` + quote(idCol) + ` = ` + bind(engine, 1)
+	if _, err := tx.ExecContext(ctx, deleteStatement, contentID); err != nil {
 		return err
 	}
-	for _, tid := range termIDs {
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO `+junction+` (`+idCol+`, term_id) VALUES (?, ?) ON CONFLICT DO NOTHING`,
-			contentID, tid,
-		); err != nil {
+	// CONTRACT-20 removed the `ON CONFLICT DO NOTHING` these inserts carried, for
+	// the same reason and with the same method CONTRACT-19 used in auth: the
+	// DELETE above just emptied the target set, so the ONLY way to hit the
+	// composite primary key is a term id repeated in the CALLER's list.
+	// Deduplicating in Go makes the conflict IMPOSSIBLE rather than tolerated,
+	// and removes a dependency on an upsert clause whose accepted spelling
+	// differs between engines and versions. Observable behavior is identical: a
+	// repeated id produced one row before and produces one row now.
+	insertStatement := `INSERT INTO ` + quote(junction) + ` (` +
+		quote(idCol) + `, ` + quote("term_id") + `) VALUES (` + bindList(engine, 1, 2) + `)`
+	for _, tid := range dedupe(termIDs) {
+		if _, err := tx.ExecContext(ctx, insertStatement, contentID, tid); err != nil {
 			return err
 		}
 	}
 	return tx.Commit()
 }
 
-// assignedTermsFor returns the terms assigned to a piece of content, joined
-// through its junction table to terms + taxonomies. Ordered by taxonomy then
-// name for a stable response. junction/idCol are fixed internal constants.
+// dedupe returns ids without repetitions, preserving first-appearance order. See
+// setContentTerms for why it replaces ON CONFLICT DO NOTHING.
+func dedupe(ids []string) []string {
+	if len(ids) < 2 {
+		return ids
+	}
+	seen := make(map[string]struct{}, len(ids))
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if _, exists := seen[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
+}
+
+// assignedTermsFor returns the terms assigned to a piece of content.
+//
+// CONTRACT-20: the two-JOIN query moved into a canonical view per junction
+// (schema.ViewArticleAssignedTerms / ViewProductAssignedTerms) read by a routine
+// each. Two views rather than one is not duplication for its own sake: a read
+// action's relation is a DECLARED name, never caller-supplied, which is exactly
+// the property that used to be guaranteed only by a hand-audited "junction and
+// idCol are internal constants" comment around a string concatenation.
+//
+// The declared order gained a third key for the same reason listTerms did:
+// (taxonomy, term_name) is not total, (taxonomy, term_name, term_slug) is.
 func (h *handlers) assignedTermsFor(ctx context.Context, junction, idCol, contentID string) ([]assignedTerm, error) {
-	rows, err := h.db.QueryContext(ctx,
-		`SELECT t.id, t.name, t.slug, x.name
-		   FROM `+junction+` j
-		   JOIN terms t       ON t.id = j.term_id
-		   JOIN taxonomies x  ON x.id = t.taxonomy_id
-		  WHERE j.`+idCol+` = ?
-		  ORDER BY x.name, t.name`,
-		contentID,
-	)
+	routine := schema.RoutineArticleAssignedTerm
+	if junction == "product_terms" {
+		routine = schema.RoutineProductAssignedTerm
+	}
+	rows, err := h.queryRoutine(ctx, routine,
+		map[string]compat.Value{"content_id": uuidValue(contentID)})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	out := make([]assignedTerm, 0)
-	for rows.Next() {
-		var a assignedTerm
-		if err := rows.Scan(&a.ID, &a.Name, &a.Slug, &a.Taxonomy); err != nil {
-			return nil, err
-		}
-		out = append(out, a)
+	out := make([]assignedTerm, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, assignedTerm{
+			ID:       rowText(row, "term_id"),
+			Name:     rowText(row, "term_name"),
+			Slug:     rowText(row, "term_slug"),
+			Taxonomy: rowText(row, "taxonomy"),
+		})
 	}
-	return out, rows.Err()
+	sortByKeys(out, func(a assignedTerm) []string { return []string{a.Taxonomy, a.Name, a.Slug} })
+	return out, nil
 }

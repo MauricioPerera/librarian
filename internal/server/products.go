@@ -7,6 +7,9 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+
+	"github.com/MauricioPerera/librarian/internal/schema"
+	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
 
 // products.go implements CONTRACT-11 T2: a REST CRUD surface over the products
@@ -63,18 +66,28 @@ type productBody struct {
 // 400 with a human message; the raw SQL error text is never sent to the client.
 var errDuplicateSKU = errors.New("sku already exists")
 
-// isUniqueSKUViolation reports whether err is the SQLite UNIQUE(sku) constraint
-// failure. SQLite (modernc driver) surfaces it as an error whose message
-// contains "UNIQUE constraint failed: products.sku". Matching the message keeps
-// this dependency-free (no driver-type import) and is stable: SQLite always
-// emits that exact phrasing for a UNIQUE violation. The schema constraint — not
-// this check — is the real guarantee (it cannot lose a concurrent race); this
-// only turns the resulting DB error into a clean 400.
-func isUniqueSKUViolation(err error) bool {
-	if err == nil {
-		return false
-	}
-	return strings.Contains(err.Error(), "UNIQUE constraint failed") && strings.Contains(err.Error(), "sku")
+// isUniqueSKUViolation reports whether err is the UNIQUE(sku) constraint
+// failure on products.
+//
+// CONTRACT-20 REPLACED THE MECHANISM, and this is the case the contract's
+// red-team section names explicitly. The old check matched the TEXT "UNIQUE
+// constraint failed", which is SQLite's wording; PostgreSQL says "duplicate key
+// value violates unique constraint". On PostgreSQL the match would never fire,
+// so a duplicate sku would stop being a clean 400 and become a 500 — silently,
+// with nothing failing to compile, until a user reused a sku in production.
+// compat.Store.IsUniqueViolation classifies by the DRIVER'S STRUCTURED CODE
+// (SQLITE_CONSTRAINT_UNIQUE / SQLITE_CONSTRAINT_PRIMARYKEY on SQLite, SQLSTATE
+// 23505 on PostgreSQL) through errors.As, so both engines answer the same and a
+// wrapped error is still classified.
+//
+// That primitive cannot say WHICH constraint was violated, which is fine here:
+// products has two unique keys, the primary key and sku, and the primary key is
+// a v4 UUID this package generates per insert. sku is the only one a caller can
+// collide with. The schema constraint — not this check — remains the real
+// guarantee (it cannot lose a concurrent race); this only turns the resulting DB
+// error into a clean 400.
+func (h *handlers) isUniqueSKUViolation(err error) bool {
+	return h.store.IsUniqueViolation(err)
 }
 
 // handleCreateProduct creates a product. Requires content.create. The author is
@@ -280,42 +293,52 @@ func validateDecimalText(s string) (string, bool) {
 
 // insertProduct inserts a product and returns the generated id. A UNIQUE(sku)
 // violation is translated to errDuplicateSKU so callers map it to 400.
+// CONTRACT-20: raw SQL with compat.Placeholder. The id and both timestamps are
+// written by the application (see dual.go newUUID / nowCanonical) instead of
+// being left to RETURNING and the column DEFAULTs — created_at is the primary
+// sort key of listProducts and the two engines render CURRENT_TIMESTAMP
+// differently, so leaving it to the engine would make the LIST ORDER diverge.
 func (h *handlers) insertProduct(ctx context.Context, authorID, title, body, price, sku string) (string, error) {
-	var id string
-	err := h.db.QueryRowContext(ctx,
-		`INSERT INTO products (author_id, title, body, price, sku) VALUES (?, ?, ?, ?, ?) RETURNING id`,
-		authorID, title, body, price, sku,
-	).Scan(&id)
-	if isUniqueSKUViolation(err) {
+	id, err := newUUID()
+	if err != nil {
+		return "", err
+	}
+	engine := h.engine()
+	stamp := nowCanonical()
+	statement := `INSERT INTO ` + quote("products") + ` (` +
+		quote("id") + `, ` + quote("author_id") + `, ` + quote("title") + `, ` +
+		quote("body") + `, ` + quote("price") + `, ` + quote("sku") + `, ` +
+		quote("created_at") + `, ` + quote("updated_at") + `) VALUES (` +
+		bindList(engine, 1, 8) + `)`
+	_, err = h.db.ExecContext(ctx, statement, id, authorID, title, body, price, sku, stamp, stamp)
+	if h.isUniqueSKUViolation(err) {
 		return "", errDuplicateSKU
 	}
-	return id, err
+	if err != nil {
+		return "", err
+	}
+	return id, nil
 }
 
 // listProducts returns a page of products ordered by created_at DESC. Shared by
 // the JSON list route and the admin UI list page.
+//
+// CONTRACT-20: schema.RoutineListProducts. The declared order is
+// (created_at DESC, id ASC): created_at alone is NOT total, so two products
+// written in the same instant could come back in either sequence, differently
+// per engine. price arrives canonicalized by its DECLARED decimal family, which
+// is what makes SQLite's TEXT column and PostgreSQL's NUMERIC one read the same.
 func (h *handlers) listProducts(ctx context.Context, limit, offset int) ([]product, error) {
-	rows, err := h.db.QueryContext(ctx,
-		`SELECT id, author_id, title, body, price, sku, created_at, updated_at
-		   FROM products
-		  ORDER BY created_at DESC
-		  LIMIT ? OFFSET ?`,
-		limit, offset,
-	)
+	rows, err := h.queryRoutine(ctx, schema.RoutineListProducts, map[string]compat.Value{
+		"page_limit":  integerValue(limit),
+		"page_offset": integerValue(offset),
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	out := make([]product, 0)
-	for rows.Next() {
-		p, err := scanProduct(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, p)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
+	out := make([]product, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, productFromRow(row))
 	}
 	return out, nil
 }
@@ -323,19 +346,12 @@ func (h *handlers) listProducts(ctx context.Context, limit, offset int) ([]produ
 // fetchProduct loads one product by id. ok is false when no row matches (missing
 // or malformed id); err is non-nil only on a real DB failure.
 func (h *handlers) fetchProduct(ctx context.Context, id string) (product, bool, error) {
-	row := h.db.QueryRowContext(ctx,
-		`SELECT id, author_id, title, body, price, sku, created_at, updated_at
-		   FROM products
-		  WHERE id = ?`,
-		id,
-	)
-	p, err := scanProduct(row)
-	if errors.Is(err, sql.ErrNoRows) {
-		return product{}, false, nil
-	}
-	if err != nil {
+	row, found, err := h.queryOne(ctx, schema.RoutineProductByID,
+		map[string]compat.Value{"product_id": uuidValue(id)})
+	if err != nil || !found {
 		return product{}, false, err
 	}
+	p := productFromRow(row)
 	// CONTRACT-12 T3: attach the assigned terms so GET /products/{id} includes
 	// them. Loaded on the single-row path only, keeping the list shape untouched.
 	terms, err := h.assignedTermsFor(ctx, "product_terms", "product_id", p.ID)
@@ -348,49 +364,58 @@ func (h *handlers) fetchProduct(ctx context.Context, id string) (product, bool, 
 
 // productExists reports whether a row with the given id is present. A missing or
 // malformed id yields (false, nil) — never a raw SQL error.
+//
+// The old statement was `SELECT 1`; a read routine declares its output columns
+// against the relation's own columns, so it selects `id` instead. The answer is
+// identical (a row matched, or none did) and nothing observable changes.
 func (h *handlers) productExists(ctx context.Context, id string) (bool, error) {
-	var x int
-	err := h.db.QueryRowContext(ctx, `SELECT 1 FROM products WHERE id = ?`, id).Scan(&x)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	return true, nil
+	_, found, err := h.queryOne(ctx, schema.RoutineProductExists,
+		map[string]compat.Value{"product_id": uuidValue(id)})
+	return found, err
 }
 
 // updateProductFields updates title/body/price/sku. It returns the sql.Result so
-// the caller can inspect RowsAffected. A UNIQUE(sku) violation is translated to
-// errDuplicateSKU. Shared by the JSON update route and the admin UI edit form.
+// the caller can inspect RowsAffected — which is exactly why it stays raw SQL:
+// CallRoutine returns only error, and the row count is what decides 404 vs 200.
+// A UNIQUE(sku) violation is translated to errDuplicateSKU.
 func (h *handlers) updateProductFields(ctx context.Context, id, title, body, price, sku string) (sql.Result, error) {
-	res, err := h.db.ExecContext(ctx,
-		`UPDATE products SET title = ?, body = ?, price = ?, sku = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-		title, body, price, sku, id,
-	)
-	if isUniqueSKUViolation(err) {
+	engine := h.engine()
+	statement := `UPDATE ` + quote("products") + ` SET ` +
+		quote("title") + ` = ` + bind(engine, 1) + `, ` +
+		quote("body") + ` = ` + bind(engine, 2) + `, ` +
+		quote("price") + ` = ` + bind(engine, 3) + `, ` +
+		quote("sku") + ` = ` + bind(engine, 4) + `, ` +
+		quote("updated_at") + ` = ` + bind(engine, 5) +
+		` WHERE ` + quote("id") + ` = ` + bind(engine, 6)
+	res, err := h.db.ExecContext(ctx, statement, title, body, price, sku, nowCanonical(), id)
+	if h.isUniqueSKUViolation(err) {
 		return nil, errDuplicateSKU
 	}
 	return res, err
 }
 
-// deleteProductByID deletes one row and returns RowsAffected (0 ⇒ 404). Shared by
-// the JSON delete route and the admin UI delete button.
+// deleteProductByID deletes one row and returns RowsAffected (0 ⇒ 404). Raw SQL
+// for the same reason updateProductFields is.
 func (h *handlers) deleteProductByID(ctx context.Context, id string) (int64, error) {
-	res, err := h.db.ExecContext(ctx, `DELETE FROM products WHERE id = ?`, id)
+	engine := h.engine()
+	statement := `DELETE FROM ` + quote("products") + ` WHERE ` + quote("id") + ` = ` + bind(engine, 1)
+	res, err := h.db.ExecContext(ctx, statement, id)
 	if err != nil {
 		return 0, err
 	}
 	return res.RowsAffected()
 }
 
-// scanProduct scans a product row from either a *sql.Rows or a *sql.Row.
-func scanProduct(s interface {
-	Scan(dest ...any) error
-}) (product, error) {
-	var p product
-	if err := s.Scan(&p.ID, &p.AuthorID, &p.Title, &p.Body, &p.Price, &p.SKU, &p.CreatedAt, &p.UpdatedAt); err != nil {
-		return product{}, err
+// productFromRow maps one canonicalized routine row to the JSON view.
+func productFromRow(row compat.Row) product {
+	return product{
+		ID:        rowText(row, "id"),
+		AuthorID:  rowText(row, "author_id"),
+		Title:     rowText(row, "title"),
+		Body:      rowText(row, "body"),
+		Price:     rowText(row, "price"),
+		SKU:       rowText(row, "sku"),
+		CreatedAt: rowText(row, "created_at"),
+		UpdatedAt: rowText(row, "updated_at"),
 	}
-	return p, nil
 }

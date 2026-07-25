@@ -130,7 +130,7 @@ func (h *handlers) registerAdminUserRoutes(mux *http.ServeMux) {
 
 // handleAdminUsersList renders the user list (email, status, roles).
 func (h *handlers) handleAdminUsersList(w http.ResponseWriter, r *http.Request) {
-	users, err := auth.ListUsers(r.Context(), h.authStore)
+	users, err := auth.ListUsers(r.Context(), h.store)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -182,7 +182,7 @@ func (h *handlers) handleAdminUserCreate(w http.ResponseWriter, r *http.Request)
 		})
 		return
 	}
-	if _, err := auth.CreateUser(r.Context(), h.authStore, email, password, roles); err != nil {
+	if _, err := auth.CreateUser(r.Context(), h.store, email, password, roles); err != nil {
 		// Unknown role (crafted request) or duplicate email — a client error, not
 		// a 500. Re-render with the reason and the user's input preserved.
 		renderUserNew(w, http.StatusBadRequest, adminUserNewPage{
@@ -199,7 +199,7 @@ func (h *handlers) handleAdminUserCreate(w http.ResponseWriter, r *http.Request)
 // handleAdminUserDetail renders the combined detail + edit page. A missing or
 // malformed id → 404 HTML (never 500), the same pattern as the articles UI.
 func (h *handlers) handleAdminUserDetail(w http.ResponseWriter, r *http.Request) {
-	u, found, err := auth.GetUser(r.Context(), h.authStore, r.PathValue("id"))
+	u, found, err := auth.GetUser(r.Context(), h.store, r.PathValue("id"))
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -228,7 +228,7 @@ func (h *handlers) handleAdminUserStatus(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "invalid form", http.StatusBadRequest)
 		return
 	}
-	err := auth.UpdateUserStatus(r.Context(), h.authStore, uid, r.PostFormValue("status"))
+	err := auth.UpdateUserStatus(r.Context(), h.store, uid, r.PostFormValue("status"))
 	switch {
 	case errors.Is(err, auth.ErrUserNotFound):
 		h.renderNotFound(w, r)
@@ -255,7 +255,7 @@ func (h *handlers) handleAdminUserRoles(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "invalid form", http.StatusBadRequest)
 		return
 	}
-	err := auth.SetUserRoles(r.Context(), h.authStore, uid, r.PostForm["roles"])
+	err := auth.SetUserRoles(r.Context(), h.store, uid, r.PostForm["roles"])
 	switch {
 	case errors.Is(err, auth.ErrUserNotFound):
 		h.renderNotFound(w, r)
@@ -333,26 +333,23 @@ func userCreateErrorMessage(err error) string {
 // permissionsForRoleID helper (authz.go). It reflects the live table, so the
 // read-only view is never a hardcoded catalog.
 func (h *handlers) rolesWithPermissions(ctx context.Context) ([]rolePermsView, error) {
-	rows, err := h.db.QueryContext(ctx, `SELECT id, name FROM roles ORDER BY name`)
+	rows, err := h.queryRoutine(ctx, schema.RoutineListRoles, nil)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	type roleRow struct{ id, name string }
-	var roleRows []roleRow
-	for rows.Next() {
-		var rr roleRow
-		if err := rows.Scan(&rr.id, &rr.name); err != nil {
-			return nil, err
-		}
-		roleRows = append(roleRows, rr)
+	roleRows := make([]roleRow, 0, len(rows))
+	for _, row := range rows {
+		roleRows = append(roleRows, roleRow{id: rowText(row, "id"), name: rowText(row, "name")})
 	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
+	// The final order is imposed HERE, not by the engine — see the COLLATION
+	// note in dual.go. Role names happen to be punctuation-free today, so the
+	// two engines already agree on them; sorting in Go keeps that true if a role
+	// is ever added whose name is not.
+	sortByKeys(roleRows, func(r roleRow) []string { return []string{r.name} })
 	out := make([]rolePermsView, 0, len(roleRows))
 	for _, rr := range roleRows {
-		perms, err := permissionsForRoleID(ctx, h.db, rr.id)
+		perms, err := h.permissionsForRoleID(ctx, rr.id)
 		if err != nil {
 			return nil, err
 		}

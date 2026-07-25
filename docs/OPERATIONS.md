@@ -367,3 +367,41 @@ go test -tags dualengine -run TestDualEngineAuth -count=1 -v ./internal/auth
   crea las vistas de CONTRACT-19.
 - Requiere `pgvector` en el PostgreSQL destino, igual que la exportación: el
   esquema canónico declara `articles.embedding vector(1536)`.
+
+## Batería dual-motor de `internal/server` (CONTRACT-20)
+
+La parte 2 de la misma migración. A diferencia de la de `internal/auth`, esta
+maneja el **mux HTTP real**: cada observación es un código de estado y un cuerpo
+de respuesta producidos por los mismos handlers que atiende un cliente. Mismo
+build tag, mismo comportamiento sin DSN (saltea).
+
+```powershell
+$env:COMPAT_POSTGRES_DSN = "postgres://user:***@host:5432/db?sslmode=disable"
+go test -tags dualengine -run TestDualEngineServer -count=1 -v ./internal/server
+```
+
+Cubre las cinco superficies del contrato: el CRUD de `articles` **con y sin
+`embedding`** (comparado componente a componente), el de `products` incluida la
+violación de `sku` duplicado, el de `terms` con jerarquía y sus vistas, la
+resolución de permisos de `authz.go`, y el CRUD genérico de un tipo **dinámico
+creado durante la prueba**. Compara explícitamente el ORDEN de cada listado y
+los 404 sobre ids inexistentes y malformados.
+
+Además:
+
+```powershell
+go test -tags dualengine -run TestDualEngineVectorPrecision -count=1 -v ./internal/server
+```
+
+mide el **límite de precisión de `vector`**: `pgvector` almacena `float4`, así
+que una componente que necesita más de precisión simple se redondea en
+PostgreSQL y se conserva entera en SQLite. Es una propiedad de la columna
+`vector(1536)` que declaró CONTRACT-05, no del camino de lectura/escritura;
+el test la mide y la reporta en vez de esconderla.
+
+> **Colación.** PostgreSQL ordena `TEXT` por la colación de la base
+> (típicamente `en_US.utf8`) y SQLite por bytes, así que un `ORDER BY` sobre
+> texto con puntuación NO da la misma secuencia en los dos motores. Los listados
+> no paginados de `internal/server` imponen su orden final en Go; los paginados
+> ordenan por `created_at` (ancho fijo) e `id` (UUID), formas para las que ambas
+> comparaciones coinciden. Ver la nota COLLATION en `internal/server/dual.go`.

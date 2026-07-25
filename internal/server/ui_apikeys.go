@@ -27,12 +27,11 @@ package server
 
 import (
 	"context"
-	"database/sql"
-	"errors"
 	"net/http"
 
 	"github.com/MauricioPerera/librarian/internal/auth"
 	"github.com/MauricioPerera/librarian/internal/schema"
+	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
 
 // Admin API-key template sets. One set per page (layout + page), following the
@@ -111,7 +110,7 @@ func (h *handlers) registerAdminAPIKeyRoutes(mux *http.ServeMux) {
 // handleAdminAPIKeysList renders the API-key list (label, role name, created,
 // status). It never shows the secret or the hash.
 func (h *handlers) handleAdminAPIKeysList(w http.ResponseWriter, r *http.Request) {
-	keys, err := auth.ListAPIKeys(r.Context(), h.authStore)
+	keys, err := auth.ListAPIKeys(r.Context(), h.store)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -160,7 +159,7 @@ func (h *handlers) handleAdminAPIKeyCreate(w http.ResponseWriter, r *http.Reques
 		})
 		return
 	}
-	roleID, ok, err := roleIDForName(r.Context(), h.db, role)
+	roleID, ok, err := h.roleIDForName(r.Context(), role)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -172,7 +171,7 @@ func (h *handlers) handleAdminAPIKeyCreate(w http.ResponseWriter, r *http.Reques
 		})
 		return
 	}
-	secret, err := auth.MintAPIKey(r.Context(), h.authStore, label, roleID)
+	secret, err := auth.MintAPIKey(r.Context(), h.store, label, roleID)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -196,11 +195,11 @@ func (h *handlers) handleAdminAPIKeyCreate(w http.ResponseWriter, r *http.Reques
 // genuinely unknown id (no such row) → 404 HTML, never a 500.
 func (h *handlers) handleAdminAPIKeyRevoke(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if err := auth.RevokeAPIKeyByID(r.Context(), h.authStore, id); err != nil {
+	if err := auth.RevokeAPIKeyByID(r.Context(), h.store, id); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	rec, found, err := auth.GetAPIKey(r.Context(), h.authStore, id)
+	rec, found, err := auth.GetAPIKey(r.Context(), h.store, id)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -224,14 +223,11 @@ func renderAPIKeyNew(w http.ResponseWriter, status int, data adminAPIKeyNewPage)
 // roleIDForName resolves a role name to its catalog id. ok is false when the
 // name is not in the roles table (a crafted request) — never a raw SQL error —
 // so the handler maps it to a 400 rather than a 500.
-func roleIDForName(ctx context.Context, db *sql.DB, name string) (string, bool, error) {
-	var id string
-	err := db.QueryRowContext(ctx, `SELECT id FROM roles WHERE name = ?`, name).Scan(&id)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", false, nil
-	}
-	if err != nil {
+func (h *handlers) roleIDForName(ctx context.Context, name string) (string, bool, error) {
+	row, found, err := h.queryOne(ctx, schema.RoutineRoleIDByNameServer,
+		map[string]compat.Value{"role_name": textValue(name)})
+	if err != nil || !found {
 		return "", false, err
 	}
-	return id, true, nil
+	return rowText(row, "id"), true, nil
 }

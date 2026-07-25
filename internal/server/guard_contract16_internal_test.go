@@ -38,7 +38,7 @@ func guardDB(t *testing.T) (*handlers, *compat.Store, func()) {
 	if err := store.SeedCatalogs(ctx, sdb.DB); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	return &handlers{db: sdb.DB, authStore: sdb, jwtSecret: "guard-secret"}, sdb, func() { _ = sdb.Close() }
+	return &handlers{db: sdb.DB, store: sdb, jwtSecret: "guard-secret"}, sdb, func() { _ = sdb.Close() }
 }
 
 // setPerms is a shorthand for the real data function under test's sibling.

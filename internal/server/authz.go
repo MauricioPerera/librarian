@@ -2,12 +2,11 @@ package server
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"net/http"
-	"strings"
 
 	"github.com/MauricioPerera/librarian/internal/auth"
+	"github.com/MauricioPerera/librarian/internal/schema"
 	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
 
@@ -89,7 +88,7 @@ func (h *handlers) authenticate(w http.ResponseWriter, r *http.Request) (*http.R
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return nil, nil, false
 	}
-	id, ok := resolveIdentity(r.Context(), h.authStore, h.jwtSecret, token)
+	id, ok := resolveIdentity(r.Context(), h.store, h.jwtSecret, token)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return nil, nil, false
@@ -150,31 +149,44 @@ func (h *handlers) requirePermission(permission string) func(http.Handler) http.
 // (not cached) — v1 has no per-request caching, and the catalog is small.
 func (h *handlers) permissionsFor(ctx context.Context, id *Identity) ([]string, error) {
 	if id.Kind == "jwt" {
-		return permissionsForRoles(ctx, h.db, id.Roles)
+		return h.permissionsForRoles(ctx, id.Roles)
 	}
-	return permissionsForRoleID(ctx, h.db, id.RoleID)
+	return h.permissionsForRoleID(ctx, id.RoleID)
 }
 
 // permissionsForRoles returns the distinct permission names granted to any of
-// the given role names, via role_permissions. An empty role list yields no
-// permissions (a user with no roles has no grants).
-func permissionsForRoles(ctx context.Context, db *sql.DB, roleNames []string) ([]string, error) {
+// the given role names. An empty role list yields no permissions (a user with no
+// roles has no grants) — preserved exactly.
+//
+// CONTRACT-20: the two-JOIN query moved into the canonical view
+// schema.ViewRoleNamePermissionNames, so the join is compiled to both engines by
+// compat instead of being written here. What is left is the one thing a routine
+// cannot express: an IN predicate whose arity comes from the caller (a routine's
+// WHERE grammar has no such form, and a routine's action list is static). That
+// residue is composed with compat.Placeholder, which is dual-engine — the
+// statement below is standard SQL over a declared view, with holes.
+//
+// Two things changed that are NOT visible through HTTP and are deliberate:
+// the DISTINCT is still the engine's, but the result is now explicitly ORDERED,
+// where before it came back in whatever sequence each engine chose. Callers only
+// ever ask "does this set contain X", so the order was never observable — but an
+// unordered read is exactly the kind of latent divergence this contract exists
+// to remove, and the dual-engine battery compares it.
+func (h *handlers) permissionsForRoles(ctx context.Context, roleNames []string) ([]string, error) {
 	if len(roleNames) == 0 {
 		return nil, nil
 	}
-	// Role names come from the verified JWT claims, not user input, but they
-	// are still bound as parameters (never interpolated). The IN list is built
-	// with the standard placeholder-per-arg pattern.
-	q := `SELECT DISTINCT p.name
-	        FROM role_permissions rp
-	        JOIN roles r       ON r.id = rp.role_id
-	        JOIN permissions p  ON p.id = rp.permission_id
-	       WHERE r.name IN (` + placeholders(len(roleNames)) + `)`
+	// Role names come from the verified JWT claims, not from user input, but
+	// they are still bound as parameters — never interpolated.
+	statement := `SELECT DISTINCT ` + quote("permission_name") +
+		` FROM ` + quote(schema.ViewRoleNamePermissionNames) +
+		` WHERE ` + quote("role_name") + ` IN (` + bindList(h.engine(), 1, len(roleNames)) + `)` +
+		` ORDER BY ` + quote("permission_name")
 	args := make([]any, len(roleNames))
 	for i, n := range roleNames {
 		args[i] = n
 	}
-	rows, err := db.QueryContext(ctx, q, args...)
+	rows, err := h.db.QueryContext(ctx, statement, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query role permissions: %w", err)
 	}
@@ -190,51 +202,30 @@ func permissionsForRoles(ctx context.Context, db *sql.DB, roleNames []string) ([
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate permissions: %w", err)
 	}
+	// The final order is imposed HERE, not by the engine: permission names carry
+	// `.` and `_`, and PostgreSQL's collation ranks those differently from
+	// SQLite's byte order. See the COLLATION note in dual.go.
+	sortStrings(names)
 	return names, nil
 }
 
 // permissionsForRoleID returns the permission names granted to the single role
-// an API key is bound to.
-func permissionsForRoleID(ctx context.Context, db *sql.DB, roleID string) ([]string, error) {
-	rows, err := db.QueryContext(ctx,
-		`SELECT p.name
-		   FROM role_permissions rp
-		   JOIN permissions p ON p.id = rp.permission_id
-		  WHERE rp.role_id = ?`,
-		roleID,
-	)
+// an API key is bound to. This one IS expressible as a routine (a single bound
+// key), so it is one: schema.RoutinePermissionsByRoleID over CONTRACT-19's
+// existing role_permission_names view — the JOIN this function used to write by
+// hand was already declared there and is simply reused.
+func (h *handlers) permissionsForRoleID(ctx context.Context, roleID string) ([]string, error) {
+	rows, err := h.queryRoutine(ctx, schema.RoutinePermissionsByRoleID,
+		map[string]compat.Value{"role_id": uuidValue(roleID)})
 	if err != nil {
 		return nil, fmt.Errorf("query role permissions: %w", err)
 	}
-	defer rows.Close()
 	var names []string
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return nil, fmt.Errorf("scan permission: %w", err)
-		}
-		names = append(names, name)
+	for _, row := range rows {
+		names = append(names, rowText(row, "permission_name"))
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate permissions: %w", err)
-	}
+	sortStrings(names)
 	return names, nil
-}
-
-// placeholders returns a "?, ?, ?" list of n placeholders for an IN clause.
-func placeholders(n int) string {
-	if n <= 0 {
-		return ""
-	}
-	var b strings.Builder
-	b.Grow(n*3 - 2)
-	for i := 0; i < n; i++ {
-		if i > 0 {
-			b.WriteString(", ")
-		}
-		b.WriteByte('?')
-	}
-	return b.String()
 }
 
 // containsString reports whether s contains v.

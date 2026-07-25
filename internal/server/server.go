@@ -45,10 +45,21 @@ func NewMux(deps Deps) (*http.ServeMux, error) {
 	// arrives.
 	h := &handlers{
 		db:        deps.DB,
-		authStore: &compat.Store{Target: schema.SQLiteTarget, DB: deps.DB},
+		store:     &compat.Store{Target: schema.SQLiteTarget, DB: deps.DB},
 		jwtSecret: deps.JWTSecret,
 		now:       time.Now,
 	}
+	h.registerRoutes(mux)
+	return mux, nil
+}
+
+// registerRoutes wires every route onto the mux. It is split out of NewMux with
+// NO behavior change so a handlers value built over a DIFFERENT engine can be
+// given the same routes — which is what the CONTRACT-20 dual-engine battery
+// needs to drive the real HTTP surface against PostgreSQL. NewMux remains the
+// only public constructor and still composes the SQLite store; choosing the
+// engine stays CONTRACT-21.
+func (h *handlers) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /auth/login", h.handleLogin)
 	mux.HandleFunc("GET /whoami", h.handleWhoami)
 
@@ -116,16 +127,18 @@ func NewMux(deps Deps) (*http.ServeMux, error) {
 	// CONTRACT-06: browser-facing UI (static assets, login/logout, protected
 	// home) on the same mux/handlers. JSON routes above are unaffected.
 	h.registerUIRoutes(mux)
-	return mux, nil
 }
 
 // handlers holds the per-request-shared state for the auth routes.
 type handlers struct {
 	db *sql.DB
-	// authStore is the same connection as db, paired with the engine it is
-	// bound to. It is what internal/auth takes since CONTRACT-19; every other
-	// package here still uses db, which CONTRACT-20 migrates.
-	authStore *compat.Store
+	// store is the same connection as db, paired with the engine it is bound
+	// to. CONTRACT-19 introduced it for internal/auth; CONTRACT-20 makes it the
+	// door for every statement this package runs too, which is why it lost the
+	// `auth` in its name. `db` survives only for the two things a *compat.Store
+	// does not offer: BeginTx (the transactions terms.go owns) and the
+	// *sql.DB that internal/store's own helpers still take.
+	store     *compat.Store
 	jwtSecret string
 	now       func() time.Time
 	// schemaMu serializes the schema-MUTATING requests (CONTRACT-13: creating a
@@ -157,7 +170,7 @@ func (h *handlers) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	user, err := auth.VerifyCredentials(r.Context(), h.authStore, req.Email, req.Password)
+	user, err := auth.VerifyCredentials(r.Context(), h.store, req.Email, req.Password)
 	if err != nil {
 		// Same generic message for unknown user and wrong password.
 		writeError(w, http.StatusUnauthorized, "invalid credentials")
@@ -183,7 +196,7 @@ func (h *handlers) handleWhoami(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-	id, ok := resolveIdentity(r.Context(), h.authStore, h.jwtSecret, token)
+	id, ok := resolveIdentity(r.Context(), h.store, h.jwtSecret, token)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return

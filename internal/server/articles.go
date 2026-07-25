@@ -4,11 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/MauricioPerera/librarian/internal/schema"
+	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
 
 // articles.go implements CONTRACT-03 T3: a REST CRUD surface over the
@@ -108,26 +109,24 @@ func (h *handlers) handleCreateArticle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	hasEmbedding := embPresent && embCanonical != ""
-	var articleID string
-	switch {
-	case hasMeta && hasEmbedding:
-		err = h.db.QueryRowContext(r.Context(),
-			`INSERT INTO articles (author_id, title, body, metadata, embedding) VALUES (?, ?, ?, ?, ?) RETURNING id`,
-			id.UserID, req.Title, req.Body, string(req.Metadata), embCanonical,
-		).Scan(&articleID)
-	case hasMeta:
-		err = h.db.QueryRowContext(r.Context(),
-			`INSERT INTO articles (author_id, title, body, metadata) VALUES (?, ?, ?, ?) RETURNING id`,
-			id.UserID, req.Title, req.Body, string(req.Metadata),
-		).Scan(&articleID)
-	case hasEmbedding:
-		err = h.db.QueryRowContext(r.Context(),
-			`INSERT INTO articles (author_id, title, body, embedding) VALUES (?, ?, ?, ?) RETURNING id`,
-			id.UserID, req.Title, req.Body, embCanonical,
-		).Scan(&articleID)
-	default:
-		articleID, err = h.insertArticleBasic(r.Context(), id.UserID, req.Title, req.Body)
+	// CONTRACT-20 collapsed the four hand-branched INSERT variants into ONE
+	// statement built from the optional columns actually present. The contract
+	// warns against multiplying them into four near-identical routines, and the
+	// warning generalizes: four variants of the same INSERT were already one
+	// variant too many. metadata and embedding are appended only when set, so the
+	// omitted case still leaves the column at its NULL default — byte-identical
+	// behavior, one statement to keep dual-engine instead of four.
+	optional := make([]string, 0, 2)
+	extra := make([]any, 0, 2)
+	if hasMeta {
+		optional = append(optional, "metadata")
+		extra = append(extra, string(req.Metadata))
 	}
+	if hasEmbedding {
+		optional = append(optional, "embedding")
+		extra = append(extra, embCanonical)
+	}
+	articleID, err := h.insertArticle(r.Context(), id.UserID, req.Title, req.Body, optional, extra)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "could not create article")
 		return
@@ -206,21 +205,20 @@ func (h *handlers) handleUpdateArticle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	setEmbedding := embPresent && !embIsNull
-	clearEmbedding := embPresent && embIsNull
+	// CONTRACT-20: the same collapse as create. The three update variants were
+	// "set the embedding", "clear it" and "leave it alone"; the first two are the
+	// same statement with a different bound value (the canonical carrier, or SQL
+	// NULL), and the third simply omits the assignment. embedding is bound as a
+	// plain parameter in BOTH cases — see insertArticle for why no cast is needed
+	// even against PostgreSQL's native vector(1536) column.
 	var res sql.Result
-	switch {
-	case setEmbedding:
-		res, err = h.db.ExecContext(r.Context(),
-			`UPDATE articles SET title = ?, body = ?, embedding = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-			req.Title, req.Body, embCanonical, id,
-		)
-	case clearEmbedding:
-		res, err = h.db.ExecContext(r.Context(),
-			`UPDATE articles SET title = ?, body = ?, embedding = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-			req.Title, req.Body, id,
-		)
-	default:
+	if embPresent {
+		var value any
+		if !embIsNull {
+			value = embCanonical
+		}
+		res, err = h.updateArticleWithEmbedding(r.Context(), id, req.Title, req.Body, value)
+	} else {
 		res, err = h.updateArticleTitleBody(r.Context(), id, req.Title, req.Body)
 	}
 	if err != nil {
@@ -245,7 +243,7 @@ func (h *handlers) handleUpdateArticle(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handlePublishArticle sets published_at = CURRENT_TIMESTAMP if it was NULL
+// handlePublishArticle sets published_at to the current instant if it was NULL
 // (idempotent — a no-op when already published). Requires content.publish.
 // 404 when the id does not exist; 200 on both first publish and repeat.
 func (h *handlers) handlePublishArticle(w http.ResponseWriter, r *http.Request) {
@@ -286,16 +284,12 @@ func (h *handlers) handleDeleteArticle(w http.ResponseWriter, r *http.Request) {
 // caller maps ok=false to 404 and err!=nil to 500, so a malformed id never
 // surfaces as a raw SQL error.
 func (h *handlers) fetchArticle(r *http.Request, id string) (article, bool, error) {
-	row := h.db.QueryRowContext(r.Context(),
-		`SELECT id, author_id, title, body, published_at, embedding, created_at, updated_at
-		   FROM articles
-		  WHERE id = ?`,
-		id,
-	)
-	a, err := scanArticle(row)
-	if errors.Is(err, sql.ErrNoRows) {
-		return article{}, false, nil
+	row, found, err := h.queryOne(r.Context(), schema.RoutineArticleByID,
+		map[string]compat.Value{"article_id": uuidValue(id)})
+	if err != nil || !found {
+		return article{}, false, err
 	}
+	a, err := articleFromRow(row)
 	if err != nil {
 		return article{}, false, err
 	}
@@ -322,38 +316,83 @@ func (h *handlers) fetchArticle(r *http.Request, id string) (article, bool, erro
 // case shared by the JSON default branch and the admin UI create form) and
 // returns the generated id.
 func (h *handlers) insertArticleBasic(ctx context.Context, authorID, title, body string) (string, error) {
-	var id string
-	err := h.db.QueryRowContext(ctx,
-		`INSERT INTO articles (author_id, title, body) VALUES (?, ?, ?) RETURNING id`,
-		authorID, title, body,
-	).Scan(&id)
-	return id, err
+	return h.insertArticle(ctx, authorID, title, body, nil, nil)
+}
+
+// insertArticle inserts one article with the always-present columns plus any
+// optional ones the caller supplies (metadata, embedding), and returns the
+// generated id.
+//
+// THE VECTOR, MEASURED — this is the risk CONTRACT-20 says to settle first.
+// articles.embedding is TEXT on SQLite but a NATIVE vector(1536) column on
+// PostgreSQL (pgvector). The question was whether binding the canonical carrier
+// text '[c1,c2,...]' as an ordinary parameter is enough, or whether PostgreSQL
+// needs an explicit conversion. It was measured against a real PostgreSQL 17
+// with pgvector before any of this was written, and the answer is that a PLAIN
+// BIND WORKS: in `INSERT INTO articles (..., embedding) VALUES (..., $4)` the
+// parameter's type is inferred from the target column, so pgvector's own text
+// input function parses it. No cast is emitted, because emitting one would be
+// PostgreSQL-only syntax in a statement that must also run on SQLite — i.e. the
+// exact divergence this contract removes. The evidence, and the ONE real
+// difference that binding cannot fix (pgvector stores float4, so a component
+// needing more than single precision is truncated on PostgreSQL and kept in full
+// on SQLite), are in docs/reports/CONTRACT-20-REPORT.md.
+//
+// The id and both timestamps are written by the application: created_at is the
+// primary sort key of listArticles and the two engines render CURRENT_TIMESTAMP
+// differently, so leaving it to the DEFAULT would make the LIST ORDER diverge.
+func (h *handlers) insertArticle(ctx context.Context, authorID, title, body string, optional []string, extra []any) (string, error) {
+	id, err := newUUID()
+	if err != nil {
+		return "", err
+	}
+	engine := h.engine()
+	stamp := nowCanonical()
+	columns := []string{"id", "author_id", "title", "body", "created_at", "updated_at"}
+	args := []any{id, authorID, title, body, stamp, stamp}
+	columns = append(columns, optional...)
+	args = append(args, extra...)
+	quoted := make([]string, len(columns))
+	for i, c := range columns {
+		quoted[i] = quote(c)
+	}
+	statement := `INSERT INTO ` + quote("articles") + ` (` + strings.Join(quoted, ", ") +
+		`) VALUES (` + bindList(engine, 1, len(args)) + `)`
+	if _, err := h.db.ExecContext(ctx, statement, args...); err != nil {
+		return "", err
+	}
+	return id, nil
 }
 
 // listArticles returns a page of articles ordered by created_at DESC. Shared by
 // the JSON list route and the admin UI list page.
+//
+// CONTRACT-20: schema.RoutineListArticles, and going through a routine here is
+// not interchangeable with raw SQL. A raw read of the embedding column returns
+// whatever the driver decided — SQLite hands back the stored carrier text,
+// PostgreSQL hands back pgvector's own rendering — so the two engines would give
+// this function different text for the same logical value. The routine declares
+// the column as vector(EmbeddingDimension), so compat canonicalizes both sides
+// to the identical '[c1,c2,...]' form before it reaches ParseVector.
+//
+// The declared order is (created_at DESC, id ASC). created_at alone is not
+// total, and this read is PAGINATED: without a total order the same
+// LIMIT/OFFSET can select different rows on each engine.
 func (h *handlers) listArticles(ctx context.Context, limit, offset int) ([]article, error) {
-	rows, err := h.db.QueryContext(ctx,
-		`SELECT id, author_id, title, body, published_at, embedding, created_at, updated_at
-		   FROM articles
-		  ORDER BY created_at DESC
-		  LIMIT ? OFFSET ?`,
-		limit, offset,
-	)
+	rows, err := h.queryRoutine(ctx, schema.RoutineListArticles, map[string]compat.Value{
+		"page_limit":  integerValue(limit),
+		"page_offset": integerValue(offset),
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	out := make([]article, 0)
-	for rows.Next() {
-		a, err := scanArticle(rows)
+	out := make([]article, 0, len(rows))
+	for _, row := range rows {
+		a, err := articleFromRow(row)
 		if err != nil {
 			return nil, err
 		}
 		out = append(out, a)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
 	}
 	return out, nil
 }
@@ -361,32 +400,59 @@ func (h *handlers) listArticles(ctx context.Context, limit, offset int) ([]artic
 // articleExists reports whether a row with the given id is present. A missing or
 // malformed id yields (false, nil) — never a raw SQL error — so callers map it
 // to 404 rather than 500.
+//
+// It has its own routine (selecting only id) rather than reusing the by-id read:
+// this runs before every update and publish, and the full read would drag a
+// 1536-component vector across the wire to answer a yes/no question. The old
+// statement was `SELECT 1`; a read routine declares its outputs against the
+// relation's own columns, so it selects `id`. The answer is identical.
 func (h *handlers) articleExists(ctx context.Context, id string) (bool, error) {
-	var x int
-	err := h.db.QueryRowContext(ctx, `SELECT 1 FROM articles WHERE id = ?`, id).Scan(&x)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	return true, nil
+	_, found, err := h.queryOne(ctx, schema.RoutineArticleExists,
+		map[string]compat.Value{"article_id": uuidValue(id)})
+	return found, err
 }
 
-// updateArticleTitleBody updates only title/body (not published_at). It returns
-// the sql.Result so the caller can inspect RowsAffected. Shared by the JSON
-// default update branch and the admin UI edit form.
+// updateArticleTitleBody updates only title/body (not published_at, not
+// embedding). It returns the sql.Result so the caller can inspect RowsAffected —
+// which is exactly why every write in this file stays raw SQL: CallRoutine
+// returns only error, and the row count is what decides 404 vs 200.
 func (h *handlers) updateArticleTitleBody(ctx context.Context, id, title, body string) (sql.Result, error) {
-	return h.db.ExecContext(ctx,
-		`UPDATE articles SET title = ?, body = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-		title, body, id,
-	)
+	engine := h.engine()
+	statement := `UPDATE ` + quote("articles") + ` SET ` +
+		quote("title") + ` = ` + bind(engine, 1) + `, ` +
+		quote("body") + ` = ` + bind(engine, 2) + `, ` +
+		quote("updated_at") + ` = ` + bind(engine, 3) +
+		` WHERE ` + quote("id") + ` = ` + bind(engine, 4)
+	return h.db.ExecContext(ctx, statement, title, body, nowCanonical(), id)
+}
+
+// updateArticleWithEmbedding updates title/body AND the embedding column.
+// embedding is a plain bound parameter: a non-nil value is the canonical carrier
+// text, a nil value is SQL NULL (the explicit-clear case). Binding NULL rather
+// than writing the literal `NULL` into the statement is what merges the old
+// "set" and "clear" branches into one statement — and it is accepted by
+// PostgreSQL's native vector column exactly as the carrier text is (measured;
+// see insertArticle).
+func (h *handlers) updateArticleWithEmbedding(ctx context.Context, id, title, body string, embedding any) (sql.Result, error) {
+	engine := h.engine()
+	statement := `UPDATE ` + quote("articles") + ` SET ` +
+		quote("title") + ` = ` + bind(engine, 1) + `, ` +
+		quote("body") + ` = ` + bind(engine, 2) + `, ` +
+		quote("embedding") + ` = ` + bind(engine, 3) + `, ` +
+		quote("updated_at") + ` = ` + bind(engine, 4) +
+		` WHERE ` + quote("id") + ` = ` + bind(engine, 5)
+	return h.db.ExecContext(ctx, statement, title, body, embedding, nowCanonical(), id)
 }
 
 // publishArticleByID sets published_at when still NULL (idempotent). found is
 // false when the id does not exist (→ 404). On success it returns the current
 // published_at so callers can confirm idempotency. Shared by the JSON publish
 // route and the admin UI publish button.
+//
+// The instant is now written by the application in the canonical timestamp form
+// instead of CURRENT_TIMESTAMP, for the same reason as everywhere else in this
+// file; the idempotence still comes from the `AND published_at IS NULL` guard,
+// which compat compiles identically on both engines.
 func (h *handlers) publishArticleByID(ctx context.Context, id string) (publishedAt *string, found bool, err error) {
 	present, err := h.articleExists(ctx, id)
 	if err != nil {
@@ -395,64 +461,65 @@ func (h *handlers) publishArticleByID(ctx context.Context, id string) (published
 	if !present {
 		return nil, false, nil
 	}
-	if _, err := h.db.ExecContext(ctx,
-		`UPDATE articles SET published_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND published_at IS NULL`,
-		id,
-	); err != nil {
+	engine := h.engine()
+	stamp := nowCanonical()
+	statement := `UPDATE ` + quote("articles") + ` SET ` +
+		quote("published_at") + ` = ` + bind(engine, 1) + `, ` +
+		quote("updated_at") + ` = ` + bind(engine, 2) +
+		` WHERE ` + quote("id") + ` = ` + bind(engine, 3) +
+		` AND ` + quote("published_at") + ` IS NULL`
+	if _, err := h.db.ExecContext(ctx, statement, stamp, stamp, id); err != nil {
 		return nil, true, err
 	}
-	var published sql.NullString
-	if err := h.db.QueryRowContext(ctx,
-		`SELECT published_at FROM articles WHERE id = ?`, id,
-	).Scan(&published); err != nil {
+	row, ok, err := h.queryOne(ctx, schema.RoutineArticlePublishedAt,
+		map[string]compat.Value{"article_id": uuidValue(id)})
+	if err != nil {
 		return nil, true, err
 	}
-	var pub *string
-	if published.Valid && published.String != "" {
-		s := published.String
-		pub = &s
+	if !ok {
+		return nil, true, nil
 	}
-	return pub, true, nil
+	return rowTextPointer(row, "published_at"), true, nil
 }
 
 // deleteArticleByID deletes one row and returns RowsAffected (0 ⇒ 404). Shared
 // by the JSON delete route and the admin UI delete button.
 func (h *handlers) deleteArticleByID(ctx context.Context, id string) (int64, error) {
-	res, err := h.db.ExecContext(ctx, `DELETE FROM articles WHERE id = ?`, id)
+	engine := h.engine()
+	statement := `DELETE FROM ` + quote("articles") + ` WHERE ` + quote("id") + ` = ` + bind(engine, 1)
+	res, err := h.db.ExecContext(ctx, statement, id)
 	if err != nil {
 		return 0, err
 	}
 	return res.RowsAffected()
 }
 
-// scanArticle scans an article row from either a *sql.Rows or a *sql.Row (both
-// implement the same Scan method via the shared sql.Scanner-like interface —
-// here we accept a scanner with Scan(...) ).
-func scanArticle(s interface {
-	Scan(dest ...any) error
-}) (article, error) {
-	var (
-		a         article
-		published sql.NullString
-		embedding sql.NullString
-	)
-	if err := s.Scan(&a.ID, &a.AuthorID, &a.Title, &a.Body, &published, &embedding, &a.CreatedAt, &a.UpdatedAt); err != nil {
-		return article{}, err
+// articleFromRow maps one canonicalized routine row to the JSON view.
+//
+// published_at and embedding are both nullable and their NULL-ness is read from
+// the canonical KIND, never from an empty string — the distinction that decides
+// whether the JSON carries the field at all (both are omitempty). embedding
+// arrives as the canonical carrier '[c1,c2,...]' on BOTH engines because the
+// routine declares the vector family; GET returns it as a JSON array of numbers,
+// never the raw text, exactly as before.
+func articleFromRow(row compat.Row) (article, error) {
+	a := article{
+		ID:          rowText(row, "id"),
+		AuthorID:    rowText(row, "author_id"),
+		Title:       rowText(row, "title"),
+		Body:        rowText(row, "body"),
+		PublishedAt: rowTextPointer(row, "published_at"),
+		CreatedAt:   rowText(row, "created_at"),
+		UpdatedAt:   rowText(row, "updated_at"),
 	}
-	if published.Valid && published.String != "" {
-		s := published.String
-		a.PublishedAt = &s
-	}
-	// embedding is stored as the canonical carrier text '[c1,c2,...]' on both
-	// engines. GET returns it as a JSON array of numbers, never the raw text;
-	// a NULL column stays a nil slice (omitempty) — backward compatible with
-	// CONTRACT-03/04 which had no embedding field.
-	if embedding.Valid && embedding.String != "" {
-		components, err := ParseVector(embedding.String)
-		if err != nil {
-			return article{}, err
+	if !rowIsNull(row, "embedding") {
+		if text := rowText(row, "embedding"); text != "" {
+			components, err := ParseVector(text)
+			if err != nil {
+				return article{}, err
+			}
+			a.Embedding = components
 		}
-		a.Embedding = components
 	}
 	return a, nil
 }

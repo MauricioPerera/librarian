@@ -195,6 +195,16 @@ func BuildWith(defs []ContentTypeDefinition) (compat.Schema, error) {
 			return compat.Schema{}, fmt.Errorf("dynamic content type %q: %w", d.Name, err)
 		}
 		full.Tables = append(full.Tables, table)
+		// CONTRACT-20 T1: the two READ routines of this type, generated here —
+		// the same place its table is generated — because a routine's output
+		// columns must be DECLARED and a dynamic type's column set is only known
+		// at runtime. Writes stay raw SQL (they need RowsAffected to answer
+		// 404 vs 200), so no write routine is generated.
+		routines, err := dynamicContentRoutines(d)
+		if err != nil {
+			return compat.Schema{}, fmt.Errorf("dynamic content type %q: %w", d.Name, err)
+		}
+		full.Routines = append(full.Routines, routines...)
 	}
 	if err := full.Validate(); err != nil {
 		return compat.Schema{}, fmt.Errorf("composed schema (code + dynamic) does not validate: %w", err)

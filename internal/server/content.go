@@ -35,13 +35,15 @@ package server
 // dynamic table is known only at runtime, so both directions are driven by the
 // definition's []FieldDefinition:
 //
-//   - READ: the SELECT list is built from the definition, and the scan targets
-//     are a []any of *any (the driver's natural Go value). jsonValue() then
-//     converts each raw driver value to the JSON type its FieldType demands, so
-//     an integer comes back as a JSON number and a boolean as a JSON boolean —
-//     not everything as a string. The row is assembled as a map[string]any and
-//     marshalled by encoding/json, which is what makes one generic code path
-//     able to produce a differently-shaped object per type.
+//   - READ (rewritten by CONTRACT-20): the read goes through the two routines
+//     schema.BuildWith generates for the type, whose output columns are DECLARED
+//     with the canonical family of each FieldType. compat therefore canonicalizes
+//     every value before this package sees it, and rowJSON() maps that single
+//     representation to the JSON type the FieldType demands — an integer comes
+//     back as a JSON number and a boolean as a JSON boolean, not everything as a
+//     string. The row is assembled as a map[string]any and marshalled by
+//     encoding/json, which is what makes one generic code path able to produce a
+//     differently-shaped object per type.
 //   - WRITE: bindValue() validates each body value AGAINST its declared
 //     FieldType and returns the Go value to bind. A JSON type that does not
 //     match the declared FieldType is a 400 with a clear message — never a 500,
@@ -49,7 +51,6 @@ package server
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -60,6 +61,7 @@ import (
 
 	"github.com/MauricioPerera/librarian/internal/schema"
 	"github.com/MauricioPerera/librarian/internal/store"
+	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
 
 // commonColumns are the columns ContentType() injects into EVERY content table,
@@ -124,145 +126,75 @@ func (h *handlers) resolveType(w http.ResponseWriter, r *http.Request) (schema.C
 	return def, true
 }
 
-// selectClause builds the fully-qualified SELECT list and the quoted table name
-// for a definition: the common columns plus one column per declared field, in
-// declaration order, so the scan targets line up positionally.
-func selectClause(def schema.ContentTypeDefinition) (table string, columns []string, err error) {
-	table, err = quoteTable(def)
-	if err != nil {
-		return "", nil, err
-	}
-	columns = []string{colID, colAuthorID, colCreatedAt, colUpdatedAt, colMetadata}
-	for _, f := range def.Fields {
-		quoted, err := quoteIdentifier(f.Name)
-		if err != nil {
-			return "", nil, err
-		}
-		columns = append(columns, quoted)
-	}
-	return table, columns, nil
-}
-
-// scanRow scans ONE row of a dynamic table whose shape is known only at
-// runtime, and returns it as a JSON-ready object.
+// rowJSON turns ONE canonicalized routine row of a dynamic table into a
+// JSON-ready object.
 //
-// The five common columns have fixed Go types. The dynamic tail is scanned into
-// a []any of *any — the driver hands back whatever it natively stores (int64
-// for INTEGER, string for TEXT, nil for NULL) — and jsonValue() then maps each
-// one to the JSON type its declared FieldType requires.
-func scanRow(s interface{ Scan(dest ...any) error }, def schema.ContentTypeDefinition) (map[string]any, error) {
-	var (
-		id, authorID, createdAt, updatedAt string
-		metadata                           sql.NullString
-	)
-	raw := make([]any, len(def.Fields))
-	dest := make([]any, 0, 5+len(def.Fields))
-	dest = append(dest, &id, &authorID, &createdAt, &updatedAt, &metadata)
-	for i := range raw {
-		dest = append(dest, &raw[i])
-	}
-	if err := s.Scan(dest...); err != nil {
-		return nil, err
-	}
-
-	row := map[string]any{
-		colID:        id,
-		colAuthorID:  authorID,
-		colCreatedAt: createdAt,
-		colUpdatedAt: updatedAt,
+// THIS FUNCTION IS THE POINT OF THE content.go DECISION IN CONTRACT-20, so the
+// reasoning lives here. It replaces scanRow + jsonValue + driverText +
+// driverInt: four functions whose whole job was to GUESS what the driver had
+// handed back. driverInt accepted int64, int, bool, float64, string and []byte
+// for a single integer column; the boolean branch tried an int and fell back to
+// a Go bool. Those were not defensive niceties — they were the per-engine
+// branching this contract exists to delete, because the answer genuinely differs:
+// SQLite stores a BOOLEAN as INTEGER and returns int64, PostgreSQL stores it as
+// BOOLEAN and returns bool; SQLite stores a DECIMAL as TEXT and PostgreSQL as
+// NUMERIC. Reading through a routine that DECLARES the family (the two routines
+// generated per type in schema.BuildWith) makes compat canonicalize the value
+// before this package ever sees it, so there is one representation to map and
+// the mapping is total.
+//
+// The per-type JSON mapping is unchanged from jsonValue, and so is every
+// response byte:
+//   - text/date  → JSON string. A date is canonical `YYYY-MM-DD` TEXT on both
+//     engines, returned verbatim with no timezone folding.
+//   - integer    → JSON number.
+//   - boolean    → JSON true/false, never 0/1.
+//   - decimal    → JSON STRING, deliberately: emitting a number would
+//     re-introduce the IEEE-754 rounding the TEXT/NUMERIC storage choice exists
+//     to avoid. Same choice as products.price (CONTRACT-11).
+//   - NULL       → JSON null for every type (every dynamic column is nullable by
+//     construction — see schema.DynamicTable). NULL-ness is read from the
+//     canonical KIND, never from an empty string.
+func rowJSON(row compat.Row, def schema.ContentTypeDefinition) (map[string]any, error) {
+	out := map[string]any{
+		colID:        rowText(row, colID),
+		colAuthorID:  rowText(row, colAuthorID),
+		colCreatedAt: rowText(row, colCreatedAt),
+		colUpdatedAt: rowText(row, colUpdatedAt),
 		colMetadata:  nil,
 	}
-	// metadata is the JSON escape column (TEXT on both engines). It is not
-	// writable through this surface; when a row has one (written by another
-	// path) it is surfaced as raw JSON, never as a re-encoded string.
-	if metadata.Valid && strings.TrimSpace(metadata.String) != "" && json.Valid([]byte(metadata.String)) {
-		row[colMetadata] = json.RawMessage(metadata.String)
-	}
-	for i, f := range def.Fields {
-		v, err := jsonValue(f, raw[i])
-		if err != nil {
-			return nil, err
+	// metadata is the JSON escape column. It is not writable through this
+	// surface; when a row has one (written by another path) it is surfaced as
+	// raw JSON, never as a re-encoded string.
+	if !rowIsNull(row, colMetadata) {
+		if text := strings.TrimSpace(rowText(row, colMetadata)); text != "" {
+			out[colMetadata] = json.RawMessage(text)
 		}
-		row[f.Name] = v
 	}
-	return row, nil
-}
-
-// jsonValue converts one raw driver value into the JSON value its declared
-// FieldType demands. NULL stays JSON null for every type (every dynamic column
-// is nullable by construction — see schema.DynamicTable).
-//
-// Per-type mapping and why:
-//   - text/date  → JSON string. A date is stored as canonical `YYYY-MM-DD` TEXT
-//     on both engines (compat maps DateType to TEXT deliberately), so the exact
-//     stored text is returned, with no timezone folding.
-//   - integer    → JSON number (int64). SQLite stores it as INTEGER.
-//   - boolean    → JSON true/false. SQLite stores it as INTEGER 0/1, so the
-//     conversion happens here rather than leaking 0/1 to the client.
-//   - decimal    → JSON STRING, deliberately. compat maps DecimalType to TEXT on
-//     SQLite precisely because IEEE-754 cannot hold an arbitrary-precision
-//     decimal; emitting a JSON number would re-introduce the rounding the
-//     storage decision exists to avoid. This is the SAME choice products.price
-//     already makes (CONTRACT-11), so the two surfaces agree. Writing accepts
-//     both a JSON number and a JSON string.
-func jsonValue(f schema.FieldDefinition, v any) (any, error) {
-	if v == nil {
-		return nil, nil
-	}
-	switch f.Type {
-	case schema.FieldText, schema.FieldDate, schema.FieldDecimal:
-		return driverText(v)
-	case schema.FieldInteger:
-		return driverInt(v)
-	case schema.FieldBoolean:
-		n, err := driverInt(v)
-		if err != nil {
-			if b, ok := v.(bool); ok {
-				return b, nil
+	for _, f := range def.Fields {
+		if rowIsNull(row, f.Name) {
+			out[f.Name] = nil
+			continue
+		}
+		text := rowText(row, f.Name)
+		switch f.Type {
+		case schema.FieldText, schema.FieldDate, schema.FieldDecimal:
+			out[f.Name] = text
+		case schema.FieldInteger:
+			n, err := strconv.ParseInt(strings.TrimSpace(text), 10, 64)
+			if err != nil {
+				return nil, fmt.Errorf("field %q: %w", f.Name, err)
 			}
-			return nil, err
+			out[f.Name] = n
+		case schema.FieldBoolean:
+			// The canonical text of the boolean family is exactly "true"/"false"
+			// on both engines — that IS the canonicalization compat performs.
+			out[f.Name] = text == "true"
+		default:
+			return nil, fmt.Errorf("field %q has unknown type %q", f.Name, string(f.Type))
 		}
-		return n != 0, nil
-	default:
-		return nil, fmt.Errorf("field %q has unknown type %q", f.Name, string(f.Type))
 	}
-}
-
-// driverText normalises the driver's text representations ([]byte or string).
-func driverText(v any) (string, error) {
-	switch t := v.(type) {
-	case string:
-		return t, nil
-	case []byte:
-		return string(t), nil
-	default:
-		return "", fmt.Errorf("unexpected stored value of type %T for a text column", v)
-	}
-}
-
-// driverInt normalises the driver's integer representations. float64 and text
-// are accepted defensively (a different driver or a value written outside this
-// surface) so a read can never turn into a 500 for a well-formed row.
-func driverInt(v any) (int64, error) {
-	switch t := v.(type) {
-	case int64:
-		return t, nil
-	case int:
-		return int64(t), nil
-	case bool:
-		if t {
-			return 1, nil
-		}
-		return 0, nil
-	case float64:
-		return int64(t), nil
-	case string:
-		return strconv.ParseInt(strings.TrimSpace(t), 10, 64)
-	case []byte:
-		return strconv.ParseInt(strings.TrimSpace(string(t)), 10, 64)
-	default:
-		return 0, fmt.Errorf("unexpected stored value of type %T for an integer column", v)
-	}
+	return out, nil
 }
 
 // errBadField is the sentinel for "the client's body is wrong" — always a 400,
@@ -536,72 +468,104 @@ func writeBindError(w http.ResponseWriter, err error) {
 
 // --- Data access -------------------------------------------------------------
 
+// dynamicSchema composes the canonical schema that DECLARES this type's two read
+// routines. It is a pure function of the persisted definition — schema.BuildWith
+// generates the table and, since CONTRACT-20, its `content_list_*` /
+// `content_read_*` routines in the same place — so it costs no database round
+// trip. Only this one type is composed, not every type in the instance: a read
+// of `eventos` needs `eventos` declared, and nothing else.
+func dynamicSchema(def schema.ContentTypeDefinition) (compat.Schema, error) {
+	return schema.BuildWith([]schema.ContentTypeDefinition{def})
+}
+
 // listContentRows returns a page of rows ordered by created_at DESC.
+//
+// CONTRACT-20: schema.DynamicListRoutine(def). The declared order is
+// (created_at DESC, id ASC) — created_at alone is not total, and a paginated
+// read without a total order can select DIFFERENT rows for the same
+// LIMIT/OFFSET on each engine, which is the worst failure mode in this file.
 func (h *handlers) listContentRows(ctx context.Context, def schema.ContentTypeDefinition, limit, offset int) ([]map[string]any, error) {
-	table, columns, err := selectClause(def)
+	dyn, err := dynamicSchema(def)
 	if err != nil {
 		return nil, err
 	}
-	query := `SELECT ` + strings.Join(columns, ", ") + ` FROM ` + table + ` ORDER BY ` + colCreatedAt + ` DESC LIMIT ? OFFSET ?`
-	rows, err := h.db.QueryContext(ctx, query, limit, offset)
+	rows, err := h.store.QueryRoutine(ctx, dyn, schema.DynamicListRoutine(def), map[string]compat.Value{
+		"page_limit":  integerValue(limit),
+		"page_offset": integerValue(offset),
+	})
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	// Never nil: an empty type must serialise as [], not null.
-	out := make([]map[string]any, 0)
-	for rows.Next() {
-		row, err := scanRow(rows, def)
+	out := make([]map[string]any, 0, len(rows))
+	for _, row := range rows {
+		item, err := rowJSON(row, def)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, row)
+		out = append(out, item)
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // fetchContentRow loads one row by id. found=false for a missing OR malformed
 // id (it is a bound parameter, so it just matches nothing); err is non-nil only
 // on a real database failure.
 func (h *handlers) fetchContentRow(ctx context.Context, def schema.ContentTypeDefinition, id string) (map[string]any, bool, error) {
-	table, columns, err := selectClause(def)
+	dyn, err := dynamicSchema(def)
 	if err != nil {
 		return nil, false, err
 	}
-	query := `SELECT ` + strings.Join(columns, ", ") + ` FROM ` + table + ` WHERE ` + colID + ` = ?`
-	row, err := scanRow(h.db.QueryRowContext(ctx, query, id), def)
-	if errors.Is(err, sql.ErrNoRows) {
+	rows, err := h.store.QueryRoutine(ctx, dyn, schema.DynamicReadRoutine(def),
+		map[string]compat.Value{"row_id": uuidValue(id)})
+	if err != nil {
+		return nil, false, err
+	}
+	if len(rows) == 0 {
 		return nil, false, nil
 	}
+	item, err := rowJSON(rows[0], def)
 	if err != nil {
 		return nil, false, err
 	}
-	return row, true, nil
+	return item, true, nil
 }
 
 // insertContentRow inserts a row with the given author and per-field values (in
 // declaration order) and returns the generated id. A type with zero fields
 // inserts the author alone — still a valid row.
+//
+// CONTRACT-20: raw SQL composed with compat.Placeholder. The column COUNT is
+// only known at runtime, which a routine's static action list cannot express;
+// the id and both timestamps are written by the application (dual.go) instead of
+// relying on RETURNING and the DEFAULTs, because created_at is this type's
+// primary sort key and the two engines render CURRENT_TIMESTAMP differently.
+// The security model of this file is unchanged: identifiers still come only from
+// the persisted definition through quoteIdentifier, values are still all bound.
 func (h *handlers) insertContentRow(ctx context.Context, def schema.ContentTypeDefinition, authorID string, values []any) (string, error) {
 	table, err := quoteTable(def)
 	if err != nil {
 		return "", err
 	}
-	columns := []string{colAuthorID}
-	placeholders := []string{"?"}
-	args := []any{authorID}
+	id, err := newUUID()
+	if err != nil {
+		return "", err
+	}
+	engine := h.engine()
+	stamp := nowCanonical()
+	columns := []string{colID, colAuthorID, colCreatedAt, colUpdatedAt}
+	args := []any{id, authorID, stamp, stamp}
 	for i, f := range def.Fields {
 		quoted, err := quoteIdentifier(f.Name)
 		if err != nil {
 			return "", err
 		}
 		columns = append(columns, quoted)
-		placeholders = append(placeholders, "?")
 		args = append(args, values[i])
 	}
-	query := `INSERT INTO ` + table + ` (` + strings.Join(columns, ", ") + `) VALUES (` + strings.Join(placeholders, ", ") + `) RETURNING ` + colID
-	var id string
-	if err := h.db.QueryRowContext(ctx, query, args...).Scan(&id); err != nil {
+	query := `INSERT INTO ` + table + ` (` + strings.Join(columns, ", ") + `) VALUES (` +
+		bindList(engine, 1, len(args)) + `)`
+	if _, err := h.db.ExecContext(ctx, query, args...); err != nil {
 		return "", err
 	}
 	return id, nil
@@ -610,24 +574,35 @@ func (h *handlers) insertContentRow(ctx context.Context, def schema.ContentTypeD
 // updateContentRow replaces every own field of one row and bumps updated_at.
 // It returns RowsAffected (0 ⇒ 404). A type with zero fields still touches
 // updated_at, so the 0/1 answer stays meaningful.
+//
+// CONTRACT-20: this is the statement the contract names as the reason writes
+// cannot be routines. CallRoutine returns only `error`; the row count IS the
+// answer that decides 404 vs 200 here, and a prior existence read would add a
+// round trip and a race the code does not have today.
 func (h *handlers) updateContentRow(ctx context.Context, def schema.ContentTypeDefinition, id string, values []any) (int64, error) {
 	table, err := quoteTable(def)
 	if err != nil {
 		return 0, err
 	}
+	engine := h.engine()
 	assignments := make([]string, 0, len(def.Fields)+1)
-	args := make([]any, 0, len(def.Fields)+1)
+	args := make([]any, 0, len(def.Fields)+2)
+	position := 1
 	for i, f := range def.Fields {
 		quoted, err := quoteIdentifier(f.Name)
 		if err != nil {
 			return 0, err
 		}
-		assignments = append(assignments, quoted+" = ?")
+		assignments = append(assignments, quoted+" = "+bind(engine, position))
 		args = append(args, values[i])
+		position++
 	}
-	assignments = append(assignments, colUpdatedAt+" = CURRENT_TIMESTAMP")
+	assignments = append(assignments, quote(colUpdatedAt)+" = "+bind(engine, position))
+	args = append(args, nowCanonical())
+	position++
+	query := `UPDATE ` + table + ` SET ` + strings.Join(assignments, ", ") +
+		` WHERE ` + quote(colID) + ` = ` + bind(engine, position)
 	args = append(args, id)
-	query := `UPDATE ` + table + ` SET ` + strings.Join(assignments, ", ") + ` WHERE ` + colID + ` = ?`
 	res, err := h.db.ExecContext(ctx, query, args...)
 	if err != nil {
 		return 0, err
@@ -635,13 +610,16 @@ func (h *handlers) updateContentRow(ctx context.Context, def schema.ContentTypeD
 	return res.RowsAffected()
 }
 
-// deleteContentRow deletes one row and returns RowsAffected (0 ⇒ 404).
+// deleteContentRow deletes one row and returns RowsAffected (0 ⇒ 404). Raw SQL
+// for the same reason updateContentRow is.
 func (h *handlers) deleteContentRow(ctx context.Context, def schema.ContentTypeDefinition, id string) (int64, error) {
 	table, err := quoteTable(def)
 	if err != nil {
 		return 0, err
 	}
-	res, err := h.db.ExecContext(ctx, `DELETE FROM `+table+` WHERE `+colID+` = ?`, id)
+	engine := h.engine()
+	query := `DELETE FROM ` + table + ` WHERE ` + quote(colID) + ` = ` + bind(engine, 1)
+	res, err := h.db.ExecContext(ctx, query, id)
 	if err != nil {
 		return 0, err
 	}

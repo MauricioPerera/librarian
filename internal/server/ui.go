@@ -229,7 +229,7 @@ func (h *handlers) handleLoginSubmit(w http.ResponseWriter, r *http.Request) {
 	email := r.PostFormValue("email")
 	password := r.PostFormValue("password")
 
-	user, err := auth.VerifyCredentials(r.Context(), h.authStore, email, password)
+	user, err := auth.VerifyCredentials(r.Context(), h.store, email, password)
 	if err != nil {
 		// Same message for unknown-user and wrong-password — anti-enumeration.
 		renderLogin(w, http.StatusUnauthorized, genericLoginError)
