@@ -40,6 +40,7 @@ import (
 	"database/sql"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
@@ -203,9 +204,43 @@ func Ascending(values ...string) []Key {
 // honouring its direction. It is the engine-independent replacement for a
 // multi-column ORDER BY over text. The sort is STABLE, so items that compare
 // equal on every key keep the sequence the routine's declared ORDER BY produced.
+//
+// It is SortByKeysE with a key function that cannot fail, so there is exactly one
+// comparison implementation in this package.
 func SortByKeys[T any](items []T, keys func(T) []Key) {
-	sort.SliceStable(items, func(i, j int) bool {
-		a, b := keys(items[i]), keys(items[j])
+	_ = SortByKeysE(items, func(item T) ([]Key, error) { return keys(item), nil })
+}
+
+// SortByKeysE is SortByKeys for a key function that can FAIL — the shape a
+// timestamp key needs, because turning stored text into a comparable instant can
+// legitimately not work (see AscInstant).
+//
+// The keys of EVERY item are computed BEFORE anything is compared, for two
+// reasons. The first is correctness of the failure mode: a comparator cannot
+// return an error, and sort.Slice would simply never call the comparator on an
+// item when the slice has fewer than two elements — so a key function that fails
+// would go unnoticed exactly in the small inputs. Computing up front means the
+// error surfaces for a one-row listing too. The second is cost: n key
+// computations instead of O(n log n).
+//
+// On error nothing is reordered: items is left exactly as it came in, so a caller
+// that (wrongly) ignores the error still sees the routine's declared ORDER BY
+// rather than a half-sorted slice.
+func SortByKeysE[T any](items []T, keys func(T) ([]Key, error)) error {
+	computed := make([][]Key, len(items))
+	for i := range items {
+		k, err := keys(items[i])
+		if err != nil {
+			return err
+		}
+		computed[i] = k
+	}
+	order := make([]int, len(items))
+	for i := range order {
+		order[i] = i
+	}
+	sort.SliceStable(order, func(x, y int) bool {
+		a, b := computed[order[x]], computed[order[y]]
 		for k := range a {
 			if a[k].Value == b[k].Value {
 				continue
@@ -217,4 +252,129 @@ func SortByKeys[T any](items []T, keys func(T) []Key) {
 		}
 		return false
 	})
+	sorted := make([]T, len(items))
+	for i, from := range order {
+		sorted[i] = items[from]
+	}
+	copy(items, sorted)
+	return nil
+}
+
+// TIMESTAMPS — comparing INSTANTS, not the strings that carry them ---------------
+//
+// CONTRACT-20C T1. A value of compat's `timestamp` family is stored as TEXT and
+// read back re-rendered with time.RFC3339Nano, which TRIMS the trailing zeros of
+// the fractional second. Comparing those strings byte-wise is NOT comparing
+// instants, and it goes wrong in two independent ways within the same second:
+//
+//	written           read back          byte order says
+//	…25.123456780Z    …25.12345678Z      after …25.123456781Z ('Z' 0x5A > '1' 0x31)
+//	…25.000000000Z    …25Z               after …25.5Z         ('Z' 0x5A > '.' 0x2E)
+//
+// Both put a LATER row first. This is not an engine divergence — SQLite and
+// PostgreSQL agree, and both are wrong — which is why CONTRACT-20B, whose subject
+// was divergence, recorded it and left it. A timestamp is a MOMENT; that it
+// travels as text is a property of the carrier, so the comparison has to be by
+// instant.
+//
+// The fix is not a custom comparator: it is to compare a rendering of the instant
+// whose byte order IS chronological order. TimestampLayout is exactly that —
+// fixed width, UTC, punctuation at identical offsets in every value — so instant
+// keys drop straight into the existing Key machinery and keep composing with the
+// text keys next to them.
+
+// TimestampLayout is RFC3339Nano with a FIXED-WIDTH nanosecond field: the single
+// canonical way librarian RENDERS an instant, both to store it and to compare it.
+//
+// It is not a new format. It is an ordinary RFC3339Nano value, parsed by compat's
+// timestamp family like any other, and re-rendered trimmed when read back. The
+// fixed width is what buys the ordering property: every value has the same
+// length, the same punctuation offsets and a zero-padded fractional field, so a
+// byte comparison of two renderings answers the same question as comparing the
+// two instants. Applied to a UTC time the offset element always renders as `Z`,
+// which is what keeps the width fixed.
+//
+// CONTRACT-20 introduced it in internal/server, for the STORED text of the
+// paginated listings that sort created_at inside the engine. CONTRACT-20B
+// deliberately did NOT share it with internal/auth, on the grounds that auth
+// sorts in Go over the value compat hands back — which is trimmed regardless of
+// what was stored — so a fixed-width write would have changed the stored text and
+// bought no ordering guarantee. CONTRACT-20C makes it shared, because the premise
+// changed on both halves: Go now compares instants (so the stored text no longer
+// decides any auth order, and changing it is observationally free), and the SQL
+// side wants ONE writer format across the whole application. See the report, T2.
+const TimestampLayout = "2006-01-02T15:04:05.000000000Z07:00"
+
+// Now returns the current instant rendered with TimestampLayout. It is what every
+// librarian package writes into a `timestamp` column, replacing the engine's
+// CURRENT_TIMESTAMP (which renders differently on each engine).
+func Now() string {
+	return time.Now().UTC().Format(TimestampLayout)
+}
+
+// timestampLayouts are the text forms ParseInstant accepts, and they mirror
+// compat's own timestampFormats (compat/store.go) ON PURPOSE: compat is what
+// canonicalizes the value on the way out, so accepting less here would reject
+// text the database layer considers valid, and accepting more would let a value
+// through that compat itself would have refused. The list covers the canonical
+// RFC 3339 form plus the space-separated forms PostgreSQL emits — which is also
+// the shape of librarian's LEGACY rows, written when created_at was left to the
+// engine's CURRENT_TIMESTAMP ("2026-07-24 07:46:36").
+var timestampLayouts = []string{
+	time.RFC3339Nano,
+	"2006-01-02 15:04:05.999999999Z07:00",
+	"2006-01-02 15:04:05.999999999Z07",
+	"2006-01-02 15:04:05.999999999",
+}
+
+// ParseInstant turns the text of a `timestamp` value into the instant it denotes.
+// A form without an offset is read as UTC, the same reading compat gives it.
+//
+// It FAILS, visibly and with the offending text quoted, on anything it cannot
+// parse — including the empty string, which is what RowText returns for a SQL
+// NULL. There is no fallback to a lexicographic comparison: that is precisely the
+// accidental behavior this contract removes.
+func ParseInstant(text string) (time.Time, error) {
+	for _, layout := range timestampLayouts {
+		if instant, err := time.Parse(layout, text); err == nil {
+			return instant, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("timestamp %q: not in any accepted layout", text)
+}
+
+// InstantSortValue renders the instant denoted by text with TimestampLayout, in
+// UTC. Byte-comparing two such renderings is comparing the two instants: the
+// normalization to UTC removes the zone, and the fixed width removes the
+// length/punctuation artefacts of the trimmed form.
+//
+// (Chronological equivalence of the byte order holds for four-digit years, which
+// is every value any engine of this project can produce or store.)
+func InstantSortValue(text string) (string, error) {
+	instant, err := ParseInstant(text)
+	if err != nil {
+		return "", err
+	}
+	return instant.UTC().Format(TimestampLayout), nil
+}
+
+// AscInstant builds an ascending sort key that compares the INSTANT denoted by
+// text, for use with SortByKeysE. Use it — never Asc — for any value of the
+// `timestamp` family.
+func AscInstant(text string) (Key, error) {
+	value, err := InstantSortValue(text)
+	if err != nil {
+		return Key{}, err
+	}
+	return Key{Value: value}, nil
+}
+
+// DescInstant is AscInstant with the direction reversed: newest first.
+func DescInstant(text string) (Key, error) {
+	key, err := AscInstant(text)
+	if err != nil {
+		return Key{}, err
+	}
+	key.Descending = true
+	return key, nil
 }

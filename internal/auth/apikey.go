@@ -154,9 +154,25 @@ func ListAPIKeys(ctx context.Context, store *compat.Store) ([]APIKeyRecord, erro
 	// CONTRACT-20 made for its three partial orders. The id is a UUID, whose
 	// hyphens sit at identical offsets in every value, so a byte comparison and a
 	// collation comparison provably agree on it.
-	dual.SortByKeys(out, func(k APIKeyRecord) []dual.Key {
-		return []dual.Key{dual.Desc(k.CreatedAt), dual.Asc(k.Label), dual.Asc(k.ID)}
-	})
+	//
+	// CONTRACT-20C: created_at is compared as an INSTANT (dual.DescInstant), not
+	// as the text that carries it. Comparing the text put a LATER key first
+	// whenever its nanosecond field ended in zero or was absent, because compat
+	// hands the value back rendered with time.RFC3339Nano, which trims trailing
+	// zeros — same wrong answer on both engines. A created_at that does not parse
+	// is returned as an ERROR rather than silently falling back to a text
+	// comparison: the column is NOT NULL and compat refuses to canonicalize an
+	// unparseable timestamp on read, so reaching this is a corrupted row, and a
+	// 500 naming the key is the honest answer.
+	if err := dual.SortByKeysE(out, func(k APIKeyRecord) ([]dual.Key, error) {
+		created, err := dual.DescInstant(k.CreatedAt)
+		if err != nil {
+			return nil, fmt.Errorf("api key %s created_at: %w", k.ID, err)
+		}
+		return []dual.Key{created, dual.Asc(k.Label), dual.Asc(k.ID)}, nil
+	}); err != nil {
+		return nil, fmt.Errorf("order api keys: %w", err)
+	}
 	if len(out) == 0 {
 		return nil, nil
 	}

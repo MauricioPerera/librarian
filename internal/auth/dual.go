@@ -28,8 +28,7 @@ package auth
 // and the one value constructor no other package needs.
 
 import (
-	"time"
-
+	"github.com/MauricioPerera/librarian/internal/dual"
 	"github.com/MauricioPerera/librarian/internal/schema"
 	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
@@ -51,21 +50,29 @@ var authSchema = schema.Build()
 // — it is the one compat declares for the family, and the one canonicalValue
 // normalizes every timestamp to when it is read back.
 //
-// CONTRACT-20B — WHY THIS IS *NOT* internal/server's FIXED-WIDTH LAYOUT, which is
-// the obvious thing to copy and would be a mistake here. internal/server writes a
-// fixed-width nanosecond field because its three PAGINATED listings sort
-// created_at INSIDE the engine, where the STORED text is what gets compared and a
-// variable width breaks the byte-vs-collation agreement. Nothing in `auth` is
-// paginated: after this contract every auth listing is ordered in Go, over the
-// value compat hands back — and compat re-renders every timestamp it reads with
-// time.RFC3339Nano, which TRIMS trailing zeros. A fixed-width value written here
-// would therefore be trimmed again on the way out and change nothing about the
-// order, while changing the TEXT stored in api_keys.created_at and with it the
-// sequence SQLite produces across rows written before and after the change. This
-// contract does not authorize an observable order change in production, so the
-// format stays exactly as CONTRACT-19 wrote it. See the report's red-team entry.
+// CONTRACT-20B wrote a bare time.RFC3339Nano here and argued AGAINST adopting
+// internal/server's fixed-width layout: nothing in `auth` is paginated, its order
+// is imposed in Go over the value compat hands back (always re-rendered TRIMMED,
+// whatever was stored), so the fixed width bought no ordering guarantee while
+// changing the stored text of api_keys.created_at — and with it the sequence
+// SQLite produced across rows written before and after the change.
+//
+// CONTRACT-20C REVISES that decision, because both halves of its premise moved:
+//
+//   - The Go order of ListAPIKeys no longer depends on the text at all: it
+//     compares created_at as an INSTANT (dual.DescInstant). So the stored text
+//     changing shape is now observationally FREE for this package — the argument
+//     that blocked the change is what T1 removed.
+//   - The remaining reason to care about the stored text is SQL: an ORDER BY
+//     inside the engine cannot parse, it compares what is stored. Having ONE
+//     writer format across the whole application is the precondition for that
+//     order to be correct, and a per-package format is a defect waiting for the
+//     next routine that sorts by created_at in SQL.
+//
+// So the layout is now dual.TimestampLayout, the single definition shared with
+// internal/server. See the report, T2.
 func now() string {
-	return time.Now().UTC().Format(time.RFC3339Nano)
+	return dual.Now()
 }
 
 // timestampValue builds a canonical timestamp argument. It stays local (rather

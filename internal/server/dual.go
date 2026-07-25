@@ -37,7 +37,6 @@ package server
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/MauricioPerera/librarian/internal/dual"
 	"github.com/MauricioPerera/librarian/internal/schema"
@@ -100,10 +99,13 @@ func quote(name string) string {
 // and therefore the order — identical. The column DEFAULTs stay as a safety net
 // for writes that do not come from the application.
 func nowCanonical() string {
-	return time.Now().UTC().Format(canonicalTimestampLayout)
+	return dual.Now()
 }
 
 // canonicalTimestampLayout is RFC3339Nano with a FIXED-WIDTH nanosecond field.
+// CONTRACT-20C moved the definition to dual.TimestampLayout, so the application
+// has exactly ONE writer format; the name stays here as the local alias the rest
+// of this package reads.
 //
 // It is not a new format — it is a valid RFC3339Nano value, parsed by compat's
 // timestamp family like any other and re-rendered trimmed when read back, so
@@ -120,13 +122,13 @@ func nowCanonical() string {
 // PAGINATED listings, where the order decides WHICH ROWS a page contains and
 // cannot be re-sorted after the fact in Go.
 //
-// It is deliberately NOT shared with internal/auth: nothing in `auth` is
-// paginated, every auth listing is ordered in Go over the value compat hands
-// back (which is re-rendered TRIMMED regardless of what was stored), so adopting
-// this layout there would change the stored text of api_keys.created_at — and
-// the sequence production observes — while buying no ordering guarantee at all.
-// See internal/auth/dual.go.
-const canonicalTimestampLayout = "2006-01-02T15:04:05.000000000Z07:00"
+// CONTRACT-20B kept it OUT of internal/auth on the grounds that auth sorts in Go
+// over the trimmed value compat hands back, so the fixed width bought nothing
+// there while changing the stored text. CONTRACT-20C shares it after all: auth
+// now compares created_at as an instant, so its stored text no longer decides any
+// order, and one writer format for the whole application is what makes a SQL
+// ORDER BY over created_at correct. See internal/auth/dual.go and the 20C report.
+const canonicalTimestampLayout = dual.TimestampLayout
 
 // integerValue builds a canonical integer routine argument. It stays local: this
 // is the only package that passes a bound LIMIT/OFFSET to a routine.
