@@ -17,9 +17,10 @@ import (
 	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
 
-// Registry table names. They are code tables in Build(), so ReservedNames()
-// picks them up automatically — a dynamic type can never be called
-// "content_types".
+// Registry table names. They are code tables in Build(); since CONTRACT-17 a
+// dynamic type named "content_types" is harmless (it produces the table
+// "cpt_content_types"), because every dynamic table carries
+// DynamicTablePrefix and no code table may.
 const (
 	// ContentTypesTable holds one row per dynamic content type.
 	ContentTypesTable = "content_types"
@@ -107,7 +108,7 @@ type ContentTypeDefinition struct {
 // a schema-level UNIQUE(name) constraint on content_types (see Build()), which
 // is the only guarantee that cannot lose a concurrent race.
 func (d ContentTypeDefinition) Validate() error {
-	if err := ValidateIdentifier(d.Name); err != nil {
+	if err := ValidateTypeName(d.Name); err != nil {
 		return fmt.Errorf("content type %w", err)
 	}
 	seen := make(map[string]struct{}, len(d.Fields))
@@ -126,10 +127,22 @@ func (d ContentTypeDefinition) Validate() error {
 	return nil
 }
 
+// TableName is the REAL name of the table backing this definition: the public
+// name with DynamicTablePrefix applied (CONTRACT-17). Every layer that needs a
+// table name — the generic CRUD layer, the store's diff step — calls this
+// instead of using d.Name, and it delegates to the single DynamicTableName
+// helper, so the derivation lives in exactly one place.
+//
+// d.Name stays the PUBLIC name: routes, API payloads and the UI never see this.
+func (d ContentTypeDefinition) TableName() string {
+	return DynamicTableName(d.Name)
+}
+
 // DynamicTable turns a validated definition into the real compat.Table, through
-// the SAME ContentType() helper articles/products use. It re-validates first:
-// this function is the ONLY way a dynamic name reaches a compat.Table, so the
-// gate cannot be bypassed by a caller that forgot to validate.
+// the SAME ContentType() helper articles/products use (its signature is
+// untouched: the prefixed name is simply what is passed in). It re-validates
+// first: this function is the ONLY way a dynamic name reaches a compat.Table,
+// so the gate cannot be bypassed by a caller that forgot to validate.
 func DynamicTable(d ContentTypeDefinition) (compat.Table, error) {
 	if err := d.Validate(); err != nil {
 		return compat.Table{}, err
@@ -153,7 +166,7 @@ func DynamicTable(d ContentTypeDefinition) (compat.Table, error) {
 			Nullable: true,
 		})
 	}
-	return ContentType(d.Name, own), nil
+	return ContentType(d.TableName(), own), nil
 }
 
 // BuildWith returns THE canonical schema of a running librarian instance:

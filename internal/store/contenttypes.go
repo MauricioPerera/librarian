@@ -241,12 +241,14 @@ func CreateContentType(ctx context.Context, store *compat.Store, def schema.Cont
 	if err != nil {
 		return err
 	}
-	if len(missing) != 1 || missing[0].Name != def.Name {
+	// The expected table is the PREFIXED one (CONTRACT-17): def.Name is the
+	// public name, def.TableName() is what BuildWith actually put in the schema.
+	if len(missing) != 1 || missing[0].Name != def.TableName() {
 		names := make([]string, 0, len(missing))
 		for _, t := range missing {
 			names = append(names, t.Name)
 		}
-		return fmt.Errorf("refusing to create content type %q: expected exactly that one table to be missing, found %v", def.Name, names)
+		return fmt.Errorf("refusing to create content type %q: expected exactly one missing table (%q), found %v", def.Name, def.TableName(), names)
 	}
 
 	// 4. Compile the DDL BEFORE opening the transaction, so a compilation

@@ -47,6 +47,52 @@ import (
 //     more than a human needs for a content-type or field name.
 const MaxIdentifierLength = 32
 
+// DynamicTablePrefix (CONTRACT-17) is the prefix EVERY table produced by a
+// dynamic content type carries. It is a STRUCTURAL guarantee, not a convention:
+//
+//   - A dynamic type named `eventos` produces the table `cpt_eventos`. The two
+//     namespaces — code tables and dynamic tables — therefore cannot intersect,
+//     so a future contract adding a code table named `eventos` can no longer
+//     produce a duplicate table in the composed schema (which made
+//     Schema.Validate() fail and the service refuse to start: hueco 3 of
+//     docs/PENDIENTES.md).
+//   - The guarantee only holds while NO code table starts with this prefix.
+//     Code tables are Go literals and never pass through this validator, so the
+//     enforcement is a TEST over Build() (see TestNoCodeTableUsesDynamicPrefix).
+//     Without that test the prefix would be a convention; with it, it is a
+//     guarantee.
+//
+// `cpt_` is chosen for "content type" (the vocabulary DEFINITION-CPT-
+// DINAMICOS.md already uses), it is short (4 bytes of the identifier budget),
+// and it matches the identifier pattern, so a prefixed name is still a legal
+// identifier and needs no special-casing anywhere.
+//
+// This is NEVER shown to, nor written by, a user: every public surface
+// (/content/{type}, /admin/content/{type}, the definitions API, the sidebar)
+// keeps using the bare name the admin chose.
+const DynamicTablePrefix = "cpt_"
+
+// MaxTypeNameLength is the maximum length of a dynamic content-type NAME.
+//
+// DECISION (CONTRACT-17 red-team): MaxIdentifierLength applies to the REAL
+// TABLE name, i.e. to the PREFIXED one — because the whole justification of the
+// 32-byte budget is downstream: Postgres' 63-byte NAMEDATALEN and compat's
+// derived names ("__compat_capture_" + <table> + "_" + <kind>, 24 + len(table)).
+// Those derivations are applied to the real table, which now carries the
+// prefix. So the type name budget shrinks by len(prefix) and a 32-character
+// type name is no longer accepted: it would produce a 36-byte table, breaking
+// the invariant the constant exists to protect. FIELD names are not prefixed
+// and keep the full MaxIdentifierLength.
+const MaxTypeNameLength = MaxIdentifierLength - len(DynamicTablePrefix)
+
+// DynamicTableName is THE single place where a dynamic type's public name
+// becomes its real table name. Everything that needs the table name (the
+// schema builder, the generic CRUD layer, the store) calls this — the
+// concatenation is never repeated, so the two namespaces cannot drift apart.
+func DynamicTableName(typeName string) string {
+	return DynamicTablePrefix + typeName
+}
+
 // identifierPattern is the ONLY accepted shape: a lowercase ASCII letter
 // followed by lowercase ASCII letters, digits and underscores. This single
 // pattern is what rejects quotes, semicolons, spaces, uppercase, unicode,
@@ -55,35 +101,47 @@ const MaxIdentifierLength = 32
 var identifierPattern = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
 
 // ReservedNames returns the set of identifiers a dynamic content type or field
-// may never use. It is DERIVED, never hardcoded, from three sources:
+// may never use. It is DERIVED, never hardcoded, from two sources:
 //
-//  1. Every table name produced by Build() — the code-defined schema. Deriving
-//     it means that adding a code table in a future contract automatically
-//     reserves that name, with no list to keep in sync.
-//  2. compat's four internal tables (__compat_schema, __compat_applied_changes,
+//  1. compat's four internal tables (__compat_schema, __compat_applied_changes,
 //     __compat_capture_state, __compat_change_journal). These already fail the
 //     pattern (they start with '_'), but they are listed explicitly so the
 //     reservation is auditable and survives any future loosening of the pattern.
-//  3. Every column name ContentType() injects (id, author_id, created_at,
-//     updated_at, metadata) — also derived, by calling ContentType with no own
-//     columns and reading back what it produced. A field colliding with one of
+//  2. Every column name ContentType() injects (id, author_id, created_at,
+//     updated_at, metadata) — derived, by calling ContentType with no own
+//     columns and reading back what it produced. A FIELD colliding with one of
 //     these would make Schema.Validate() fail with an opaque duplicate-column
-//     error at apply time instead of a clean 400 at request time.
+//     error at apply time instead of a clean 400 at request time. This is the
+//     reservation that still carries real weight, and it is unchanged.
 //
-// The three sets are deliberately merged into ONE list applied to BOTH type
-// names and field names. It is slightly stricter than strictly necessary (a
-// field named "users" is harmless), but a single reserved set is far easier to
-// reason about and audit than two overlapping ones, and no legitimate content
-// model needs those words.
+// DECISION (CONTRACT-17 T2) — the third source, "every table name produced by
+// Build()", was REMOVED, deliberately:
+//
+//   - Its ONLY purpose was to stop a dynamic type from colliding with a code
+//     table. With DynamicTablePrefix that collision is structurally impossible:
+//     a type named `users` produces `cpt_users`, which no code table can ever
+//     be called (enforced by TestNoCodeTableUsesDynamicPrefix). Keeping the
+//     reservation would be a rule whose justification no longer exists.
+//   - Keeping it also had a real cost: `articles`, `products`, `terms`,
+//     `media`… are exactly the names an admin would legitimately choose for
+//     their own type, and rejecting them would be an unexplainable "reserved"
+//     error about an implementation detail the admin cannot see.
+//   - The confusion argument (a type `users` living next to /users) is real but
+//     cosmetic, and it is the admin's call to make: the two are different
+//     surfaces (/content/users vs /users) and different tables (cpt_users vs
+//     users). A structural impossibility beats a naming taboo.
+//
+// The remaining set is applied to BOTH type names and field names. It is
+// slightly stricter than strictly necessary for a type name (a type named `id`
+// is harmless now that it becomes `cpt_id`), but one reserved set is far easier
+// to audit than two overlapping ones, and no legitimate content model needs
+// those words as a type name either.
 func ReservedNames() map[string]struct{} {
 	reserved := map[string]struct{}{
 		"__compat_schema":          {},
 		"__compat_applied_changes": {},
 		"__compat_capture_state":   {},
 		"__compat_change_journal":  {},
-	}
-	for _, table := range Build().Tables {
-		reserved[table.Name] = struct{}{}
 	}
 	// Derive the injected column names from ContentType itself (its signature is
 	// untouched — this only calls it), so they can never drift apart.
@@ -109,6 +167,28 @@ func ValidateIdentifier(name string) error {
 	}
 	if _, ok := ReservedNames()[name]; ok {
 		return fmt.Errorf("name %q is reserved and cannot be used", name)
+	}
+	return nil
+}
+
+// ValidateTypeName is the gate for a dynamic content type's PUBLIC name. It is
+// ValidateIdentifier plus the tighter length budget: the name must still be a
+// legal identifier AFTER the prefix is applied, because it is the PREFIXED name
+// that becomes a real table and that compat derives its own names from.
+//
+// A type name that STARTS WITH the prefix (`cpt_x` → `cpt_cpt_x`) is
+// deliberately ALLOWED: name → prefix+name is injective, so no two type names
+// can ever produce the same table, and the collision this contract removes is
+// between dynamic tables and CODE tables, not among dynamic ones (which is
+// already decided by UNIQUE(name) on content_types). Forbidding it would be a
+// rule with no failure to prevent.
+func ValidateTypeName(name string) error {
+	if err := ValidateIdentifier(name); err != nil {
+		return err
+	}
+	if len(name) > MaxTypeNameLength {
+		return fmt.Errorf("name %q is invalid: longer than %d characters (a content type name is limited to %d so its real table %q fits the %d-character identifier budget)",
+			name, MaxTypeNameLength, MaxTypeNameLength, DynamicTableName(name), MaxIdentifierLength)
 	}
 	return nil
 }

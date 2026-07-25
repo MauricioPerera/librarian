@@ -16,6 +16,8 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/MauricioPerera/librarian/internal/schema"
 )
 
 // tableColumns returns the column names of a table, in declaration order,
@@ -118,13 +120,18 @@ func TestCreateContentTypeCreatesRealTable(t *testing.T) {
 	}
 
 	// THE evidence: the real table, with the injected columns, from the catalog.
-	if !sqliteTableExists(t, db, "reviews") {
-		t.Fatal("the real 'reviews' table was not created")
+	// CONTRACT-17: the REAL table is the PREFIXED one, and no table carries the
+	// bare public name.
+	if !sqliteTableExists(t, db, "cpt_reviews") {
+		t.Fatal("the real 'cpt_reviews' table was not created")
 	}
-	got := tableColumns(t, db, "reviews")
+	if sqliteTableExists(t, db, "reviews") {
+		t.Fatal("an UNPREFIXED table 'reviews' exists — the prefix is not being applied")
+	}
+	got := tableColumns(t, db, "cpt_reviews")
 	want := []string{"id", "author_id", "headline", "score", "price_paid", "verified", "read_on", "created_at", "updated_at", "metadata"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
-		t.Fatalf("columns of 'reviews' = %v, want %v", got, want)
+		t.Fatalf("columns of 'cpt_reviews' = %v, want %v", got, want)
 	}
 
 	// And it behaves like a real content table: an insert referencing a real
@@ -134,15 +141,15 @@ func TestCreateContentTypeCreatesRealTable(t *testing.T) {
 		t.Fatalf("lookup author: %v", err)
 	}
 	if _, err := db.Exec(
-		`INSERT INTO reviews (author_id, headline, score, price_paid, verified, read_on) VALUES (?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO cpt_reviews (author_id, headline, score, price_paid, verified, read_on) VALUES (?, ?, ?, ?, ?, ?)`,
 		authorID, "Great book", 5, "19.99", 1, "2026-07-24"); err != nil {
 		t.Fatalf("insert into the dynamic table: %v", err)
 	}
 	var n int
-	if err := db.QueryRow(`SELECT count(*) FROM reviews`).Scan(&n); err != nil || n != 1 {
+	if err := db.QueryRow(`SELECT count(*) FROM cpt_reviews`).Scan(&n); err != nil || n != 1 {
 		t.Fatalf("dynamic table row count=%d err=%v, want 1", n, err)
 	}
-	t.Logf("T3 OK: POST /content-types created the real table; PRAGMA table_info(reviews)=%v; 1 row inserted", got)
+	t.Logf("T3 OK: POST /content-types created the real table 'cpt_reviews' (no bare 'reviews'); PRAGMA table_info=%v; 1 row inserted", got)
 }
 
 // TestCreateContentTypeWithoutPermissionIs403 covers the gating criterion: the
@@ -159,7 +166,7 @@ func TestCreateContentTypeWithoutPermissionIs403(t *testing.T) {
 	if status != http.StatusForbidden {
 		t.Fatalf("without content_types.manage: status=%d body=%v, want 403", status, body)
 	}
-	if sqliteTableExists(t, db, "reviews") {
+	if sqliteTableExists(t, db, "cpt_reviews") {
 		t.Fatal("a forbidden request created the table")
 	}
 	var n int
@@ -201,10 +208,9 @@ func TestCreateContentTypeHostileNamesAre400(t *testing.T) {
 		{"only digits", "123"},
 		{"starts with digit", "1abc"},
 		{"too long", strings.Repeat("a", 33)},
-		{"reserved code table", "users"},
+		{"too long for a PREFIXED table", strings.Repeat("a", schema.MaxTypeNameLength+1)},
 		{"reserved injected column", "id"},
 		{"compat internal", "__compat_schema"},
-		{"registry table", "content_types"},
 	}
 	for _, tc := range cases {
 		status, body := doJSON(t, srv, http.MethodPost, "/content-types",
@@ -369,8 +375,8 @@ func TestCreateContentTypeIsCreateOnly(t *testing.T) {
 		t.Logf("CREATE-ONLY OK: %s /content-types/reviews -> %d", method, status)
 	}
 	// The type is untouched.
-	if !sqliteTableExists(t, db, "reviews") {
-		t.Fatal("'reviews' table disappeared")
+	if !sqliteTableExists(t, db, "cpt_reviews") {
+		t.Fatal("'cpt_reviews' table disappeared")
 	}
 }
 

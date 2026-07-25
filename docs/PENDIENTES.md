@@ -68,7 +68,17 @@ alcance, no un olvido.
 
 ## 3. Colisión de nombre entre un CPT dinámico y una tabla de código futura (BAJA)
 
-**Estado:** documentado, no resuelto (CONTRACT-13).
+**Estado:** RESUELTO por CONTRACT-17 (`specs/CONTRACT-17-prefijo-tablas-dinamicas.md`,
+reporte en `docs/reports/CONTRACT-17-REPORT.md`). La tabla real de un tipo
+dinámico lleva ahora el prefijo `cpt_` (`schema.DynamicTablePrefix`, aplicado en
+el único punto `schema.DynamicTableName`), y ninguna tabla de código puede
+usarlo — lo garantiza un test que recorre `schema.Build()`. Los dos espacios de
+nombres son disjuntos, así que la colisión descrita abajo pasó de "falla ruidosa
+que exige intervención manual" a IMPOSIBLE. El nombre público del tipo no
+cambió: las rutas y la API siguen usando el nombre que el admin eligió. Se
+conserva el texto de abajo como registro de cómo se descubrió el hueco.
+
+**Estado previo:** documentado, no resuelto (CONTRACT-13).
 
 El validador de identificadores reserva los nombres de todas las tablas que
 produce `schema.Build()`, derivándolos en vez de hardcodearlos — así que hoy un

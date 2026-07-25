@@ -347,7 +347,7 @@ func TestDynamicContentFieldValidation(t *testing.T) {
 
 	// NOTHING was stored by any rejected request.
 	var n int
-	if err := db.QueryRow(`SELECT count(*) FROM reviews`).Scan(&n); err != nil {
+	if err := db.QueryRow(`SELECT count(*) FROM cpt_reviews`).Scan(&n); err != nil {
 		t.Fatalf("count reviews: %v", err)
 	}
 	if n != 0 {
@@ -355,7 +355,7 @@ func TestDynamicContentFieldValidation(t *testing.T) {
 	}
 	// And the common columns were never touched: the injected/common-column
 	// bodies could not have altered the table shape either.
-	got := tableColumns(t, db, "reviews")
+	got := tableColumns(t, db, "cpt_reviews")
 	want := []string{"id", "author_id", "headline", "score", "price_paid", "verified", "read_on", "created_at", "updated_at", "metadata"}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("reviews columns changed: %v, want %v", got, want)
@@ -455,7 +455,7 @@ func TestDynamicContentIsolationBetweenTypes(t *testing.T) {
 		t.Fatalf("a reviews id is deletable under /content/recipes: status=%d, want 404", status)
 	}
 	var stillThere int
-	db.QueryRow(`SELECT count(*) FROM reviews`).Scan(&stillThere)
+	db.QueryRow(`SELECT count(*) FROM cpt_reviews`).Scan(&stillThere)
 	if stillThere != 3 {
 		t.Fatalf("cross-type delete removed rows: reviews has %d, want 3", stillThere)
 	}
@@ -530,7 +530,7 @@ func TestDynamicContentHostileTypeNames(t *testing.T) {
 
 	// THE proof: nothing was executed. Every system table is intact, with the
 	// same row counts, and no table was created or dropped.
-	for _, table := range []string{"users", "roles", "permissions", "role_permissions", "api_keys", "articles", "products", "terms", "content_types", "content_type_fields", "reviews"} {
+	for _, table := range []string{"users", "roles", "permissions", "role_permissions", "api_keys", "articles", "products", "terms", "content_types", "content_type_fields", "cpt_reviews"} {
 		if !sqliteTableExists(t, db, table) {
 			t.Fatalf("table %q no longer exists — an injection was executed", table)
 		}
@@ -600,7 +600,7 @@ func TestDynamicContentHostileValuesAreStoredVerbatim(t *testing.T) {
 		// ...and straight out of the database, proving it was STORED verbatim
 		// and not merely echoed back by the handler.
 		var stored string
-		if err := db.QueryRow(`SELECT headline FROM reviews WHERE id = ?`, id).Scan(&stored); err != nil {
+		if err := db.QueryRow(`SELECT headline FROM cpt_reviews WHERE id = ?`, id).Scan(&stored); err != nil {
 			t.Fatalf("direct read of %q: %v", payload, err)
 		}
 		if stored != payload {
@@ -627,7 +627,7 @@ func TestDynamicContentHostileValuesAreStoredVerbatim(t *testing.T) {
 		t.Fatalf("table count changed %d→%d — a value was executed", tablesBefore, after)
 	}
 	var n int
-	db.QueryRow(`SELECT count(*) FROM reviews`).Scan(&n)
+	db.QueryRow(`SELECT count(*) FROM cpt_reviews`).Scan(&n)
 	if n != len(payloads) {
 		t.Fatalf("reviews has %d rows, want %d", n, len(payloads))
 	}
@@ -697,7 +697,7 @@ func TestDynamicContentPermissionGating(t *testing.T) {
 
 	// The row survived every rejected attempt.
 	var n int
-	db.QueryRow(`SELECT count(*) FROM reviews`).Scan(&n)
+	db.QueryRow(`SELECT count(*) FROM cpt_reviews`).Scan(&n)
 	if n != 1 {
 		t.Fatalf("reviews has %d rows after rejected writes, want 1", n)
 	}
@@ -728,7 +728,7 @@ func TestDynamicContentAPIKeyCannotCreate(t *testing.T) {
 		t.Fatalf("403 with no explanatory message: %v", body)
 	}
 	var n int
-	db.QueryRow(`SELECT count(*) FROM reviews`).Scan(&n)
+	db.QueryRow(`SELECT count(*) FROM cpt_reviews`).Scan(&n)
 	if n != 0 {
 		t.Fatalf("an API-key create inserted %d rows", n)
 	}

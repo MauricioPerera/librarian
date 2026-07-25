@@ -88,8 +88,16 @@ func TestDumpSchemaIncludesDynamicTypes(t *testing.T) {
 		names = append(names, tbl.Name)
 	}
 	joined := strings.Join(names, ",")
-	if !strings.Contains(joined, "reviews") {
-		t.Fatalf("EXPORT WOULD OMIT DATA: dumped schema has no 'reviews' table; tables=%v", names)
+	// CONTRACT-17: the exported table is the PREFIXED one — that is what
+	// `compat copy` will create on PostgreSQL — and the bare name must not be
+	// present at all.
+	if !strings.Contains(joined, schema.DynamicTableName("reviews")) {
+		t.Fatalf("EXPORT WOULD OMIT DATA: dumped schema has no %q table; tables=%v", schema.DynamicTableName("reviews"), names)
+	}
+	for _, tbl := range dumped.Tables {
+		if tbl.Name == "reviews" {
+			t.Fatalf("the dump contains the UNPREFIXED table 'reviews'; tables=%v", names)
+		}
 	}
 	for _, code := range []string{"users", "articles", "products", "terms", schema.ContentTypesTable} {
 		if !strings.Contains(joined, code) {

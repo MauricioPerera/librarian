@@ -95,6 +95,20 @@ func quoteIdentifier(name string) (string, error) {
 	return `"` + name + `"`, nil
 }
 
+// quoteTable is the ONLY way this file names a dynamic TABLE in SQL
+// (CONTRACT-17). It goes through def.TableName(), i.e. through
+// schema.DynamicTableName, so the public name (`eventos`, used in the URL) and
+// the real table name (`cpt_eventos`, used in the query) can never be confused
+// — the two symmetric bugs being "the query hits the bare name and finds
+// nothing" and "the prefixed name leaks into a response".
+//
+// The prefixed name is re-validated by quoteIdentifier exactly like any other
+// identifier: schema.MaxTypeNameLength guarantees it still fits the identifier
+// budget, so a legal type name always yields a legal table name.
+func quoteTable(def schema.ContentTypeDefinition) (string, error) {
+	return quoteIdentifier(def.TableName())
+}
+
 // resolveType turns the {type} path segment into a PERSISTED definition. The
 // segment is used only as a bound comparison value inside FetchContentType; an
 // unknown, malformed or hostile name simply matches no definition and produces
@@ -116,7 +130,7 @@ func (h *handlers) resolveType(w http.ResponseWriter, r *http.Request) (schema.C
 // for a definition: the common columns plus one column per declared field, in
 // declaration order, so the scan targets line up positionally.
 func selectClause(def schema.ContentTypeDefinition) (table string, columns []string, err error) {
-	table, err = quoteIdentifier(def.Name)
+	table, err = quoteTable(def)
 	if err != nil {
 		return "", nil, err
 	}
@@ -571,7 +585,7 @@ func (h *handlers) fetchContentRow(ctx context.Context, def schema.ContentTypeDe
 // declaration order) and returns the generated id. A type with zero fields
 // inserts the author alone — still a valid row.
 func (h *handlers) insertContentRow(ctx context.Context, def schema.ContentTypeDefinition, authorID string, values []any) (string, error) {
-	table, err := quoteIdentifier(def.Name)
+	table, err := quoteTable(def)
 	if err != nil {
 		return "", err
 	}
@@ -599,7 +613,7 @@ func (h *handlers) insertContentRow(ctx context.Context, def schema.ContentTypeD
 // It returns RowsAffected (0 ⇒ 404). A type with zero fields still touches
 // updated_at, so the 0/1 answer stays meaningful.
 func (h *handlers) updateContentRow(ctx context.Context, def schema.ContentTypeDefinition, id string, values []any) (int64, error) {
-	table, err := quoteIdentifier(def.Name)
+	table, err := quoteTable(def)
 	if err != nil {
 		return 0, err
 	}
@@ -625,7 +639,7 @@ func (h *handlers) updateContentRow(ctx context.Context, def schema.ContentTypeD
 
 // deleteContentRow deletes one row and returns RowsAffected (0 ⇒ 404).
 func (h *handlers) deleteContentRow(ctx context.Context, def schema.ContentTypeDefinition, id string) (int64, error) {
-	table, err := quoteIdentifier(def.Name)
+	table, err := quoteTable(def)
 	if err != nil {
 		return 0, err
 	}

@@ -103,19 +103,25 @@ func TestDynamicTypeSurvivesRestartCycle(t *testing.T) {
 	if err := store.CreateContentType(ctx, db1, reviewsDef); err != nil {
 		t.Fatalf("create content type: %v", err)
 	}
-	if !tableExists(t, db1.DB, "reviews") {
-		t.Fatal("boot #1: dynamic table 'reviews' was not created")
+	if !tableExists(t, db1.DB, reviewsDef.TableName()) {
+		t.Fatalf("boot #1: dynamic table %q was not created", reviewsDef.TableName())
 	}
-	if !hasTable(metadataSchema(t, db1.DB), "reviews") {
-		t.Fatal("boot #1: __compat_schema does not contain 'reviews'")
+	// CONTRACT-17: the REAL table is the prefixed one, and the bare public name
+	// must not exist as a table at all.
+	if tableExists(t, db1.DB, reviewsDef.Name) {
+		t.Fatalf("boot #1: an UNPREFIXED table %q exists", reviewsDef.Name)
+	}
+	if !hasTable(metadataSchema(t, db1.DB), reviewsDef.TableName()) {
+		t.Fatalf("boot #1: __compat_schema does not contain %q", reviewsDef.TableName())
 	}
 	// The code tables must still be in the metadata too — the reduced-metadata
 	// trap works in both directions.
 	if !hasTable(metadataSchema(t, db1.DB), "users") {
 		t.Fatal("boot #1: __compat_schema lost the code table 'users'")
 	}
-	t.Logf("boot #1 OK: table exists=%v, metadata tables=%d (reviews present)",
-		tableExists(t, db1.DB, "reviews"), len(metadataSchema(t, db1.DB).Tables))
+	t.Logf("boot #1 OK: table %q exists=%v, unprefixed %q exists=%v, metadata tables=%d",
+		reviewsDef.TableName(), tableExists(t, db1.DB, reviewsDef.TableName()),
+		reviewsDef.Name, tableExists(t, db1.DB, reviewsDef.Name), len(metadataSchema(t, db1.DB).Tables))
 	if err := db1.Close(); err != nil {
 		t.Fatalf("close #1: %v", err)
 	}
@@ -128,11 +134,11 @@ func TestDynamicTypeSurvivesRestartCycle(t *testing.T) {
 	if err := store.EnsureSchema(ctx, db2); err != nil {
 		t.Fatalf("RESTART FAILED: EnsureSchema #2 errored: %v", err)
 	}
-	if !tableExists(t, db2.DB, "reviews") {
-		t.Fatal("restart #1: dynamic table 'reviews' disappeared")
+	if !tableExists(t, db2.DB, reviewsDef.TableName()) {
+		t.Fatalf("restart #1: dynamic table %q disappeared", reviewsDef.TableName())
 	}
 	meta2 := metadataSchema(t, db2.DB)
-	if !hasTable(meta2, "reviews") {
+	if !hasTable(meta2, reviewsDef.TableName()) {
 		t.Fatalf("restart #1: __compat_schema NO LONGER contains 'reviews' — a `compat copy` would now silently omit that table and all its rows. Tables in metadata: %d", len(meta2.Tables))
 	}
 	if !hasTable(meta2, "users") || !hasTable(meta2, "products") {
@@ -153,12 +159,12 @@ func TestDynamicTypeSurvivesRestartCycle(t *testing.T) {
 	if err := store.EnsureSchema(ctx, db3); err != nil {
 		t.Fatalf("SECOND RESTART FAILED: EnsureSchema #3 errored: %v", err)
 	}
-	if !tableExists(t, db3.DB, "reviews") {
-		t.Fatal("restart #2: dynamic table 'reviews' disappeared")
+	if !tableExists(t, db3.DB, reviewsDef.TableName()) {
+		t.Fatalf("restart #2: dynamic table %q disappeared", reviewsDef.TableName())
 	}
 	meta3 := metadataSchema(t, db3.DB)
-	if !hasTable(meta3, "reviews") {
-		t.Fatal("restart #2: __compat_schema no longer contains 'reviews'")
+	if !hasTable(meta3, reviewsDef.TableName()) {
+		t.Fatalf("restart #2: __compat_schema no longer contains %q", reviewsDef.TableName())
 	}
 	// The dynamic definition itself must still be readable, and still compose.
 	defs, err := store.LoadDefinitions(ctx, db3)
@@ -204,8 +210,11 @@ func TestDumpSchemaIncludesDynamicType(t *testing.T) {
 	if err := json.Unmarshal(data, &dumped); err != nil {
 		t.Fatalf("unmarshal dump: %v", err)
 	}
-	if !hasTable(dumped, "reviews") {
-		t.Fatal("EXPORT WOULD OMIT DATA: --dump-schema output does not contain the dynamic table 'reviews'")
+	if !hasTable(dumped, reviewsDef.TableName()) {
+		t.Fatalf("EXPORT WOULD OMIT DATA: --dump-schema output does not contain the dynamic table %q", reviewsDef.TableName())
+	}
+	if hasTable(dumped, reviewsDef.Name) {
+		t.Fatalf("--dump-schema contains the UNPREFIXED table %q", reviewsDef.Name)
 	}
 	// Every code table must still be there (the composition must not replace).
 	for _, tbl := range schema.Build().Tables {
@@ -216,7 +225,7 @@ func TestDumpSchemaIncludesDynamicType(t *testing.T) {
 	// And the dump must carry the dynamic type's OWN columns, not just its name.
 	var cols []string
 	for _, tbl := range dumped.Tables {
-		if tbl.Name == "reviews" {
+		if tbl.Name == reviewsDef.TableName() {
 			for _, c := range tbl.Columns {
 				cols = append(cols, c.Name)
 			}
@@ -224,14 +233,14 @@ func TestDumpSchemaIncludesDynamicType(t *testing.T) {
 	}
 	for _, want := range []string{"id", "author_id", "headline", "score", "price_paid", "verified", "read_on", "created_at", "updated_at", "metadata"} {
 		if !strings.Contains(strings.Join(cols, ","), want) {
-			t.Fatalf("dumped 'reviews' is missing column %q; got %v", want, cols)
+			t.Fatalf("dumped %q is missing column %q; got %v", reviewsDef.TableName(), want, cols)
 		}
 	}
 	// It must compile for the EXPORT target too, not only for SQLite.
 	if _, err := compat.CompileDDL(schema.PostgresTarget, dumped); err != nil {
 		t.Fatalf("dumped schema does not compile for PostgreSQL (the export destination): %v", err)
 	}
-	t.Logf("DUMP OK: %d tables including dynamic 'reviews' %v; compiles for PostgreSQL", len(dumped.Tables), cols)
+	t.Logf("DUMP OK: %d tables including dynamic %q %v; compiles for PostgreSQL", len(dumped.Tables), reviewsDef.TableName(), cols)
 }
 
 // TestCanonicalSchemaWithoutRegistry confirms the honest bootstrap case: a
@@ -321,8 +330,8 @@ func TestUpgradeFromPreContract13Database(t *testing.T) {
 	if err := store.EnsureSchema(ctx, db); err != nil {
 		t.Fatalf("EnsureSchema after upgrade + dynamic type: %v", err)
 	}
-	if !hasTable(metadataSchema(t, db.DB), "reviews") {
-		t.Fatal("metadata lost 'reviews' after the post-upgrade restart")
+	if !hasTable(metadataSchema(t, db.DB), reviewsDef.TableName()) {
+		t.Fatalf("metadata lost %q after the post-upgrade restart", reviewsDef.TableName())
 	}
 	t.Logf("UPGRADE OK: registry added, legacy row intact, dynamic type created and surviving a restart")
 }
@@ -348,7 +357,7 @@ func TestCreateContentTypeIsAtomic(t *testing.T) {
 		t.Fatalf("ensure: %v", err)
 	}
 	// Squat the name with a raw table compat's metadata knows nothing about.
-	if _, err := db.DB.ExecContext(ctx, `CREATE TABLE "reviews" (x INTEGER)`); err != nil {
+	if _, err := db.DB.ExecContext(ctx, `CREATE TABLE "`+reviewsDef.TableName()+`" (x INTEGER)`); err != nil {
 		t.Fatalf("squat table: %v", err)
 	}
 
@@ -370,8 +379,8 @@ func TestCreateContentTypeIsAtomic(t *testing.T) {
 		t.Fatalf("PARTIAL STATE: content_types=%d, content_type_fields=%d rows persisted despite the failure — want 0/0", types, fields)
 	}
 	// And the metadata was not touched either.
-	if hasTable(metadataSchema(t, db.DB), "reviews") {
-		t.Fatal("PARTIAL STATE: __compat_schema records 'reviews' despite the failed creation")
+	if hasTable(metadataSchema(t, db.DB), reviewsDef.TableName()) {
+		t.Fatalf("PARTIAL STATE: __compat_schema records %q despite the failed creation", reviewsDef.TableName())
 	}
 	t.Logf("ATOMIC OK: 0 definition rows, 0 field rows, metadata untouched after the failed creation")
 }
@@ -435,7 +444,10 @@ func TestCreateContentTypeRejectsHostileNames(t *testing.T) {
 		t.Fatalf("ensure: %v", err)
 	}
 
-	for _, name := range []string{`x"; DROP TABLE users; --`, "users", "MiTipo", "1abc", "", "my type", strings.Repeat("a", 64)} {
+	// NOTE (CONTRACT-17): "users" is deliberately NOT in this list any more — a
+	// type named like a code table is now legal because it produces "cpt_users".
+	// A name too long for the PREFIXED table still is hostile.
+	for _, name := range []string{`x"; DROP TABLE users; --`, "MiTipo", "1abc", "", "my type", strings.Repeat("a", 64), strings.Repeat("a", schema.MaxTypeNameLength+1)} {
 		if err := store.CreateContentType(ctx, db, schema.ContentTypeDefinition{Name: name}); err == nil {
 			t.Fatalf("store accepted hostile name %q", name)
 		}

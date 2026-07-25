@@ -47,10 +47,6 @@ func TestValidateIdentifierHostileBattery(t *testing.T) {
 		{"null byte", "reviews\x00"},
 		{"too long (33)", strings.Repeat("a", 33)},
 		{"way too long (200)", strings.Repeat("a", 200)},
-		{"reserved code table: users", "users"},
-		{"reserved code table: articles", "articles"},
-		{"reserved code table: terms", "terms"},
-		{"reserved registry table", schema.ContentTypesTable},
 		{"reserved injected column: id", "id"},
 		{"reserved injected column: author_id", "author_id"},
 		{"reserved injected column: metadata", "metadata"},
@@ -91,23 +87,172 @@ func TestValidateIdentifierAcceptsLegitimateNames(t *testing.T) {
 	}
 }
 
-// TestReservedNamesDerivedFromBuild confirms the reserved set is DERIVED, not
-// hardcoded: every table Build() declares and every column ContentType()
-// injects is in it. If a future contract adds a code table, this stays true
-// with no list to update.
-func TestReservedNamesDerivedFromBuild(t *testing.T) {
+// TestReservedNamesDerivedFromContentType confirms the reserved set is still
+// DERIVED, not hardcoded: every column ContentType() injects is in it, so a
+// FIELD can never collide with id/author_id/created_at/updated_at/metadata.
+//
+// It ALSO pins the CONTRACT-17 T2 decision in the other direction: code table
+// names are NO LONGER reserved. The prefix makes the collision they used to
+// prevent structurally impossible (see TestTypeNamedLikeCodeTableDoesNotCollide),
+// so the reservation was removed rather than kept as a rule with no cause. If a
+// future contract puts it back, this test fails and forces the decision to be
+// re-argued instead of silently reverted.
+func TestReservedNamesDerivedFromContentType(t *testing.T) {
 	reserved := schema.ReservedNames()
-	for _, table := range schema.Build().Tables {
-		if _, ok := reserved[table.Name]; !ok {
-			t.Fatalf("code table %q is not reserved", table.Name)
-		}
-	}
 	for _, column := range schema.ContentType("probe", nil).Columns {
 		if _, ok := reserved[column.Name]; !ok {
 			t.Fatalf("ContentType-injected column %q is not reserved", column.Name)
 		}
 	}
+	for _, table := range schema.Build().Tables {
+		if _, ok := reserved[table.Name]; ok {
+			// Only legitimate if the table name IS an injected column name, which
+			// no code table is.
+			t.Fatalf("code table %q is reserved again — CONTRACT-17 removed that reservation on purpose", table.Name)
+		}
+	}
 	t.Logf("reserved names (%d): %v", len(reserved), sortedKeys(reserved))
+}
+
+// --- CONTRACT-17: the structural prefix ---------------------------------------
+
+// TestNoCodeTableUsesDynamicPrefix IS the enforcement of CONTRACT-17. Code
+// tables are Go literals in Build(): they never pass through
+// ValidateIdentifier, so nothing at runtime can stop one from being named
+// "cpt_something". This test is therefore the ONLY real guarantee that the two
+// namespaces stay disjoint — without it, the prefix is a convention.
+func TestNoCodeTableUsesDynamicPrefix(t *testing.T) {
+	for _, table := range schema.Build().Tables {
+		if strings.HasPrefix(table.Name, schema.DynamicTablePrefix) {
+			t.Fatalf(`code table %q starts with %q, which is RESERVED for dynamic content types.
+
+CONSEQUENCE: an admin can create a dynamic type whose real table is exactly this
+name. The composed schema (schema.BuildWith) would then contain the same table
+twice, Schema.Validate() would fail, and THE SERVICE WOULD NOT START — the exact
+failure CONTRACT-17 exists to make impossible.
+
+FIX: rename the code table so it does not start with %q. Never "solve" this by
+changing the prefix: the existing databases already carry it.`,
+				table.Name, schema.DynamicTablePrefix, schema.DynamicTablePrefix)
+		}
+	}
+	t.Logf("ENFORCEMENT OK: none of the %d code tables uses the %q prefix", len(schema.Build().Tables), schema.DynamicTablePrefix)
+}
+
+// TestDynamicTableIsPrefixed is the T1 acceptance criterion at the unit level:
+// the compat.Table a definition produces carries the prefixed name, and the
+// derivation goes through the single DynamicTableName helper.
+func TestDynamicTableIsPrefixed(t *testing.T) {
+	table, err := schema.DynamicTable(schema.ContentTypeDefinition{Name: "eventos"})
+	if err != nil {
+		t.Fatalf("DynamicTable: %v", err)
+	}
+	if table.Name != "cpt_eventos" {
+		t.Fatalf("dynamic table name = %q, want %q", table.Name, "cpt_eventos")
+	}
+	if got := schema.DynamicTableName("eventos"); got != table.Name {
+		t.Fatalf("DynamicTableName(%q) = %q but DynamicTable produced %q — two derivations", "eventos", got, table.Name)
+	}
+	if got := (schema.ContentTypeDefinition{Name: "eventos"}).TableName(); got != table.Name {
+		t.Fatalf("TableName() = %q, want %q", got, table.Name)
+	}
+	t.Logf("PREFIX OK: public name %q -> real table %q", "eventos", table.Name)
+}
+
+// TestTypeNamedLikeCodeTableDoesNotCollide is the inverse of the enforcement:
+// a type named exactly like a code table is now ACCEPTED, produces a distinct
+// prefixed table, and the composed schema still validates and compiles. This is
+// what makes hueco 3 unreachable rather than merely detectable.
+func TestTypeNamedLikeCodeTableDoesNotCollide(t *testing.T) {
+	for _, name := range []string{"users", "articles", "products", schema.ContentTypesTable} {
+		def := schema.ContentTypeDefinition{Name: name, Fields: []schema.FieldDefinition{{Name: "nota", Type: schema.FieldText}}}
+		if err := def.Validate(); err != nil {
+			t.Fatalf("type named %q was rejected: %v", name, err)
+		}
+		full, err := schema.BuildWith([]schema.ContentTypeDefinition{def})
+		if err != nil {
+			t.Fatalf("BuildWith(type %q): %v", name, err)
+		}
+		if len(full.Tables) != len(schema.Build().Tables)+1 {
+			t.Fatalf("type %q: composed schema has %d tables, want %d+1", name, len(full.Tables), len(schema.Build().Tables))
+		}
+		var sawCode, sawDynamic bool
+		for _, tbl := range full.Tables {
+			if tbl.Name == name {
+				sawCode = true
+			}
+			if tbl.Name == schema.DynamicTableName(name) {
+				sawDynamic = true
+			}
+		}
+		if !sawCode || !sawDynamic {
+			t.Fatalf("type %q: code table present=%v, dynamic table %q present=%v", name, sawCode, schema.DynamicTableName(name), sawDynamic)
+		}
+		if _, err := compat.CompileDDL(schema.PostgresTarget, full); err != nil {
+			t.Fatalf("type %q: CompileDDL(postgres): %v", name, err)
+		}
+		t.Logf("NO COLLISION: code table %q and dynamic table %q coexist", name, schema.DynamicTableName(name))
+	}
+}
+
+// TestTypeNameBudgetAccountsForThePrefix pins the documented length decision:
+// MaxIdentifierLength applies to the REAL (prefixed) table, so the type-name
+// budget is smaller by exactly len(prefix). A type name at the old limit (32)
+// must now be rejected — otherwise it would produce a 36-byte table and break
+// the invariant the limit exists to protect.
+func TestTypeNameBudgetAccountsForThePrefix(t *testing.T) {
+	if schema.MaxTypeNameLength != schema.MaxIdentifierLength-len(schema.DynamicTablePrefix) {
+		t.Fatalf("MaxTypeNameLength=%d does not account for the prefix", schema.MaxTypeNameLength)
+	}
+	atLimit := strings.Repeat("a", schema.MaxTypeNameLength)
+	if err := schema.ValidateTypeName(atLimit); err != nil {
+		t.Fatalf("type name of length %d rejected: %v", len(atLimit), err)
+	}
+	if got := len(schema.DynamicTableName(atLimit)); got != schema.MaxIdentifierLength {
+		t.Fatalf("table for the longest legal type name is %d bytes, want %d", got, schema.MaxIdentifierLength)
+	}
+	over := strings.Repeat("a", schema.MaxTypeNameLength+1)
+	if err := schema.ValidateTypeName(over); err == nil {
+		t.Fatalf("type name of length %d was accepted; its table would be %d bytes", len(over), len(schema.DynamicTableName(over)))
+	} else {
+		t.Logf("REJECTED type name of length %d -> %v", len(over), err)
+	}
+	// A FIELD is not prefixed, so it keeps the full budget.
+	if err := schema.ValidateIdentifier(strings.Repeat("f", schema.MaxIdentifierLength)); err != nil {
+		t.Fatalf("field name at MaxIdentifierLength rejected: %v", err)
+	}
+}
+
+// TestTypeNameStartingWithThePrefixIsAllowed covers the red-team case: a type
+// literally called "cpt_algo". name -> prefix+name is injective, so it simply
+// yields "cpt_cpt_algo" and cannot collide with anything, including the type
+// "algo". Forbidding it would be a rule with no failure to prevent.
+func TestTypeNameStartingWithThePrefixIsAllowed(t *testing.T) {
+	a := schema.ContentTypeDefinition{Name: "cpt_algo"}
+	b := schema.ContentTypeDefinition{Name: "algo"}
+	full, err := schema.BuildWith([]schema.ContentTypeDefinition{a, b})
+	if err != nil {
+		t.Fatalf("BuildWith: %v", err)
+	}
+	if err := full.Validate(); err != nil {
+		t.Fatalf("composed schema does not validate: %v", err)
+	}
+	names := map[string]bool{}
+	for _, tbl := range full.Tables {
+		names[tbl.Name] = true
+	}
+	if !names["cpt_cpt_algo"] || !names["cpt_algo"] {
+		t.Fatalf("want tables cpt_cpt_algo and cpt_algo, got %v", sortedKeys(setOf(names)))
+	}
+	t.Logf("INJECTIVE OK: types %q and %q -> tables %q and %q", a.Name, b.Name, a.TableName(), b.TableName())
+}
+
+func setOf(m map[string]bool) map[string]struct{} {
+	out := make(map[string]struct{}, len(m))
+	for k := range m {
+		out[k] = struct{}{}
+	}
+	return out
 }
 
 func sortedKeys(m map[string]struct{}) []string {
@@ -131,7 +276,8 @@ func TestDefinitionValidateRejectsBadFields(t *testing.T) {
 		def   schema.ContentTypeDefinition
 	}{
 		{"hostile type name", schema.ContentTypeDefinition{Name: `x"; --`}},
-		{"reserved type name", schema.ContentTypeDefinition{Name: "products"}},
+		{"type name reserved as an injected column", schema.ContentTypeDefinition{Name: "metadata"}},
+		{"type name one over the type budget", schema.ContentTypeDefinition{Name: strings.Repeat("a", schema.MaxTypeNameLength+1)}},
 		{"hostile field name", schema.ContentTypeDefinition{Name: "reviews", Fields: []schema.FieldDefinition{{Name: "sc ore", Type: schema.FieldInteger}}}},
 		{"reserved field name", schema.ContentTypeDefinition{Name: "reviews", Fields: []schema.FieldDefinition{{Name: "metadata", Type: schema.FieldText}}}},
 		{"unknown field type", schema.ContentTypeDefinition{Name: "reviews", Fields: []schema.FieldDefinition{{Name: "score", Type: "bigint"}}}},
@@ -219,8 +365,13 @@ func TestBuildWithComposesCodePlusDynamic(t *testing.T) {
 			t.Fatalf("composed schema lost code table %q", tbl.Name)
 		}
 	}
-	if !names["reviews"] {
-		t.Fatal("composed schema does not contain the dynamic table 'reviews'")
+	if !names[schema.DynamicTableName("reviews")] {
+		t.Fatalf("composed schema does not contain the dynamic table %q", schema.DynamicTableName("reviews"))
+	}
+	// CONTRACT-17: the BARE name must NOT be a table. There is one namespace for
+	// code tables and another for dynamic ones, and they do not intersect.
+	if names["reviews"] {
+		t.Fatal("composed schema contains the UNPREFIXED table 'reviews'")
 	}
 	if err := full.Validate(); err != nil {
 		t.Fatalf("composed schema does not validate: %v", err)
@@ -280,8 +431,8 @@ func TestDynamicSchemaRoundTripJSON(t *testing.T) {
 	if err != nil {
 		t.Fatalf("JSONWith: %v", err)
 	}
-	if !strings.Contains(string(data), `"reviews"`) {
-		t.Fatal("JSONWith output does not mention the dynamic table 'reviews'")
+	if !strings.Contains(string(data), `"`+schema.DynamicTableName("reviews")+`"`) {
+		t.Fatalf("JSONWith output does not mention the dynamic table %q", schema.DynamicTableName("reviews"))
 	}
 	var round compat.Schema
 	if err := json.Unmarshal(data, &round); err != nil {

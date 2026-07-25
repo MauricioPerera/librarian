@@ -23,6 +23,15 @@ tal cual y conviven con este camino nuevo. Los tipos de contenido de código y l
 unifican en esta fase: son dos caminos paralelos, uno para lo que un desarrollador construye con
 control total, otro para lo que un admin arma sin deploy.
 
+**Espacio de nombres de tablas (CONTRACT-17).** La tabla real de un tipo dinámico lleva SIEMPRE el
+prefijo `cpt_`: un tipo llamado `eventos` vive en la tabla `cpt_eventos`. El prefijo está vedado
+para las tablas de código (garantizado por un test sobre `schema.Build()`), así que los dos
+espacios de nombres no pueden intersecarse y la colisión entre un tipo dinámico y una tabla de
+código futura es IMPOSIBLE, no meramente detectable. El prefijo es un detalle de la capa de datos:
+el nombre público del tipo no cambia en ninguna superficie (`/content/{tipo}`,
+`/admin/content/{tipo}`, la API de definiciones y la sidebar siguen usando `eventos`), y el admin
+nunca lo ve ni lo escribe.
+
 ## Capacidades objetivo
 
 - Crear un tipo de contenido nuevo desde la UI: nombre + una lista de campos, cada uno con un

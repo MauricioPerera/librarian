@@ -19,6 +19,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/MauricioPerera/librarian/internal/schema"
 )
 
 // --- T1: the mechanism that makes the dynamic sidebar unforgettable ----------
@@ -203,8 +205,11 @@ func TestAdminContentTypesListAndCreate(t *testing.T) {
 		t.Errorf("persisted %d fields, want 2 (the blank row must be ignored)", n)
 	}
 	// And the real table exists.
-	if !tableExists(t, db, "libros") {
-		t.Errorf("table libros was not created")
+	if !tableExists(t, db, "cpt_libros") {
+		t.Errorf("table cpt_libros was not created")
+	}
+	if tableExists(t, db, "libros") {
+		t.Errorf("an UNPREFIXED table 'libros' exists")
 	}
 }
 
@@ -217,7 +222,9 @@ func TestAdminContentTypeInvalidNameReRendersForm(t *testing.T) {
 	grant(t, db, "editor", "content_types.manage")
 	client := loginUI(t, db, srv, "ct@example.com", "pw", "editor")
 
-	for _, bad := range []string{"Recetas", "mi tipo", "1tipo", "users", "recetas; DROP TABLE users"} {
+	// NOTE (CONTRACT-17): "users" is no longer invalid — it produces "cpt_users".
+	// A name too long for the prefixed table takes its place in this battery.
+	for _, bad := range []string{"Recetas", "mi tipo", "1tipo", strings.Repeat("r", schema.MaxTypeNameLength+1), "recetas; DROP TABLE users"} {
 		resp, err := client.PostForm(srv.URL+"/admin/content-types",
 			url.Values{"name": {bad}, "field_name": {"campo"}, "field_type": {"text"}})
 		if err != nil {
@@ -482,7 +489,7 @@ func TestAdminContentCreateWithoutPermissionIs403(t *testing.T) {
 		t.Errorf("403 is not the HTML page: %.200q", body)
 	}
 	var n int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM recetas`).Scan(&n); err != nil {
+	if err := db.QueryRow(`SELECT COUNT(*) FROM cpt_recetas`).Scan(&n); err != nil {
 		t.Fatalf("count: %v", err)
 	}
 	if n != 0 {
@@ -525,7 +532,7 @@ func TestAdminContentValidationReRendersForm(t *testing.T) {
 		}
 	}
 	var n int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM medidas`).Scan(&n); err != nil {
+	if err := db.QueryRow(`SELECT COUNT(*) FROM cpt_medidas`).Scan(&n); err != nil {
 		t.Fatalf("count: %v", err)
 	}
 	if n != 0 {
@@ -602,7 +609,7 @@ func TestAdminDynamicContentFullFlow(t *testing.T) {
 	// boolean as 1, date as canonical YYYY-MM-DD).
 	var titulo, costo, fecha string
 	var raciones, publicada int64
-	if err := db.QueryRow(`SELECT titulo, raciones, costo, publicada, fecha FROM recetas WHERE id = ?`, rowID).
+	if err := db.QueryRow(`SELECT titulo, raciones, costo, publicada, fecha FROM cpt_recetas WHERE id = ?`, rowID).
 		Scan(&titulo, &raciones, &costo, &publicada, &fecha); err != nil {
 		t.Fatalf("select stored row: %v", err)
 	}
@@ -686,7 +693,7 @@ func TestAdminContentUncheckedCheckboxStoresFalseNotNull(t *testing.T) {
 	resp.Body.Close()
 
 	var activa sql.NullInt64
-	if err := db.QueryRow(`SELECT activa FROM banderas WHERE nombre = ?`, "sin marcar").Scan(&activa); err != nil {
+	if err := db.QueryRow(`SELECT activa FROM cpt_banderas WHERE nombre = ?`, "sin marcar").Scan(&activa); err != nil {
 		t.Fatalf("select: %v", err)
 	}
 	if !activa.Valid {
@@ -703,7 +710,7 @@ func TestAdminContentUncheckedCheckboxStoresFalseNotNull(t *testing.T) {
 		t.Fatalf("create checked: %v", err)
 	}
 	resp.Body.Close()
-	if err := db.QueryRow(`SELECT activa FROM banderas WHERE nombre = ?`, "marcada").Scan(&activa); err != nil {
+	if err := db.QueryRow(`SELECT activa FROM cpt_banderas WHERE nombre = ?`, "marcada").Scan(&activa); err != nil {
 		t.Fatalf("select checked: %v", err)
 	}
 	if !activa.Valid || activa.Int64 != 1 {
@@ -736,13 +743,13 @@ func TestAdminContentEditFormDistinguishesFalseFromNull(t *testing.T) {
 		t.Fatalf("create null-to-be: %v", err)
 	}
 	resp.Body.Close()
-	if _, err := db.Exec(`UPDATE tris SET activa = NULL WHERE nombre = ?`, "nula"); err != nil {
+	if _, err := db.Exec(`UPDATE cpt_tris SET activa = NULL WHERE nombre = ?`, "nula"); err != nil {
 		t.Fatalf("force NULL: %v", err)
 	}
 
 	idOf := func(name string) string {
 		var id string
-		if err := db.QueryRow(`SELECT id FROM tris WHERE nombre = ?`, name).Scan(&id); err != nil {
+		if err := db.QueryRow(`SELECT id FROM cpt_tris WHERE nombre = ?`, name).Scan(&id); err != nil {
 			t.Fatalf("id of %q: %v", name, err)
 		}
 		return id
@@ -788,7 +795,7 @@ func TestAdminContentEmptyTextStoresNull(t *testing.T) {
 
 	var etiqueta sql.NullString
 	var cuenta sql.NullInt64
-	if err := db.QueryRow(`SELECT etiqueta, cuenta FROM opcionales`).Scan(&etiqueta, &cuenta); err != nil {
+	if err := db.QueryRow(`SELECT etiqueta, cuenta FROM cpt_opcionales`).Scan(&etiqueta, &cuenta); err != nil {
 		t.Fatalf("select: %v", err)
 	}
 	if etiqueta.Valid || cuenta.Valid {
