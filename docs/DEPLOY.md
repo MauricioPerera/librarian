@@ -160,31 +160,110 @@ systemctl start librarian.service
 modo solo-lectura efectiva (la tabla de permisos vacía) sin que ninguna verificación lo
 detectara, porque todas eran `GET` y las lecturas no requieren permiso.
 
+### 1. El servicio está vivo
+
 ```bash
-# 1. El servicio está vivo
 systemctl is-active librarian.service
 journalctl -u librarian.service --no-pager -n 5      # sin errores de arranque
 curl -s https://librarian.ardf.dev/health            # {"status":"ok"}
+```
 
-# 2. Autenticación real
-TOKEN=$(curl -s -X POST https://librarian.ardf.dev/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"email":"<admin>","password":"<pass>"}' | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
+### 2. Conseguir una identidad para verificar
 
-# 3. Lecturas (necesarias pero NO suficientes)
+La verificación necesita autenticarse. **No uses la contraseña de una persona para esto**: acuñá
+una credencial efímera, de alcance mínimo, y revocala como parte del mismo procedimiento. Es más
+seguro y además no depende de que alguien tenga la contraseña a mano — en el deploy de
+`CONTRACT-18` esa contraseña sencillamente no estaba disponible, y el paso de verificación no
+puede quedar bloqueado por eso.
+
+```bash
+# En el VPS. Crea una API key con rol administrator y deja el secreto en /tmp.
+python3 -c "
+import sqlite3, hashlib, secrets, base64
+secret = 'lbk_' + base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b'=').decode()
+c = sqlite3.connect('/opt/librarian/data/librarian.db')
+rid = c.execute(\"SELECT id FROM roles WHERE name='administrator'\").fetchone()[0]
+c.execute('INSERT INTO api_keys (label, key_hash, role_id) VALUES (?,?,?)',
+          ('deploy-check', hashlib.sha256(secret.encode()).hexdigest(), rid))
+c.commit(); open('/tmp/deploy-check.key','w').write(secret)
+"
+K=$(cat /tmp/deploy-check.key)
+```
+
+El prefijo `lbk_` y el hash SHA-256 hex son el formato que espera `auth.VerifyAPIKey`; se envía
+como `Authorization: Bearer <secreto>`, igual que un JWT.
+
+**La revocación va en este mismo procedimiento, no en una lista de pendientes** (paso 5). Una
+credencial de prueba que sobrevive a su prueba es una puerta abierta que nadie recuerda haber
+dejado.
+
+Si necesitás verificar la UI y no solo la API, ahí sí hace falta una sesión con contraseña: la
+API key autentica la API, no el login del navegador.
+
+### 3. Lecturas (necesarias pero NO suficientes)
+
+```bash
 for r in /articles /products /terms /content-types; do
   echo -n "$r="; curl -s -o /dev/null -w "%{http_code}\n" "https://librarian.ardf.dev$r" \
-    -H "Authorization: Bearer $TOKEN"
+    -H "Authorization: Bearer $K"
 done
+```
 
-# 4. UNA ESCRITURA REAL que atraviese la capa de autorización — el paso que no se puede saltear
-curl -s -X POST https://librarian.ardf.dev/articles -H "Authorization: Bearer $TOKEN" \
+### 4. UNA ESCRITURA REAL — el paso que no se puede saltear
+
+Tiene que atravesar la capa de autorización y ejercitar **lo que este deploy cambió**, no
+cualquier escritura genérica.
+
+**Elegí una secuencia que sea su propio inverso**, para que la verificación no deje rastro. Casi
+siempre existe: una capacidad que puede quitar algo suele poder también agregarlo. En el deploy
+de `CONTRACT-18` (edición de campos de un tipo dinámico, que RECONSTRUYE la tabla entera y puede
+destruir datos) la secuencia fue: agregar un campo → escribir contenido en él → volver a quitarlo
+confirmando la pérdida. Se ejercitan los dos caminos, el aditivo y el destructivo con su guarda de
+confirmación, y el sistema termina exactamente como empezó.
+
+```bash
+# Ejemplo simple, cuando el deploy no toca nada delicado:
+curl -s -X POST https://librarian.ardf.dev/articles -H "Authorization: Bearer $K" \
   -H "Content-Type: application/json" -d '{"title":"deploy check","body":"x"}'
 # ...y borrar lo creado.
 ```
 
-Si el deploy tocó datos existentes (procedimiento C), verificá además que **esos datos concretos
-siguen accesibles por su ruta pública**, no solo que la tabla tiene filas.
+**Qué mirar cuando el deploy toca datos existentes** (procedimiento C, o cualquier cambio que
+reconstruya tablas): que los datos preexistentes conserven su **IDENTIDAD**, no solo sus valores.
+Mismos `id`, mismos `created_at`. Un registro con los mismos valores pero identidad nueva es un
+registro distinto que se le parece, y toda referencia externa a él ya está rota. Verificá además
+que esos datos concretos siguen accesibles **por su ruta pública**, no solo que la tabla tiene
+filas.
+
+Si el deploy tocó el esquema, confirmá también que el catálogo físico, la metadata
+`__compat_schema` y el registro de campos dicen **los tres lo mismo** — es la comprobación que
+detecta la caché desincronizada antes de que la detecte un crashloop:
+
+```bash
+python3 -c "
+import sqlite3, json
+c = sqlite3.connect('/opt/librarian/data/librarian.db')
+print('catalogo :', [r[1] for r in c.execute('PRAGMA table_info(cpt_eventos)')])
+d = json.loads(c.execute(\"SELECT value FROM __compat_schema WHERE key='canonical_schema'\").fetchone()[0])
+t = next(t for t in d['tables'] if t['name'] == 'cpt_eventos')
+print('metadata :', [x['name'] for x in t['columns']])
+print('sobrantes:', [r[0] for r in c.execute(\"SELECT name FROM sqlite_master WHERE name LIKE 'cptmp%'\")] or 'ninguna')
+"
+```
+
+### 5. Cerrar la credencial efímera
+
+```bash
+python3 -c "
+import sqlite3
+c = sqlite3.connect('/opt/librarian/data/librarian.db')
+c.execute(\"DELETE FROM api_keys WHERE label='deploy-check'\"); c.commit()
+print('keys activas:', c.execute('SELECT count(*) FROM api_keys').fetchone()[0])
+"
+rm -f /tmp/deploy-check.key
+```
+
+El recuento de credenciales activas tiene que quedar igual que antes de empezar.
 
 ## Rollback
 
