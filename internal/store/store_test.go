@@ -191,3 +191,51 @@ func count(t *testing.T, db *sql.DB, query string) int {
 	}
 	return n
 }
+
+// TestEnsureSchemaRecreatesViews covers the CONTRACT-19 upgrade path, which is
+// the one way this contract could break an ALREADY DEPLOYED instance: such a
+// database has every TABLE already, so an EnsureSchema that only acted when a
+// table was missing would never create the new views and every auth read would
+// fail after the deploy. Dropping the views and running EnsureSchema again
+// simulates exactly that database, and the views must come back.
+func TestEnsureSchemaRecreatesViews(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(filepath.Join(t.TempDir(), "views.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close()
+	if err := store.EnsureSchema(ctx, db); err != nil {
+		t.Fatalf("ensure: %v", err)
+	}
+
+	views := schema.Build().Views
+	if len(views) == 0 {
+		t.Fatal("the canonical schema declares no views — CONTRACT-19 T1 is missing")
+	}
+	for _, view := range views {
+		if _, err := db.DB.ExecContext(ctx, `DROP VIEW "`+view.Name+`"`); err != nil {
+			t.Fatalf("drop view %s: %v", view.Name, err)
+		}
+	}
+	if got := count(t, db.DB, `SELECT count(*) FROM sqlite_master WHERE type = 'view'`); got != 0 {
+		t.Fatalf("views still present after drop: %d", got)
+	}
+
+	// The restart of an already-deployed instance: no table is missing.
+	if err := store.EnsureSchema(ctx, db); err != nil {
+		t.Fatalf("re-ensure: %v", err)
+	}
+	if got, want := count(t, db.DB, `SELECT count(*) FROM sqlite_master WHERE type = 'view'`), len(views); got != want {
+		t.Fatalf("views after re-ensure = %d, want %d", got, want)
+	}
+	// A third run must be a no-op success, not a "view already exists" failure.
+	if err := store.EnsureSchema(ctx, db); err != nil {
+		t.Fatalf("third ensure (idempotency): %v", err)
+	}
+	for _, view := range views {
+		if _, err := db.DB.ExecContext(ctx, `SELECT count(*) FROM "`+view.Name+`"`); err != nil {
+			t.Fatalf("view %s is not queryable: %v", view.Name, err)
+		}
+	}
+}

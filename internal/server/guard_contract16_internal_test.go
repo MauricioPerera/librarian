@@ -16,16 +16,16 @@ package server
 
 import (
 	"context"
-	"database/sql"
 	"path/filepath"
 	"testing"
 
 	"github.com/MauricioPerera/librarian/internal/auth"
 	"github.com/MauricioPerera/librarian/internal/store"
+	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
 
 // guardDB opens a seeded temp database and returns handlers wired to it.
-func guardDB(t *testing.T) (*handlers, *sql.DB, func()) {
+func guardDB(t *testing.T) (*handlers, *compat.Store, func()) {
 	t.Helper()
 	sdb, err := store.Open(filepath.Join(t.TempDir(), "guard.db"))
 	if err != nil {
@@ -38,11 +38,11 @@ func guardDB(t *testing.T) (*handlers, *sql.DB, func()) {
 	if err := store.SeedCatalogs(ctx, sdb.DB); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	return &handlers{db: sdb.DB, jwtSecret: "guard-secret"}, sdb.DB, func() { _ = sdb.Close() }
+	return &handlers{db: sdb.DB, authStore: sdb, jwtSecret: "guard-secret"}, sdb, func() { _ = sdb.Close() }
 }
 
 // setPerms is a shorthand for the real data function under test's sibling.
-func setPerms(t *testing.T, db *sql.DB, role string, perms ...string) {
+func setPerms(t *testing.T, db *compat.Store, role string, perms ...string) {
 	t.Helper()
 	if err := auth.SetRolePermissions(context.Background(), db, role, perms); err != nil {
 		t.Fatalf("set perms for %q: %v", role, err)
@@ -135,7 +135,7 @@ func TestGuardCaseD_APIKeyIdentity(t *testing.T) {
 	setPerms(t, db, "editor", "roles.manage")
 
 	var adminRoleID string
-	if err := db.QueryRow(`SELECT id FROM roles WHERE name = ?`, "administrator").Scan(&adminRoleID); err != nil {
+	if err := db.DB.QueryRow(`SELECT id FROM roles WHERE name = ?`, "administrator").Scan(&adminRoleID); err != nil {
 		t.Fatalf("role id: %v", err)
 	}
 	key := &Identity{Kind: "apikey", RoleID: adminRoleID, Label: "ci-key"}

@@ -60,10 +60,10 @@ func grant(t *testing.T, db *sql.DB, role string, perms ...string) {
 func jwtFor(t *testing.T, db *sql.DB, email, password, role string) string {
 	t.Helper()
 	ctx := context.Background()
-	if _, err := auth.CreateUser(ctx, db, email, password, []string{role}); err != nil {
+	if _, err := auth.CreateUser(ctx, storeFor(db), email, password, []string{role}); err != nil {
 		t.Fatalf("create user %q: %v", email, err)
 	}
-	user, err := auth.VerifyCredentials(ctx, db, email, password)
+	user, err := auth.VerifyCredentials(ctx, storeFor(db), email, password)
 	if err != nil {
 		t.Fatalf("verify %q: %v", email, err)
 	}
@@ -79,7 +79,7 @@ func jwtFor(t *testing.T, db *sql.DB, email, password, role string) string {
 func apiKeyFor(t *testing.T, db *sql.DB, label, role string) string {
 	t.Helper()
 	rid := roleID(t, db, role)
-	secret, err := auth.MintAPIKey(context.Background(), db, label, rid)
+	secret, err := auth.MintAPIKey(context.Background(), storeFor(db), label, rid)
 	if err != nil {
 		t.Fatalf("mint api key: %v", err)
 	}

@@ -4,11 +4,13 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
+
+	"github.com/MauricioPerera/librarian/internal/schema"
+	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
 
 // keyPrefix tags librarian-issued API key secrets so they are visually
@@ -32,17 +34,35 @@ type APIKey struct {
 // never stored and never logged. bcrypt is deliberately not used: the secret
 // already has high entropy, so a slow hash buys nothing and a plain SHA-256
 // lookup is sufficient.
-func MintAPIKey(ctx context.Context, db *sql.DB, label, roleID string) (string, error) {
+//
+// CONTRACT-19: a single INSERT, so it goes through CallRoutine — the transaction
+// the routine opens IS the whole operation. created_at is supplied by the
+// application in the canonical RFC3339Nano form instead of being left to the
+// column DEFAULT, because the two engines render CURRENT_TIMESTAMP as different
+// TEXT and that column is the primary sort key of ListAPIKeys; see the routine
+// declaration in internal/schema/auth_dual.go. The id keeps its DEFAULT
+// gen_random_uuid(), which compat compiles for both engines, because nothing
+// here needs to know it — but compat's insert action requires every column of
+// the row, so it is generated in Go like the user id (the column DEFAULT stays
+// as a safety net for writes that do not come from the app).
+func MintAPIKey(ctx context.Context, store *compat.Store, label, roleID string) (string, error) {
 	secret, err := generateSecret()
 	if err != nil {
 		return "", fmt.Errorf("generate key: %w", err)
 	}
 	keyHash := hashSecret(secret)
+	id, err := newUUID()
+	if err != nil {
+		return "", fmt.Errorf("generate api key id: %w", err)
+	}
 
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO api_keys (label, key_hash, role_id) VALUES (?, ?, ?)`,
-		label, keyHash, roleID,
-	); err != nil {
+	if err := store.CallRoutine(ctx, authSchema, schema.RoutineInsertAPIKey, map[string]compat.Value{
+		"id":         uuidValue(id),
+		"label":      textValue(label),
+		"key_hash":   textValue(keyHash),
+		"role_id":    uuidValue(roleID),
+		"created_at": timestampValue(now()),
+	}); err != nil {
 		return "", fmt.Errorf("insert api key: %w", err)
 	}
 	return secret, nil
@@ -51,18 +71,18 @@ func MintAPIKey(ctx context.Context, db *sql.DB, label, roleID string) (string, 
 // RevokeAPIKey sets revoked_at on the row matching the given plaintext secret,
 // marking it as rejected on all subsequent verification. The row is looked up
 // by its hash, not by the plaintext secret.
-func RevokeAPIKey(ctx context.Context, db *sql.DB, secret string) error {
-	keyHash := hashSecret(secret)
-	res, err := db.ExecContext(ctx,
-		`UPDATE api_keys SET revoked_at = CURRENT_TIMESTAMP WHERE key_hash = ? AND revoked_at IS NULL`,
-		keyHash,
-	)
-	if err != nil {
+//
+// Revocation is idempotent: an already-revoked or unknown key matches no row
+// (the routine's WHERE carries `revoked_at IS NULL`, which behaves identically
+// on both engines) and the call is a no-op success. The previous implementation
+// inspected RowsAffected only to do nothing with it; CallRoutine does not expose
+// it, and nothing observable changes.
+func RevokeAPIKey(ctx context.Context, store *compat.Store, secret string) error {
+	if err := store.CallRoutine(ctx, authSchema, schema.RoutineRevokeAPIKeyByHash, map[string]compat.Value{
+		"key_hash":   textValue(hashSecret(secret)),
+		"revoked_at": timestampValue(now()),
+	}); err != nil {
 		return fmt.Errorf("revoke api key: %w", err)
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		// Already revoked or unknown — either way not an active key. Revocation
-		// is idempotent, so this is a no-op success.
 	}
 	return nil
 }
@@ -75,20 +95,21 @@ func RevokeAPIKey(ctx context.Context, db *sql.DB, secret string) error {
 // Revocation is idempotent — revoking an already-revoked or unknown id affects
 // zero rows and is a no-op success, so a double click or a repeated call never
 // errors. The id is bound as a parameter, never interpolated.
-func RevokeAPIKeyByID(ctx context.Context, db *sql.DB, id string) error {
-	if _, err := db.ExecContext(ctx,
-		`UPDATE api_keys SET revoked_at = CURRENT_TIMESTAMP WHERE id = ? AND revoked_at IS NULL`,
-		id,
-	); err != nil {
+func RevokeAPIKeyByID(ctx context.Context, store *compat.Store, id string) error {
+	if err := store.CallRoutine(ctx, authSchema, schema.RoutineRevokeAPIKeyByID, map[string]compat.Value{
+		"id":         uuidValue(id),
+		"revoked_at": timestampValue(now()),
+	}); err != nil {
 		return fmt.Errorf("revoke api key by id: %w", err)
 	}
 	return nil
 }
 
 // APIKeyRecord is the admin-facing view of an api_keys row for the CONTRACT-09
-// UI: id, label, the NAME of the bound role (resolved via a JOIN, not the raw
-// role_id), the creation timestamp, and the revocation state. It deliberately
-// carries NO key_hash and NO secret — neither is ever surfaced to the UI.
+// UI: id, label, the NAME of the bound role (resolved via the api_key_records
+// view, not the raw role_id), the creation timestamp, and the revocation state.
+// It deliberately carries NO key_hash and NO secret — neither is ever surfaced
+// to the UI, and the view does not even project the hash.
 type APIKeyRecord struct {
 	ID        string
 	Label     string
@@ -99,117 +120,94 @@ type APIKeyRecord struct {
 }
 
 // ListAPIKeys returns every api_keys row as an APIKeyRecord, newest first, with
-// the bound role's NAME resolved through a single JOIN to roles (not an N+1
-// per-row lookup). It never selects key_hash, so the secret's hash cannot leak
-// into the UI even by accident. revoked_at is scanned as a nullable string (the
-// SQLite driver returns CURRENT_TIMESTAMP as text); a non-empty value marks the
-// key revoked and is surfaced as Revoked + RevokedAt.
-func ListAPIKeys(ctx context.Context, db *sql.DB) ([]APIKeyRecord, error) {
-	rows, err := db.QueryContext(ctx,
-		`SELECT k.id, k.label, r.name, k.created_at, k.revoked_at
-		   FROM api_keys k
-		   JOIN roles r ON r.id = k.role_id
-		  ORDER BY k.created_at DESC, k.label`,
-	)
+// the bound role's NAME resolved through the api_key_records view (not an N+1
+// per-row lookup). The view never projects key_hash, so the secret's hash cannot
+// leak into the UI even by accident.
+//
+// The ordering (created_at DESC, label) is declared in the routine, so both
+// engines return the same SEQUENCE and not only the same set. The timestamps
+// come back canonicalized to RFC3339Nano by the `timestamp` family declared on
+// the read action, identically on SQLite and PostgreSQL.
+func ListAPIKeys(ctx context.Context, store *compat.Store) ([]APIKeyRecord, error) {
+	rows, err := store.QueryRoutine(ctx, authSchema, schema.RoutineListAPIKeys, nil)
 	if err != nil {
 		return nil, fmt.Errorf("query api keys: %w", err)
 	}
-	defer rows.Close()
-	var out []APIKeyRecord
-	for rows.Next() {
-		rec, err := scanAPIKeyRecord(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, rec)
+	out := make([]APIKeyRecord, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, apiKeyRecord(row))
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate api keys: %w", err)
+	if len(out) == 0 {
+		return nil, nil
 	}
 	return out, nil
 }
 
-// GetAPIKey loads a single api_keys row as an APIKeyRecord by id, with the same
-// role-name JOIN and the same never-select-key_hash guarantee as ListAPIKeys.
-// found is false when no row matches (a missing or malformed id) — never a raw
-// SQL error — so the handler maps it to a 404 after an idempotent revoke rather
-// than a 500. It is used to re-render the single row fragment after a revoke.
-func GetAPIKey(ctx context.Context, db *sql.DB, id string) (APIKeyRecord, bool, error) {
-	row := db.QueryRowContext(ctx,
-		`SELECT k.id, k.label, r.name, k.created_at, k.revoked_at
-		   FROM api_keys k
-		   JOIN roles r ON r.id = k.role_id
-		  WHERE k.id = ?`,
-		id,
-	)
-	rec, err := scanAPIKeyRecord(row)
-	if errors.Is(err, sql.ErrNoRows) {
+// GetAPIKey loads a single api_keys row as an APIKeyRecord by id, from the same
+// view and with the same never-select-key_hash guarantee as ListAPIKeys. found
+// is false when no row matches (a missing or malformed id) — never a raw SQL
+// error — so the handler maps it to a 404 after an idempotent revoke rather than
+// a 500. It is used to re-render the single row fragment after a revoke.
+func GetAPIKey(ctx context.Context, store *compat.Store, id string) (APIKeyRecord, bool, error) {
+	rows, err := store.QueryRoutine(ctx, authSchema, schema.RoutineAPIKeyByID, map[string]compat.Value{
+		"id": uuidValue(id),
+	})
+	if err != nil {
+		return APIKeyRecord{}, false, fmt.Errorf("query api key: %w", err)
+	}
+	if len(rows) == 0 {
 		return APIKeyRecord{}, false, nil
 	}
-	if err != nil {
-		return APIKeyRecord{}, false, err
-	}
-	return rec, true, nil
+	return apiKeyRecord(rows[0]), true, nil
 }
 
-// scanRow is the minimal surface shared by *sql.Row and *sql.Rows so the record
-// scan logic is written once for both the list and single-row paths.
-type scanRow interface {
-	Scan(dest ...any) error
-}
-
-// scanAPIKeyRecord scans one api_keys row (already joined to roles) into an
-// APIKeyRecord, translating the nullable revoked_at timestamp into the Revoked
-// flag + RevokedAt string.
-func scanAPIKeyRecord(row scanRow) (APIKeyRecord, error) {
-	var (
-		rec       APIKeyRecord
-		revokedAt sql.NullString
-	)
-	if err := row.Scan(&rec.ID, &rec.Label, &rec.RoleName, &rec.CreatedAt, &revokedAt); err != nil {
-		return APIKeyRecord{}, err
+// apiKeyRecord maps one api_key_records row to the UI record, translating the
+// nullable revoked_at timestamp into the Revoked flag + RevokedAt string. NULL
+// is tested by the canonical value KIND, not by an empty string.
+func apiKeyRecord(row compat.Row) APIKeyRecord {
+	rec := APIKeyRecord{
+		ID:        rowText(row, "id"),
+		Label:     rowText(row, "label"),
+		RoleName:  rowText(row, "role_name"),
+		CreatedAt: rowText(row, "created_at"),
 	}
-	if revokedAt.Valid && revokedAt.String != "" {
+	if !rowIsNull(row, "revoked_at") {
 		rec.Revoked = true
-		rec.RevokedAt = revokedAt.String
+		rec.RevokedAt = rowText(row, "revoked_at")
 	}
-	return rec, nil
+	return rec
 }
 
 // VerifyAPIKey looks up the plaintext secret by its SHA-256 hash and returns
 // the key's identity if the row exists and is not revoked. Verification is a
-// single exact-match SQL lookup (WHERE key_hash = ?); the plaintext secret is
-// never compared in Go, so there is no timing side-channel on the secret in
-// application code — the equality check happens inside the DB engine, against
-// the stored hash, not against the secret.
-func VerifyAPIKey(ctx context.Context, db *sql.DB, secret string) (*APIKey, error) {
+// single exact-match lookup (WHERE key_hash = <bound parameter>); the plaintext
+// secret is never compared in Go, so there is no timing side-channel on the
+// secret in application code — the equality check happens inside the DB engine,
+// against the stored hash, not against the secret.
+func VerifyAPIKey(ctx context.Context, store *compat.Store, secret string) (*APIKey, error) {
 	if secret == "" {
 		return nil, ErrAPIKeyRejected
 	}
-	keyHash := hashSecret(secret)
-	var (
-		id        string
-		label     string
-		roleID    string
-		revokedAt sql.NullString
-	)
-	err := db.QueryRowContext(ctx,
-		`SELECT id, label, role_id, revoked_at FROM api_keys WHERE key_hash = ?`,
-		keyHash,
-	).Scan(&id, &label, &roleID, &revokedAt)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		return nil, ErrAPIKeyRejected
-	case err != nil:
+	rows, err := store.QueryRoutine(ctx, authSchema, schema.RoutineAPIKeyByHash, map[string]compat.Value{
+		"key_hash": textValue(hashSecret(secret)),
+	})
+	if err != nil {
 		return nil, fmt.Errorf("query api key: %w", err)
 	}
-	// revoked_at is a nullable timestamp. On SQLite the driver returns it as a
-	// string (CURRENT_TIMESTAMP), so we scan into NullString rather than
-	// NullTime. A non-null value (any non-empty timestamp) means revoked.
-	if revokedAt.Valid && revokedAt.String != "" {
+	if len(rows) == 0 {
 		return nil, ErrAPIKeyRejected
 	}
-	return &APIKey{ID: id, Label: label, RoleID: roleID}, nil
+	// revoked_at is a nullable timestamp; a non-NULL value means revoked. The
+	// test is on the canonical NULL kind, which is the same answer on both
+	// engines regardless of how each driver surfaces a null column.
+	if !rowIsNull(rows[0], "revoked_at") {
+		return nil, ErrAPIKeyRejected
+	}
+	return &APIKey{
+		ID:     rowText(rows[0], "id"),
+		Label:  rowText(rows[0], "label"),
+		RoleID: rowText(rows[0], "role_id"),
+	}, nil
 }
 
 // generateSecret produces 32 crypto-random bytes and base64url-encodes them

@@ -105,7 +105,7 @@ func TestAdminUserCreateAppearsInListAndDetail(t *testing.T) {
 	}
 
 	// Created active, with the two roles, in the DB.
-	u, found, err := auth.GetUser(context.Background(), db, userIDByEmail(t, db, "new@example.com"))
+	u, found, err := auth.GetUser(context.Background(), storeFor(db), userIDByEmail(t, db, "new@example.com"))
 	if err != nil || !found {
 		t.Fatalf("GetUser: found=%v err=%v", found, err)
 	}
@@ -164,7 +164,7 @@ func TestAdminUserStatusChange(t *testing.T) {
 	db, srv, cleanup := openUITLS(t)
 	defer cleanup()
 	client := adminClient(t, db, srv)
-	created, err := auth.CreateUser(context.Background(), db, "target@example.com", "pw", []string{"author"})
+	created, err := auth.CreateUser(context.Background(), storeFor(db), "target@example.com", "pw", []string{"author"})
 	if err != nil {
 		t.Fatalf("create target: %v", err)
 	}
@@ -206,7 +206,7 @@ func TestAdminUserRolesChange(t *testing.T) {
 	db, srv, cleanup := openUITLS(t)
 	defer cleanup()
 	client := adminClient(t, db, srv)
-	created, err := auth.CreateUser(context.Background(), db, "roles@example.com", "pw", []string{"author"})
+	created, err := auth.CreateUser(context.Background(), storeFor(db), "roles@example.com", "pw", []string{"author"})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -221,7 +221,7 @@ func TestAdminUserRolesChange(t *testing.T) {
 	}
 	resp.Body.Close()
 
-	u, _, _ := auth.GetUser(context.Background(), db, created.ID)
+	u, _, _ := auth.GetUser(context.Background(), storeFor(db), created.ID)
 	if !containsAll(u.Roles, "editor", "contributor") || len(u.Roles) != 2 {
 		t.Errorf("roles = %v, want {editor, contributor}", u.Roles)
 	}
@@ -340,7 +340,7 @@ func TestAdminUsersWriteWithoutPermissionServerSide(t *testing.T) {
 	db, srv, cleanup := openUITLS(t)
 	defer cleanup()
 	// A target user for the status attempt.
-	target, err := auth.CreateUser(context.Background(), db, "victim@example.com", "pw", []string{"author"})
+	target, err := auth.CreateUser(context.Background(), storeFor(db), "victim@example.com", "pw", []string{"author"})
 	if err != nil {
 		t.Fatalf("create target: %v", err)
 	}

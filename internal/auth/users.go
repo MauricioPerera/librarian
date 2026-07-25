@@ -1,8 +1,16 @@
 // Package auth implements librarian's dual authentication: password-based user
 // credentials with bcrypt (T2), HS256 JWT issue/verify (T3), and SHA-256 API
-// keys (T4). All functions operate directly against the shared *sql.DB handle
-// exposed by compat.Store.DB using parameterized database/sql — no separate
-// connection, no string-concatenated SQL.
+// keys (T4).
+//
+// CONTRACT-19: every function that touches the database takes a *compat.Store
+// instead of a bare *sql.DB. The store carries BOTH the connection and the
+// ENGINE, which is what the three portable doors need — QueryRoutine and
+// CallRoutine are methods on it, and compat.Placeholder needs the engine to emit
+// `?` or `$n`. A bare *sql.DB cannot answer "which engine is this?", and asking
+// the driver would be exactly the engine-branching this layer exists to remove.
+// *compat.Store was chosen over passing the engine as an extra argument because
+// the two values must never be paired wrongly, and because it is the receiver
+// the routine calls already require.
 package auth
 
 import (
@@ -11,6 +19,8 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/MauricioPerera/librarian/internal/schema"
+	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -81,37 +91,44 @@ var dummyHash = func() []byte {
 // assigns the supplied role names via user_roles. Role names that do not exist
 // in the roles catalog are an error. The plaintext password is hashed and
 // discarded within this function; only the hash crosses the DB boundary.
-func CreateUser(ctx context.Context, db *sql.DB, email, password string, roleNames []string) (*User, error) {
+//
+// CONTRACT-19: this is one of the three operations that CANNOT go through a
+// routine. It writes a user row and then N junction rows, where N comes from the
+// caller, and all of it must commit together; a routine's action list is static,
+// and CallRoutine would open a transaction per call. So it composes raw SQL with
+// compat.Placeholder inside the transaction it owns. The id, previously read
+// back with `RETURNING id`, is generated here and bound as one more value.
+func CreateUser(ctx context.Context, store *compat.Store, email, password string, roleNames []string) (*User, error) {
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
 		return nil, fmt.Errorf("hash password: %w", err)
 	}
+	id, err := newUUID()
+	if err != nil {
+		return nil, fmt.Errorf("generate user id: %w", err)
+	}
+	engine := store.Target.Engine
+	timestamp := now()
 
-	tx, err := db.BeginTx(ctx, nil)
+	tx, err := store.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
-	var id string
-	if err := tx.QueryRowContext(ctx,
-		`INSERT INTO users (email, password_hash, status) VALUES (?, ?, 'active') RETURNING id`,
-		email, string(hash),
-	).Scan(&id); err != nil {
+	insertUser := `INSERT INTO "users" ("id", "email", "password_hash", "status", "created_at", "updated_at")` +
+		` VALUES (` + bind(engine, 1) + `, ` + bind(engine, 2) + `, ` + bind(engine, 3) +
+		`, ` + bind(engine, 4) + `, ` + bind(engine, 5) + `, ` + bind(engine, 6) + `)`
+	if _, err := tx.ExecContext(ctx, insertUser, id, email, string(hash), statusActive, timestamp, timestamp); err != nil {
 		return nil, fmt.Errorf("insert user: %w", err)
 	}
 
-	roleIDs, err := roleIDsForNames(ctx, tx, roleNames)
+	roleIDs, err := roleIDsForNames(ctx, tx, engine, roleNames)
 	if err != nil {
 		return nil, err
 	}
-	for _, rid := range roleIDs {
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO user_roles (user_id, role_id) VALUES (?, ?) ON CONFLICT DO NOTHING`,
-			id, rid,
-		); err != nil {
-			return nil, fmt.Errorf("assign role: %w", err)
-		}
+	if err := insertUserRoles(ctx, tx, engine, id, roleIDs); err != nil {
+		return nil, err
 	}
 
 	if err := tx.Commit(); err != nil {
@@ -133,26 +150,23 @@ func CreateUser(ctx context.Context, db *sql.DB, email, password string, roleNam
 // one. Putting the status test before the compare would create a faster branch
 // for suspended users and leak account state by timing — the same enumeration
 // leak this function already avoids for missing emails.
-func VerifyCredentials(ctx context.Context, db *sql.DB, email, password string) (*User, error) {
-	var (
-		id     string
-		hash   string
-		status string
-	)
-	err := db.QueryRowContext(ctx,
-		`SELECT id, password_hash, status FROM users WHERE email = ?`,
-		email,
-	).Scan(&id, &hash, &status)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
+func VerifyCredentials(ctx context.Context, store *compat.Store, email, password string) (*User, error) {
+	rows, err := store.QueryRoutine(ctx, authSchema, schema.RoutineUserCredentialsByEmail, map[string]compat.Value{
+		"email": textValue(email),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("query user: %w", err)
+	}
+	if len(rows) == 0 {
 		// Equalize timing with the wrong-password branch: run a real bcrypt
 		// compare against a fixed hash. Result is discarded; the error is
 		// the generic one regardless.
 		_ = bcrypt.CompareHashAndPassword(dummyHash, []byte(password))
 		return nil, ErrInvalidCredentials
-	case err != nil:
-		return nil, fmt.Errorf("query user: %w", err)
 	}
+	id := rowText(rows[0], "id")
+	hash := rowText(rows[0], "password_hash")
+	status := rowText(rows[0], "status")
 
 	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)); err != nil {
 		return nil, ErrInvalidCredentials
@@ -166,7 +180,7 @@ func VerifyCredentials(ctx context.Context, db *sql.DB, email, password string) 
 		return nil, ErrInvalidCredentials
 	}
 
-	roles, err := rolesForUser(ctx, db, id)
+	roles, err := rolesForUser(ctx, store, id)
 	if err != nil {
 		return nil, err
 	}
@@ -178,27 +192,25 @@ func VerifyCredentials(ctx context.Context, db *sql.DB, email, password string) 
 // rolesForUser (the same junction query the rest of the package uses); the
 // catalog is small and this runs on an admin page, so the per-user query is
 // acceptable and avoids duplicating an aggregation query.
-func ListUsers(ctx context.Context, db *sql.DB) ([]UserRecord, error) {
-	rows, err := db.QueryContext(ctx,
-		`SELECT id, email, status FROM users ORDER BY email`,
-	)
+//
+// The ORDER BY is declared in the routine, not here. email is UNIQUE, so it is a
+// TOTAL order and the two engines return the same SEQUENCE, not merely the same
+// set — the divergence a listing test that only compares contents never sees.
+func ListUsers(ctx context.Context, store *compat.Store) ([]UserRecord, error) {
+	rows, err := store.QueryRoutine(ctx, authSchema, schema.RoutineListUsers, nil)
 	if err != nil {
 		return nil, fmt.Errorf("query users: %w", err)
 	}
-	defer rows.Close()
 	var out []UserRecord
-	for rows.Next() {
-		var u UserRecord
-		if err := rows.Scan(&u.ID, &u.Email, &u.Status); err != nil {
-			return nil, fmt.Errorf("scan user: %w", err)
-		}
-		out = append(out, u)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate users: %w", err)
+	for _, row := range rows {
+		out = append(out, UserRecord{
+			ID:     rowText(row, "id"),
+			Email:  rowText(row, "email"),
+			Status: rowText(row, "status"),
+		})
 	}
 	for i := range out {
-		roles, err := rolesForUser(ctx, db, out[i].ID)
+		roles, err := rolesForUser(ctx, store, out[i].ID)
 		if err != nil {
 			return nil, err
 		}
@@ -210,19 +222,22 @@ func ListUsers(ctx context.Context, db *sql.DB) ([]UserRecord, error) {
 // GetUser loads one user (id, email, status, roles) by id. found is false when
 // no row matches (a missing or malformed id) — never a raw SQL error — so the
 // caller maps it to a 404; err is non-nil only on a real DB failure.
-func GetUser(ctx context.Context, db *sql.DB, id string) (UserRecord, bool, error) {
-	var u UserRecord
-	err := db.QueryRowContext(ctx,
-		`SELECT id, email, status FROM users WHERE id = ?`,
-		id,
-	).Scan(&u.ID, &u.Email, &u.Status)
-	if errors.Is(err, sql.ErrNoRows) {
-		return UserRecord{}, false, nil
-	}
+func GetUser(ctx context.Context, store *compat.Store, id string) (UserRecord, bool, error) {
+	rows, err := store.QueryRoutine(ctx, authSchema, schema.RoutineUserByID, map[string]compat.Value{
+		"id": uuidValue(id),
+	})
 	if err != nil {
 		return UserRecord{}, false, fmt.Errorf("query user: %w", err)
 	}
-	roles, err := rolesForUser(ctx, db, u.ID)
+	if len(rows) == 0 {
+		return UserRecord{}, false, nil
+	}
+	u := UserRecord{
+		ID:     rowText(rows[0], "id"),
+		Email:  rowText(rows[0], "email"),
+		Status: rowText(rows[0], "status"),
+	}
+	roles, err := rolesForUser(ctx, store, u.ID)
 	if err != nil {
 		return UserRecord{}, false, err
 	}
@@ -235,23 +250,32 @@ func GetUser(ctx context.Context, db *sql.DB, id string) (UserRecord, bool, erro
 // the schema CHECK, and a clean 400 for the handler). A status not matching any
 // row returns ErrUserNotFound (→ 404). The status string is bound as a
 // parameter, never interpolated.
-func UpdateUserStatus(ctx context.Context, db *sql.DB, id, status string) error {
+//
+// CONTRACT-19: the write goes through CallRoutine, which returns only an error —
+// there is no RowsAffected to test. The not-found case is therefore decided by
+// reading the row first, which produces the same observable result (the previous
+// implementation reported ErrUserNotFound exactly when no row matched the id).
+// The UPDATE stays a single statement in its own transaction, so nothing that
+// was atomic before has been split.
+func UpdateUserStatus(ctx context.Context, store *compat.Store, id, status string) error {
 	if !validStatus(status) {
 		return fmt.Errorf("%w %q", ErrInvalidStatus, status)
 	}
-	res, err := db.ExecContext(ctx,
-		`UPDATE users SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-		status, id,
-	)
+	rows, err := store.QueryRoutine(ctx, authSchema, schema.RoutineUserByID, map[string]compat.Value{
+		"id": uuidValue(id),
+	})
 	if err != nil {
 		return fmt.Errorf("update status: %w", err)
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("rows affected: %w", err)
-	}
-	if n == 0 {
+	if len(rows) == 0 {
 		return ErrUserNotFound
+	}
+	if err := store.CallRoutine(ctx, authSchema, schema.RoutineUpdateUserStatus, map[string]compat.Value{
+		"id":         uuidValue(id),
+		"status":     textValue(status),
+		"updated_at": timestampValue(now()),
+	}); err != nil {
+		return fmt.Errorf("update status: %w", err)
 	}
 	return nil
 }
@@ -264,15 +288,21 @@ func UpdateUserStatus(ctx context.Context, db *sql.DB, id, status string) error 
 // empty roleNames is valid — it removes all roles. All ids are bound as
 // parameters; roleIDsForNames rejects any name not in the catalog, so a crafted
 // request cannot assign a non-catalog role.
-func SetUserRoles(ctx context.Context, db *sql.DB, userID string, roleNames []string) error {
-	tx, err := db.BeginTx(ctx, nil)
+//
+// CONTRACT-19: raw SQL with compat.Placeholder, for the same structural reason
+// as CreateUser — one DELETE plus N INSERTs that must commit together, with N
+// coming from the caller.
+func SetUserRoles(ctx context.Context, store *compat.Store, userID string, roleNames []string) error {
+	engine := store.Target.Engine
+	tx, err := store.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
 	var exists string
-	if err := tx.QueryRowContext(ctx, `SELECT id FROM users WHERE id = ?`, userID).Scan(&exists); err != nil {
+	lookupUser := `SELECT "id" FROM "users" WHERE "id" = ` + bind(engine, 1)
+	if err := tx.QueryRowContext(ctx, lookupUser, userID).Scan(&exists); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrUserNotFound
 		}
@@ -280,24 +310,35 @@ func SetUserRoles(ctx context.Context, db *sql.DB, userID string, roleNames []st
 	}
 
 	// Resolve BEFORE mutating so an unknown role aborts with the table untouched.
-	roleIDs, err := roleIDsForNames(ctx, tx, roleNames)
+	roleIDs, err := roleIDsForNames(ctx, tx, engine, roleNames)
 	if err != nil {
 		return err
 	}
 
-	if _, err := tx.ExecContext(ctx, `DELETE FROM user_roles WHERE user_id = ?`, userID); err != nil {
+	clear := `DELETE FROM "user_roles" WHERE "user_id" = ` + bind(engine, 1)
+	if _, err := tx.ExecContext(ctx, clear, userID); err != nil {
 		return fmt.Errorf("clear roles: %w", err)
 	}
-	for _, rid := range roleIDs {
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO user_roles (user_id, role_id) VALUES (?, ?) ON CONFLICT DO NOTHING`,
-			userID, rid,
-		); err != nil {
-			return fmt.Errorf("assign role: %w", err)
-		}
+	if err := insertUserRoles(ctx, tx, engine, userID, roleIDs); err != nil {
+		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit roles: %w", err)
+	}
+	return nil
+}
+
+// insertUserRoles writes the junction rows for one user. The ids are deduped, so
+// a role name repeated by the caller inserts one row instead of colliding with
+// the composite primary key — the behavior `ON CONFLICT DO NOTHING` used to give,
+// obtained here by making the conflict impossible instead of tolerating it.
+func insertUserRoles(ctx context.Context, tx txQuerier, engine compat.Engine, userID string, roleIDs []string) error {
+	assign := `INSERT INTO "user_roles" ("user_id", "role_id") VALUES (` +
+		bind(engine, 1) + `, ` + bind(engine, 2) + `)`
+	for _, rid := range dedupe(roleIDs) {
+		if _, err := tx.ExecContext(ctx, assign, userID, rid); err != nil {
+			return fmt.Errorf("assign role: %w", err)
+		}
 	}
 	return nil
 }
@@ -314,11 +355,17 @@ func validStatus(s string) bool {
 
 // roleIDsForNames resolves role names to their catalog ids inside tx. Returns
 // an error if any name is absent from the roles table.
-func roleIDsForNames(ctx context.Context, tx *sql.Tx, roleNames []string) ([]string, error) {
+//
+// It stays a raw statement rather than the auth_role_id_by_name routine on
+// purpose: it runs INSIDE the caller's transaction, and QueryRoutine would open
+// its own — the resolve-before-mutate guarantee would then read a catalog
+// outside the transaction that is about to delete and re-insert.
+func roleIDsForNames(ctx context.Context, tx txQuerier, engine compat.Engine, roleNames []string) ([]string, error) {
+	statement := `SELECT "id" FROM "roles" WHERE "name" = ` + bind(engine, 1)
 	ids := make([]string, 0, len(roleNames))
 	for _, name := range roleNames {
 		var rid string
-		if err := tx.QueryRowContext(ctx, `SELECT id FROM roles WHERE name = ?`, name).Scan(&rid); err != nil {
+		if err := tx.QueryRowContext(ctx, statement, name).Scan(&rid); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return nil, fmt.Errorf("%w %q", ErrUnknownRole, name)
 			}
@@ -330,29 +377,19 @@ func roleIDsForNames(ctx context.Context, tx *sql.Tx, roleNames []string) ([]str
 }
 
 // rolesForUser returns the names of the roles assigned to a user, via the
-// user_roles junction.
-func rolesForUser(ctx context.Context, db *sql.DB, userID string) ([]string, error) {
-	rows, err := db.QueryContext(ctx,
-		`SELECT r.name
-		   FROM user_roles ur
-		   JOIN roles r ON r.id = ur.role_id
-		  WHERE ur.user_id = ?`,
-		userID,
-	)
+// user_role_names view (the user_roles → roles JOIN, declared in the canonical
+// schema so compat compiles it for both engines). Names come back ordered, so
+// the two engines agree on the sequence and not only on the set.
+func rolesForUser(ctx context.Context, store *compat.Store, userID string) ([]string, error) {
+	rows, err := store.QueryRoutine(ctx, authSchema, schema.RoutineUserRoleNames, map[string]compat.Value{
+		"user_id": uuidValue(userID),
+	})
 	if err != nil {
 		return nil, fmt.Errorf("query user roles: %w", err)
 	}
-	defer rows.Close()
 	var names []string
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return nil, fmt.Errorf("scan role: %w", err)
-		}
-		names = append(names, name)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate roles: %w", err)
+	for _, row := range rows {
+		names = append(names, rowText(row, "role_name"))
 	}
 	return names, nil
 }

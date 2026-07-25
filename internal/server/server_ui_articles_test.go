@@ -25,7 +25,7 @@ import (
 // follows redirects (default) so the jar captures the Set-Cookie.
 func loginUI(t *testing.T, db *sql.DB, srv *httptest.Server, email, pw, role string) *http.Client {
 	t.Helper()
-	if _, err := auth.CreateUser(context.Background(), db, email, pw, []string{role}); err != nil {
+	if _, err := auth.CreateUser(context.Background(), storeFor(db), email, pw, []string{role}); err != nil {
 		t.Fatalf("create user %q: %v", email, err)
 	}
 	jar, _ := cookiejar.New(nil)

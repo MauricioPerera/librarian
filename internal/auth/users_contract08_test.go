@@ -7,11 +7,11 @@ package auth_test
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"testing"
 
 	"github.com/MauricioPerera/librarian/internal/auth"
+	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
 
 // TestVerifyCredentialsSuspendedRejected is the core security-fix test: a user
@@ -212,10 +212,10 @@ func TestSetUserRoles(t *testing.T) {
 
 // userID looks up a user id by email — needed by the status-fix test, which
 // starts from an email rather than the created id.
-func userID(t *testing.T, db *sql.DB, email string) string {
+func userID(t *testing.T, db *compat.Store, email string) string {
 	t.Helper()
 	var id string
-	if err := db.QueryRow(`SELECT id FROM users WHERE email = ?`, email).Scan(&id); err != nil {
+	if err := db.DB.QueryRow(`SELECT id FROM users WHERE email = ?`, email).Scan(&id); err != nil {
 		t.Fatalf("lookup user %q: %v", email, err)
 	}
 	return id

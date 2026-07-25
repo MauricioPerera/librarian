@@ -130,7 +130,7 @@ func (h *handlers) registerAdminUserRoutes(mux *http.ServeMux) {
 
 // handleAdminUsersList renders the user list (email, status, roles).
 func (h *handlers) handleAdminUsersList(w http.ResponseWriter, r *http.Request) {
-	users, err := auth.ListUsers(r.Context(), h.db)
+	users, err := auth.ListUsers(r.Context(), h.authStore)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -182,7 +182,7 @@ func (h *handlers) handleAdminUserCreate(w http.ResponseWriter, r *http.Request)
 		})
 		return
 	}
-	if _, err := auth.CreateUser(r.Context(), h.db, email, password, roles); err != nil {
+	if _, err := auth.CreateUser(r.Context(), h.authStore, email, password, roles); err != nil {
 		// Unknown role (crafted request) or duplicate email — a client error, not
 		// a 500. Re-render with the reason and the user's input preserved.
 		renderUserNew(w, http.StatusBadRequest, adminUserNewPage{
@@ -199,7 +199,7 @@ func (h *handlers) handleAdminUserCreate(w http.ResponseWriter, r *http.Request)
 // handleAdminUserDetail renders the combined detail + edit page. A missing or
 // malformed id → 404 HTML (never 500), the same pattern as the articles UI.
 func (h *handlers) handleAdminUserDetail(w http.ResponseWriter, r *http.Request) {
-	u, found, err := auth.GetUser(r.Context(), h.db, r.PathValue("id"))
+	u, found, err := auth.GetUser(r.Context(), h.authStore, r.PathValue("id"))
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -228,7 +228,7 @@ func (h *handlers) handleAdminUserStatus(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "invalid form", http.StatusBadRequest)
 		return
 	}
-	err := auth.UpdateUserStatus(r.Context(), h.db, uid, r.PostFormValue("status"))
+	err := auth.UpdateUserStatus(r.Context(), h.authStore, uid, r.PostFormValue("status"))
 	switch {
 	case errors.Is(err, auth.ErrUserNotFound):
 		h.renderNotFound(w, r)
@@ -255,7 +255,7 @@ func (h *handlers) handleAdminUserRoles(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "invalid form", http.StatusBadRequest)
 		return
 	}
-	err := auth.SetUserRoles(r.Context(), h.db, uid, r.PostForm["roles"])
+	err := auth.SetUserRoles(r.Context(), h.authStore, uid, r.PostForm["roles"])
 	switch {
 	case errors.Is(err, auth.ErrUserNotFound):
 		h.renderNotFound(w, r)

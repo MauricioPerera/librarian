@@ -1,13 +1,26 @@
 package server_test
 
 import (
+	"database/sql"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
+	"github.com/MauricioPerera/librarian/internal/schema"
 	"github.com/MauricioPerera/librarian/internal/server"
+	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
+
+// storeFor pairs a test's *sql.DB handle with the engine it is bound to, which
+// is what internal/auth takes since CONTRACT-19 (a bare *sql.DB cannot answer
+// "which engine is this?", and QueryRoutine/CallRoutine/Placeholder all need
+// the answer). Every test database in this package is the embedded SQLite file
+// store.Open creates, so the target is schema.SQLiteTarget — the same pairing
+// server.NewMux performs internally.
+func storeFor(db *sql.DB) *compat.Store {
+	return &compat.Store{Target: schema.SQLiteTarget, DB: db}
+}
 
 // TestHealth covers the HTTP acceptance criterion: GET /health → 200 with body
 // {"status":"ok"}. Uses a real httptest server + client (no lingering

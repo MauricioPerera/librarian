@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/MauricioPerera/librarian/internal/auth"
+	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
 
 // Identity is the resolved caller surfaced by the authorization layer. It is
@@ -49,7 +50,10 @@ func identityFromContext(ctx context.Context) (*Identity, bool) {
 // resolution function: /whoami and the permission middleware both call it, so
 // there is no duplicated resolution logic. Returns ok=false when neither
 // mechanism authenticates (the caller writes 401).
-func resolveIdentity(ctx context.Context, db *sql.DB, secret, token string) (*Identity, bool) {
+// CONTRACT-19: the API-key branch calls internal/auth, which now takes the
+// *compat.Store (connection + engine) rather than a bare *sql.DB. Only the
+// parameter type changes; the resolution order and semantics are untouched.
+func resolveIdentity(ctx context.Context, store *compat.Store, secret, token string) (*Identity, bool) {
 	// Try JWT first. VerifyJWT is the canonical check (rejects non-HMAC algs,
 	// bad signature, expired).
 	if claims, err := auth.VerifyJWT(secret, token); err == nil {
@@ -62,7 +66,7 @@ func resolveIdentity(ctx context.Context, db *sql.DB, secret, token string) (*Id
 	}
 	// Fall back to API key: exact-match on the SHA-256 hash inside the DB,
 	// rejected if revoked. Same path as /whoami.
-	if key, err := auth.VerifyAPIKey(ctx, db, token); err == nil {
+	if key, err := auth.VerifyAPIKey(ctx, store, token); err == nil {
 		return &Identity{
 			Kind:   "apikey",
 			RoleID: key.RoleID,
@@ -85,7 +89,7 @@ func (h *handlers) authenticate(w http.ResponseWriter, r *http.Request) (*http.R
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return nil, nil, false
 	}
-	id, ok := resolveIdentity(r.Context(), h.db, h.jwtSecret, token)
+	id, ok := resolveIdentity(r.Context(), h.authStore, h.jwtSecret, token)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return nil, nil, false

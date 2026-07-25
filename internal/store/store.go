@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/MauricioPerera/librarian/internal/schema"
 	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
@@ -68,11 +69,20 @@ func EnsureSchema(ctx context.Context, store *compat.Store) error {
 	if err != nil {
 		return err
 	}
-	if len(missing) == 0 {
-		return nil
+	if len(missing) > 0 {
+		if err := store.ApplySchema(ctx, compat.Schema{Tables: missing}); err != nil {
+			return fmt.Errorf("apply schema: %w", err)
+		}
 	}
-	if err := store.ApplySchema(ctx, compat.Schema{Tables: missing}); err != nil {
-		return fmt.Errorf("apply schema: %w", err)
+	// CONTRACT-19 adds VIEWS to the canonical schema (the JOINs internal/auth
+	// used to hand-write). They are recreated on every start rather than
+	// created only when missing, for two reasons: a view is a stateless
+	// DEFINITION (dropping and recreating it destroys no data and is what makes
+	// a changed definition take effect), and an ALREADY DEPLOYED database has no
+	// missing TABLE, so a "create only what is missing" pass gated on the table
+	// diff would never create the views at all and every auth read would fail.
+	if err := applyViews(ctx, store, want.Views); err != nil {
+		return err
 	}
 	// ApplySchema above records compat's own "canonical_schema" metadata (the
 	// __compat_schema table InspectSchema prefers over introspecting the live
@@ -89,6 +99,54 @@ func EnsureSchema(ctx context.Context, store *compat.Store) error {
 		return fmt.Errorf("record full schema metadata: %w", err)
 	}
 	return nil
+}
+
+// applyViews recreates every canonical view: DROP VIEW IF EXISTS followed by the
+// CREATE VIEW compat compiles for this engine, all in one transaction.
+//
+// compat has no CompileDropView (CompileDDL only ever creates, and DROP TABLE is
+// its own entry point), so the drop is the one statement written by hand here.
+// It is safe to do so: `DROP VIEW IF EXISTS "name"` is byte-identical on SQLite
+// and PostgreSQL, the name is a compile-time constant from schema.Build() and it
+// is quoted with the same rule compat uses, so it introduces no divergence and
+// no injection surface.
+//
+// store.ApplySchema is deliberately NOT used for this: it would overwrite the
+// __compat_schema metadata with a views-only schema. EnsureSchema writes the
+// FULL canonical schema right after this call, which is what keeps that metadata
+// truthful.
+func applyViews(ctx context.Context, store *compat.Store, views []compat.View) error {
+	if len(views) == 0 {
+		return nil
+	}
+	statements, err := compat.CompileDDL(store.Target, compat.Schema{Views: views})
+	if err != nil {
+		return fmt.Errorf("compile views: %w", err)
+	}
+	tx, err := store.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin view tx: %w", err)
+	}
+	defer tx.Rollback()
+	for _, view := range views {
+		if _, err := tx.ExecContext(ctx, `DROP VIEW IF EXISTS `+quoteIdentifier(view.Name)); err != nil {
+			return fmt.Errorf("drop view %s: %w", view.Name, err)
+		}
+	}
+	for _, statement := range statements {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("create view: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+// quoteIdentifier applies the same identifier quoting compat emits (double
+// quotes, embedded quote doubled), so an embedded quote or semicolon stays part
+// of the identifier and can never introduce a second statement. It exists only
+// for the DROP VIEW above, the single DDL form compat does not compile.
+func quoteIdentifier(identifier string) string {
+	return `"` + strings.ReplaceAll(identifier, `"`, `""`) + `"`
 }
 
 // execer is the tiny shared surface of *sql.DB and *sql.Tx that

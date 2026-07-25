@@ -43,7 +43,7 @@ lo importa en el destino, re-exporta el snapshot del destino y compara digests:
 - El CLI `compat` instalado una sola vez:
 
   ```powershell
-  go install github.com/MauricioPerera/sqlite-postgres-compat/cmd/compat@v0.2.0
+  go install github.com/MauricioPerera/sqlite-postgres-compat/cmd/compat@v0.4.0
   # queda en $env:USERPROFILE\go\bin\compat.exe  (en el PATH de Go)
   ```
 
@@ -344,3 +344,26 @@ falla acá es del lado de cómo `librarian` arma su esquema/config, no de
   `JSONType` → `TEXT` para preservar el payload byte-a-byte) y se canonicaliza
   al exportar; por eso la verificación compara el `metadata` parseado como JSON,
   no el texto crudo.
+## Batería dual-motor de `internal/auth` (CONTRACT-19)
+
+Independiente del flujo de exportación de arriba: verifica que las funciones
+públicas de `internal/auth` devuelven **lo mismo** contra SQLite real y contra
+PostgreSQL 17 real. Está fuera de la suite default con el build tag
+`dualengine` (mismo patrón que `exportfixture`) porque necesita un PostgreSQL
+vivo. Sin `COMPAT_POSTGRES_DSN` **saltea** en vez de pasar en falso.
+
+```powershell
+$env:COMPAT_POSTGRES_DSN = "postgres://user:***@host:5432/db?sslmode=disable"
+go test -tags dualengine -run TestDualEngineAuth -count=1 -v ./internal/auth
+```
+
+- Crea un **schema PostgreSQL propio y único por corrida**
+  (`librarian_c19_<nanos>`), aplica ahí el esquema canónico completo (tablas +
+  vistas) y lo borra con `DROP SCHEMA … CASCADE` al terminar. No toca `public`
+  más allá de leer el tipo `vector` de pgvector, que se resuelve por
+  `search_path`.
+- El lado SQLite usa el camino de producción (`store.Open` → `store.EnsureSchema`
+  → `store.SeedCatalogs`), así que la batería también prueba que el arranque real
+  crea las vistas de CONTRACT-19.
+- Requiere `pgvector` en el PostgreSQL destino, igual que la exportación: el
+  esquema canónico declara `articles.embedding vector(1536)`.

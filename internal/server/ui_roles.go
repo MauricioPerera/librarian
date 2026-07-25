@@ -79,7 +79,7 @@ func (h *handlers) registerAdminRoleRoutes(mux *http.ServeMux) {
 // A role name outside the catalog → 404 HTML (never a 500).
 func (h *handlers) handleAdminRoleEditForm(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	current, found, err := auth.RolePermissions(r.Context(), h.db, name)
+	current, found, err := auth.RolePermissions(r.Context(), h.authStore, name)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -117,7 +117,7 @@ func (h *handlers) handleAdminRolePermissions(w http.ResponseWriter, r *http.Req
 	selected := r.PostForm["permissions"]
 
 	// (1) Unknown role → 404, before anything else.
-	_, found, err := auth.RolePermissions(r.Context(), h.db, name)
+	_, found, err := auth.RolePermissions(r.Context(), h.authStore, name)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -151,7 +151,7 @@ func (h *handlers) handleAdminRolePermissions(w http.ResponseWriter, r *http.Req
 	}
 
 	// (4) Atomic replacement.
-	switch err := auth.SetRolePermissions(r.Context(), h.db, name, selected); {
+	switch err := auth.SetRolePermissions(r.Context(), h.authStore, name, selected); {
 	case errors.Is(err, auth.ErrRoleNotFound):
 		h.renderNotFound(w, r)
 		return

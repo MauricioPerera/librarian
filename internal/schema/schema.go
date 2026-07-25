@@ -520,5 +520,11 @@ func Build() compat.Schema {
 			contentTypesTable(),
 			contentTypeFieldsTable(),
 		},
+		// CONTRACT-19 T1: the views that replace internal/auth's hand-written
+		// JOINs and the routines (read + single-write) it executes. They are
+		// part of the canonical schema like the tables, so they travel with
+		// --dump-schema / `compat copy` and are covered by the JSON round-trip.
+		Views:    authViews(),
+		Routines: authRoutines(),
 	}
 }

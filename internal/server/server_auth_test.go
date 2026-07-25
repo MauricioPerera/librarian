@@ -102,7 +102,7 @@ func TestLoginSuccess(t *testing.T) {
 	defer cleanup()
 	ctx := context.Background()
 
-	if _, err := auth.CreateUser(ctx, db, "alice@example.com", "correct-horse", []string{"editor", "author"}); err != nil {
+	if _, err := auth.CreateUser(ctx, storeFor(db), "alice@example.com", "correct-horse", []string{"editor", "author"}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 
@@ -136,7 +136,7 @@ func TestLoginInvalidCredentials(t *testing.T) {
 	defer cleanup()
 	ctx := context.Background()
 
-	if _, err := auth.CreateUser(ctx, db, "bob@example.com", "s3cret", []string{"author"}); err != nil {
+	if _, err := auth.CreateUser(ctx, storeFor(db), "bob@example.com", "s3cret", []string{"author"}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 
@@ -172,10 +172,10 @@ func TestWhoamiJWT(t *testing.T) {
 	defer cleanup()
 	ctx := context.Background()
 
-	if _, err := auth.CreateUser(ctx, db, "carol@example.com", "pw", []string{"editor"}); err != nil {
+	if _, err := auth.CreateUser(ctx, storeFor(db), "carol@example.com", "pw", []string{"editor"}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	user, err := auth.VerifyCredentials(ctx, db, "carol@example.com", "pw")
+	user, err := auth.VerifyCredentials(ctx, storeFor(db), "carol@example.com", "pw")
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}
@@ -207,7 +207,7 @@ func TestWhoamiAPIKey(t *testing.T) {
 	ctx := context.Background()
 
 	rid := roleID(t, db, "editor")
-	secret, err := auth.MintAPIKey(ctx, db, "ci-runner", rid)
+	secret, err := auth.MintAPIKey(ctx, storeFor(db), "ci-runner", rid)
 	if err != nil {
 		t.Fatalf("mint: %v", err)
 	}
@@ -236,11 +236,11 @@ func TestWhoamiRevokedAPIKeyRejected(t *testing.T) {
 	ctx := context.Background()
 
 	rid := roleID(t, db, "editor")
-	secret, err := auth.MintAPIKey(ctx, db, "revoked-key", rid)
+	secret, err := auth.MintAPIKey(ctx, storeFor(db), "revoked-key", rid)
 	if err != nil {
 		t.Fatalf("mint: %v", err)
 	}
-	if err := auth.RevokeAPIKey(ctx, db, secret); err != nil {
+	if err := auth.RevokeAPIKey(ctx, storeFor(db), secret); err != nil {
 		t.Fatalf("revoke: %v", err)
 	}
 

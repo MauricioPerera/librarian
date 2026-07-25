@@ -798,7 +798,7 @@ func TestDynamicContentSurvivesRestart(t *testing.T) {
 
 	// A fresh token from the SAME database (the JWT is verified against the
 	// persisted user, so this exercises the restart end to end).
-	user, err := auth.VerifyCredentials(ctx, sdb2.DB, "admin@example.com", "pw")
+	user, err := auth.VerifyCredentials(ctx, storeFor(sdb2.DB), "admin@example.com", "pw")
 	if err != nil {
 		t.Fatalf("verify after restart: %v", err)
 	}

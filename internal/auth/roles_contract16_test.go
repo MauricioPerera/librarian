@@ -7,19 +7,19 @@ package auth_test
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"sort"
 	"testing"
 
 	"github.com/MauricioPerera/librarian/internal/auth"
+	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
 
 // grantedPerms reads a role's grants with a DIRECT SQL query — deliberately NOT
 // through auth.RolePermissions, so the assertions are not self-fulfilling.
-func grantedPerms(t *testing.T, db *sql.DB, role string) []string {
+func grantedPerms(t *testing.T, db *compat.Store, role string) []string {
 	t.Helper()
-	rows, err := db.Query(
+	rows, err := db.DB.Query(
 		`SELECT p.name
 		   FROM role_permissions rp
 		   JOIN roles r       ON r.id = rp.role_id
@@ -109,14 +109,14 @@ func TestSetRolePermissionsUnknownRole(t *testing.T) {
 	ctx := context.Background()
 
 	var before int
-	db.QueryRow(`SELECT COUNT(*) FROM role_permissions`).Scan(&before)
+	db.DB.QueryRow(`SELECT COUNT(*) FROM role_permissions`).Scan(&before)
 
 	err := auth.SetRolePermissions(ctx, db, "superadmin", []string{"content.create"})
 	if !errors.Is(err, auth.ErrRoleNotFound) {
 		t.Fatalf("err = %v, want ErrRoleNotFound", err)
 	}
 	var after int
-	db.QueryRow(`SELECT COUNT(*) FROM role_permissions`).Scan(&after)
+	db.DB.QueryRow(`SELECT COUNT(*) FROM role_permissions`).Scan(&after)
 	if after != before {
 		t.Errorf("role_permissions mutated on unknown role: %d → %d", before, after)
 	}
@@ -159,7 +159,7 @@ func TestSetRolePermissionsIsIdempotentOnRepeats(t *testing.T) {
 		t.Fatalf("set with repeats: %v", err)
 	}
 	var n int
-	if err := db.QueryRow(
+	if err := db.DB.QueryRow(
 		`SELECT COUNT(*) FROM role_permissions rp JOIN roles r ON r.id = rp.role_id WHERE r.name = ?`,
 		"contributor").Scan(&n); err != nil {
 		t.Fatalf("count rows: %v", err)

@@ -111,7 +111,7 @@ func (h *handlers) registerAdminAPIKeyRoutes(mux *http.ServeMux) {
 // handleAdminAPIKeysList renders the API-key list (label, role name, created,
 // status). It never shows the secret or the hash.
 func (h *handlers) handleAdminAPIKeysList(w http.ResponseWriter, r *http.Request) {
-	keys, err := auth.ListAPIKeys(r.Context(), h.db)
+	keys, err := auth.ListAPIKeys(r.Context(), h.authStore)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -172,7 +172,7 @@ func (h *handlers) handleAdminAPIKeyCreate(w http.ResponseWriter, r *http.Reques
 		})
 		return
 	}
-	secret, err := auth.MintAPIKey(r.Context(), h.db, label, roleID)
+	secret, err := auth.MintAPIKey(r.Context(), h.authStore, label, roleID)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -196,11 +196,11 @@ func (h *handlers) handleAdminAPIKeyCreate(w http.ResponseWriter, r *http.Reques
 // genuinely unknown id (no such row) → 404 HTML, never a 500.
 func (h *handlers) handleAdminAPIKeyRevoke(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if err := auth.RevokeAPIKeyByID(r.Context(), h.db, id); err != nil {
+	if err := auth.RevokeAPIKeyByID(r.Context(), h.authStore, id); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
-	rec, found, err := auth.GetAPIKey(r.Context(), h.db, id)
+	rec, found, err := auth.GetAPIKey(r.Context(), h.authStore, id)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return

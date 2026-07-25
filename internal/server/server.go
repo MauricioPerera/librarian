@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/MauricioPerera/librarian/internal/auth"
+	"github.com/MauricioPerera/librarian/internal/schema"
+	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
 
 // Deps carries the runtime dependencies the routes need. JWTSecret must be
@@ -34,7 +36,19 @@ func NewMux(deps Deps) (*http.ServeMux, error) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", handleHealth)
 
-	h := &handlers{db: deps.DB, jwtSecret: deps.JWTSecret, now: time.Now}
+	// CONTRACT-19: internal/auth now takes a *compat.Store (connection AND
+	// engine) instead of a bare *sql.DB, because compat.Placeholder /
+	// QueryRoutine / CallRoutine need to know the engine. Deps is deliberately
+	// unchanged and the store is composed here from the handle the server
+	// already receives: librarian still runs on SQLite only — choosing the
+	// engine is CONTRACT-21, and this is the single line that changes when it
+	// arrives.
+	h := &handlers{
+		db:        deps.DB,
+		authStore: &compat.Store{Target: schema.SQLiteTarget, DB: deps.DB},
+		jwtSecret: deps.JWTSecret,
+		now:       time.Now,
+	}
 	mux.HandleFunc("POST /auth/login", h.handleLogin)
 	mux.HandleFunc("GET /whoami", h.handleWhoami)
 
@@ -107,7 +121,11 @@ func NewMux(deps Deps) (*http.ServeMux, error) {
 
 // handlers holds the per-request-shared state for the auth routes.
 type handlers struct {
-	db        *sql.DB
+	db *sql.DB
+	// authStore is the same connection as db, paired with the engine it is
+	// bound to. It is what internal/auth takes since CONTRACT-19; every other
+	// package here still uses db, which CONTRACT-20 migrates.
+	authStore *compat.Store
 	jwtSecret string
 	now       func() time.Time
 	// schemaMu serializes the schema-MUTATING requests (CONTRACT-13: creating a
@@ -139,7 +157,7 @@ func (h *handlers) handleLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	user, err := auth.VerifyCredentials(r.Context(), h.db, req.Email, req.Password)
+	user, err := auth.VerifyCredentials(r.Context(), h.authStore, req.Email, req.Password)
 	if err != nil {
 		// Same generic message for unknown user and wrong password.
 		writeError(w, http.StatusUnauthorized, "invalid credentials")
@@ -165,7 +183,7 @@ func (h *handlers) handleWhoami(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-	id, ok := resolveIdentity(r.Context(), h.db, h.jwtSecret, token)
+	id, ok := resolveIdentity(r.Context(), h.authStore, h.jwtSecret, token)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return

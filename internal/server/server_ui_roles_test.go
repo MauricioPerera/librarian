@@ -125,10 +125,10 @@ func apiStatus(t *testing.T, srv *httptest.Server, token, method, path, body str
 func tokenFor(t *testing.T, db *sql.DB, email, role string) string {
 	t.Helper()
 	ctx := context.Background()
-	if _, err := auth.CreateUser(ctx, db, email, "pw", []string{role}); err != nil {
+	if _, err := auth.CreateUser(ctx, storeFor(db), email, "pw", []string{role}); err != nil {
 		t.Fatalf("create %q: %v", email, err)
 	}
-	u, err := auth.VerifyCredentials(ctx, db, email, "pw")
+	u, err := auth.VerifyCredentials(ctx, storeFor(db), email, "pw")
 	if err != nil {
 		t.Fatalf("verify %q: %v", email, err)
 	}
@@ -340,11 +340,11 @@ func TestGuardHTTPTwoRolesFirstAllowedSecondRejected(t *testing.T) {
 	grant(t, db, "editor", "roles.manage")
 	// A session whose JWT carries BOTH roles: create the user, assign both roles,
 	// and only THEN log in, so the token's claims list them both.
-	created, err := auth.CreateUser(context.Background(), db, "two@example.com", "pw", []string{"administrator"})
+	created, err := auth.CreateUser(context.Background(), storeFor(db), "two@example.com", "pw", []string{"administrator"})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if err := auth.SetUserRoles(context.Background(), db, created.ID, []string{"administrator", "editor"}); err != nil {
+	if err := auth.SetUserRoles(context.Background(), storeFor(db), created.ID, []string{"administrator", "editor"}); err != nil {
 		t.Fatalf("assign second role: %v", err)
 	}
 	client := loginExisting(t, srv, "two@example.com", "pw")

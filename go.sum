@@ -2,6 +2,8 @@ github.com/MauricioPerera/sqlite-postgres-compat v0.1.0 h1:4hO7h+kt2LcMu6OGF7/sB
 github.com/MauricioPerera/sqlite-postgres-compat v0.1.0/go.mod h1:dGuIcYfzUW9XwBVpRRteseFILUBtQvCs1nk79p+Q3Ms=
 github.com/MauricioPerera/sqlite-postgres-compat v0.2.0 h1:u0irDqL4CkQCzDAkcdkcqt6Aya2IrkCbgnZBuGhpIq8=
 github.com/MauricioPerera/sqlite-postgres-compat v0.2.0/go.mod h1:dGuIcYfzUW9XwBVpRRteseFILUBtQvCs1nk79p+Q3Ms=
+github.com/MauricioPerera/sqlite-postgres-compat v0.4.0 h1:j1yX3rI2MXFt/4RlNkNHx/PORcx18hAly5/ff6Mp+DI=
+github.com/MauricioPerera/sqlite-postgres-compat v0.4.0/go.mod h1:dGuIcYfzUW9XwBVpRRteseFILUBtQvCs1nk79p+Q3Ms=
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=

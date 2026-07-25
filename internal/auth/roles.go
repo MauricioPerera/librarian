@@ -18,12 +18,24 @@ package auth
 // The catalogs themselves (schema.Roles / schema.Permissions) stay fixed in
 // code: this file edits GRANTS, it never creates or deletes a role or a
 // permission.
+//
+// CONTRACT-19: SetRolePermissions is the third and last operation that cannot go
+// through a routine. Its atomicity — one DELETE plus N INSERTs committing
+// together — is a deliberate guarantee of CONTRACT-16, and CallRoutine opens its
+// own transaction per call, so splitting it across calls would lose exactly what
+// this function exists to provide. It therefore composes raw SQL with
+// compat.Placeholder inside the transaction it owns. Its READ counterpart,
+// RolePermissions, runs outside any transaction and goes through QueryRoutine
+// over the role_permission_names view.
 
 import (
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+
+	"github.com/MauricioPerera/librarian/internal/schema"
+	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
 
 // ErrRoleNotFound is returned by SetRolePermissions when the target role name is
@@ -49,19 +61,24 @@ var ErrUnknownPermission = errors.New("unknown permission")
 // performing the change (see the guard in internal/server/ui_roles.go), because
 // this function is also the one a bootstrap/repair path would use.
 //
-// A repeated permission name in the input is harmless: role_permissions has a
-// composite primary key and the insert uses ON CONFLICT DO NOTHING, so the
-// operation is idempotent and cannot duplicate rows. All ids are bound as
+// A repeated permission name in the input is harmless: the resolved ids are
+// deduped before the inserts, so the composite primary key can never be hit and
+// the operation is idempotent. (It used to rely on `ON CONFLICT DO NOTHING`;
+// CONTRACT-19 removed the upsert clause because after the DELETE above the only
+// possible conflict is a duplicate in the CALLER's list, which dedupe makes
+// impossible by construction rather than merely tolerated.) All ids are bound as
 // parameters; nothing is interpolated.
-func SetRolePermissions(ctx context.Context, db *sql.DB, roleName string, permissionNames []string) error {
-	tx, err := db.BeginTx(ctx, nil)
+func SetRolePermissions(ctx context.Context, store *compat.Store, roleName string, permissionNames []string) error {
+	engine := store.Target.Engine
+	tx, err := store.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
 	var roleID string
-	if err := tx.QueryRowContext(ctx, `SELECT id FROM roles WHERE name = ?`, roleName).Scan(&roleID); err != nil {
+	lookupRole := `SELECT "id" FROM "roles" WHERE "name" = ` + bind(engine, 1)
+	if err := tx.QueryRowContext(ctx, lookupRole, roleName).Scan(&roleID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("%w %q", ErrRoleNotFound, roleName)
 		}
@@ -70,19 +87,19 @@ func SetRolePermissions(ctx context.Context, db *sql.DB, roleName string, permis
 
 	// Resolve BEFORE mutating so an unknown permission aborts with the table
 	// untouched — same invariant as SetUserRoles.
-	permIDs, err := permissionIDsForNames(ctx, tx, permissionNames)
+	permIDs, err := permissionIDsForNames(ctx, tx, engine, permissionNames)
 	if err != nil {
 		return err
 	}
 
-	if _, err := tx.ExecContext(ctx, `DELETE FROM role_permissions WHERE role_id = ?`, roleID); err != nil {
+	clear := `DELETE FROM "role_permissions" WHERE "role_id" = ` + bind(engine, 1)
+	if _, err := tx.ExecContext(ctx, clear, roleID); err != nil {
 		return fmt.Errorf("clear role permissions: %w", err)
 	}
-	for _, pid := range permIDs {
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO role_permissions (role_id, permission_id) VALUES (?, ?) ON CONFLICT DO NOTHING`,
-			roleID, pid,
-		); err != nil {
+	grant := `INSERT INTO "role_permissions" ("role_id", "permission_id") VALUES (` +
+		bind(engine, 1) + `, ` + bind(engine, 2) + `)`
+	for _, pid := range dedupe(permIDs) {
+		if _, err := tx.ExecContext(ctx, grant, roleID, pid); err != nil {
 			return fmt.Errorf("grant permission: %w", err)
 		}
 	}
@@ -94,38 +111,28 @@ func SetRolePermissions(ctx context.Context, db *sql.DB, roleName string, permis
 
 // RolePermissions returns the permission names currently granted to a role, by
 // role NAME. found is false when the role is not in the catalog (never a raw SQL
-// error), so the caller maps it to a 404. Names are ordered for a stable view.
-func RolePermissions(ctx context.Context, db *sql.DB, roleName string) ([]string, bool, error) {
-	var roleID string
-	err := db.QueryRowContext(ctx, `SELECT id FROM roles WHERE name = ?`, roleName).Scan(&roleID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, false, nil
-	}
+// error), so the caller maps it to a 404. Names are ordered for a stable view —
+// the ORDER BY is declared in the routine, so both engines return the same
+// sequence.
+func RolePermissions(ctx context.Context, store *compat.Store, roleName string) ([]string, bool, error) {
+	roleRows, err := store.QueryRoutine(ctx, authSchema, schema.RoutineRoleIDByName, map[string]compat.Value{
+		"name": textValue(roleName),
+	})
 	if err != nil {
 		return nil, false, fmt.Errorf("lookup role: %w", err)
 	}
-	rows, err := db.QueryContext(ctx,
-		`SELECT p.name
-		   FROM role_permissions rp
-		   JOIN permissions p ON p.id = rp.permission_id
-		  WHERE rp.role_id = ?
-		  ORDER BY p.name`,
-		roleID,
-	)
+	if len(roleRows) == 0 {
+		return nil, false, nil
+	}
+	rows, err := store.QueryRoutine(ctx, authSchema, schema.RoutineRolePermissionNames, map[string]compat.Value{
+		"role_id": uuidValue(rowText(roleRows[0], "id")),
+	})
 	if err != nil {
 		return nil, false, fmt.Errorf("query role permissions: %w", err)
 	}
-	defer rows.Close()
 	var names []string
-	for rows.Next() {
-		var name string
-		if err := rows.Scan(&name); err != nil {
-			return nil, false, fmt.Errorf("scan permission: %w", err)
-		}
-		names = append(names, name)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, false, fmt.Errorf("iterate permissions: %w", err)
+	for _, row := range rows {
+		names = append(names, rowText(row, "permission_name"))
 	}
 	return names, true, nil
 }
@@ -133,11 +140,16 @@ func RolePermissions(ctx context.Context, db *sql.DB, roleName string) ([]string
 // permissionIDsForNames resolves permission names to their catalog ids inside tx.
 // It returns ErrUnknownPermission (wrapped with the offending name) if any name
 // is absent from the permissions table — the mirror of roleIDsForNames.
-func permissionIDsForNames(ctx context.Context, tx *sql.Tx, permissionNames []string) ([]string, error) {
+//
+// Like roleIDsForNames it stays a raw statement instead of the
+// auth_permission_id_by_name routine, because it must read inside the caller's
+// transaction and QueryRoutine would open its own.
+func permissionIDsForNames(ctx context.Context, tx txQuerier, engine compat.Engine, permissionNames []string) ([]string, error) {
+	statement := `SELECT "id" FROM "permissions" WHERE "name" = ` + bind(engine, 1)
 	ids := make([]string, 0, len(permissionNames))
 	for _, name := range permissionNames {
 		var pid string
-		if err := tx.QueryRowContext(ctx, `SELECT id FROM permissions WHERE name = ?`, name).Scan(&pid); err != nil {
+		if err := tx.QueryRowContext(ctx, statement, name).Scan(&pid); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				return nil, fmt.Errorf("%w %q", ErrUnknownPermission, name)
 			}

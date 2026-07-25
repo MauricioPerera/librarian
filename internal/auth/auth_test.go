@@ -2,7 +2,6 @@ package auth_test
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -10,12 +9,14 @@ import (
 
 	"github.com/MauricioPerera/librarian/internal/auth"
 	"github.com/MauricioPerera/librarian/internal/store"
+	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
 
 // openDB opens a temp SQLite file, applies the schema, and seeds the role
 // catalog so user creation / API-key minting can reference roles. Returns the
-// *sql.DB handle (compat.Store.DB) and a close func.
-func openDB(t *testing.T) (*sql.DB, func()) {
+// *compat.Store (connection + engine, what internal/auth takes since
+// CONTRACT-19) and a close func.
+func openDB(t *testing.T) (*compat.Store, func()) {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "auth.db")
 	sdb, err := store.Open(dbPath)
@@ -29,14 +30,14 @@ func openDB(t *testing.T) (*sql.DB, func()) {
 	if err := store.SeedCatalogs(ctx, sdb.DB); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	return sdb.DB, func() { _ = sdb.Close() }
+	return sdb, func() { _ = sdb.Close() }
 }
 
 // roleID looks up a role id by name — needed to mint API keys against a role.
-func roleID(t *testing.T, db *sql.DB, name string) string {
+func roleID(t *testing.T, db *compat.Store, name string) string {
 	t.Helper()
 	var id string
-	if err := db.QueryRow(`SELECT id FROM roles WHERE name = ?`, name).Scan(&id); err != nil {
+	if err := db.DB.QueryRow(`SELECT id FROM roles WHERE name = ?`, name).Scan(&id); err != nil {
 		t.Fatalf("lookup role %q: %v", name, err)
 	}
 	return id

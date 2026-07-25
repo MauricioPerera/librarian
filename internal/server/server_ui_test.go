@@ -135,7 +135,7 @@ func TestUIStaticAssetsEmbedded(t *testing.T) {
 func TestUILoginSuccessSetsCookie(t *testing.T) {
 	db, srv, cleanup := openUITLS(t)
 	defer cleanup()
-	if _, err := auth.CreateUser(context.Background(), db, "ui@example.com", "hunter2", []string{"editor"}); err != nil {
+	if _, err := auth.CreateUser(context.Background(), storeFor(db), "ui@example.com", "hunter2", []string{"editor"}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 
@@ -179,7 +179,7 @@ func TestUILoginSuccessSetsCookie(t *testing.T) {
 func TestUILoginInvalidGenericError(t *testing.T) {
 	db, srv, cleanup := openUITLS(t)
 	defer cleanup()
-	if _, err := auth.CreateUser(context.Background(), db, "real@example.com", "correct", []string{"author"}); err != nil {
+	if _, err := auth.CreateUser(context.Background(), storeFor(db), "real@example.com", "correct", []string{"author"}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	client := noRedirectClient(srv)
@@ -296,7 +296,7 @@ func TestUIHomeInvalidCookieRedirects(t *testing.T) {
 func TestUIRoundTrip(t *testing.T) {
 	db, srv, cleanup := openUITLS(t)
 	defer cleanup()
-	if _, err := auth.CreateUser(context.Background(), db, "round@example.com", "trip-pw", []string{"editor"}); err != nil {
+	if _, err := auth.CreateUser(context.Background(), storeFor(db), "round@example.com", "trip-pw", []string{"editor"}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 
@@ -402,7 +402,7 @@ func TestUIJSONRoutesUnaffected(t *testing.T) {
 	db, srv, cleanup := openUITLS(t)
 	defer cleanup()
 	ctx := context.Background()
-	if _, err := auth.CreateUser(ctx, db, "api@example.com", "api-pw", []string{"editor", "author"}); err != nil {
+	if _, err := auth.CreateUser(ctx, storeFor(db), "api@example.com", "api-pw", []string{"editor", "author"}); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	client := srv.Client()
