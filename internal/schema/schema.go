@@ -383,9 +383,31 @@ func checkIn(column string, values []string) compat.Constraint {
 // reasoning that put UNIQUE on products.sku and UNIQUE(taxonomy_id, slug) on
 // terms. The server translates the violation into a clean 400.
 //
-// There is deliberately no updated_at: DEFINITION-CPT-DINAMICOS.md makes v1
-// create-only (compat has no ALTER TABLE support, so an already-applied type
-// can never be edited); a column that could never change would be a lie.
+// There is deliberately no updated_at, and CONTRACT-18 RE-EXAMINED that and
+// KEPT IT — with a new reason, because the old one expired.
+//
+// The old reason: v1 was create-only (compat has no ALTER TABLE), so a column
+// that could never change would be a lie. Since CONTRACT-18 a type's fields CAN
+// be edited, so that argument no longer holds.
+//
+// The reason it stays out anyway:
+//
+//   - Adding a column to a CODE table is not something EnsureSchema can do: it
+//     only creates MISSING tables and never touches an existing one (that
+//     restriction is deliberate and is what makes a restart safe). Adding
+//     updated_at would therefore require a hand-run migration on every deployed
+//     database before the new binary could be trusted — a real, irreversible
+//     operational cost.
+//   - Nothing consumes it. No API response, no UI surface and no export
+//     decision depends on when a type was last edited; it would be a column
+//     added "because it is customary".
+//   - The information is not lost: the edit is an administrative action that
+//     goes through a permission-gated route and is visible in the service log,
+//     and the CURRENT shape of a type is always readable from the registry.
+//
+// If a later contract needs "when was this type last edited" (an audit trail,
+// an optimistic-concurrency token for the editor), it should add it
+// deliberately, WITH its migration step — not inherit it from here.
 func contentTypesTable() compat.Table {
 	return compat.Table{
 		Name: ContentTypesTable,

@@ -83,16 +83,14 @@ const (
 	colMetadata  = "metadata"
 )
 
-// quoteIdentifier is the ONLY place a dynamic name becomes SQL text. It re-runs
-// the CONTRACT-13 T1 gate before quoting, so an identifier can only be
-// interpolated if it still satisfies `[a-z][a-z0-9_]*` (which contains no
-// quote, no semicolon, no space and no unicode). The double quotes are then
-// belt-and-braces, not the protection: the alphabet alone makes escaping moot.
+// quoteIdentifier is the ONLY place a dynamic name becomes SQL text in this
+// package. Its body moved to schema.QuoteIdentifier in CONTRACT-18 (the table
+// rebuild in internal/store needs the SAME function to build its copy
+// statements, and store cannot import server), so there is still exactly one
+// implementation, one gate and one error message; this stays as the local name
+// every call site in this file already uses.
 func quoteIdentifier(name string) (string, error) {
-	if err := schema.ValidateIdentifier(name); err != nil {
-		return "", fmt.Errorf("refusing to build a query with identifier %q: %w", name, err)
-	}
-	return `"` + name + `"`, nil
+	return schema.QuoteIdentifier(name)
 }
 
 // quoteTable is the ONLY way this file names a dynamic TABLE in SQL

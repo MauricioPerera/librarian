@@ -54,7 +54,15 @@ exportabilidad dual-motor que motiva todo el proyecto.
 
 ## Fuera de alcance
 
-- **Editar los campos de un CPT dinámico ya creado** (agregar, quitar o renombrar un campo
+- ~~**Editar los campos de un CPT dinámico ya creado**~~ — **YA NO: implementado por CONTRACT-18**
+  (`docs/reports/CONTRACT-18-REPORT.md`). Agregar, renombrar y quitar campos se hace por
+  `PUT /content-types/{nombre}` y por `/admin/content-types/{nombre}/edit`, reconstruyendo la tabla
+  real dentro de UNA transacción y componiendo SOLO operaciones que `compat` ya expresa (`CompileDDL`
+  + `CompileDropTable`, v0.2.0): no se construyó ningún mecanismo de migración por fuera de `compat`,
+  así que la objeción de abajo se respetó en vez de saltearse. Cambiar el TIPO de un campo sigue
+  fuera de alcance (el casteo entre familias diverge entre motores). El texto original se conserva:
+
+  **Editar los campos de un CPT dinámico ya creado** (agregar, quitar o renombrar un campo
   después de la creación) — decisión forzada por una limitación real: `sqlite-postgres-compat`
   no tiene ningún soporte de `ALTER TABLE` (verificado, cero resultados en todo el paquete), y
   construir un mecanismo de migración propio por fuera de `compat` introduciría una segunda

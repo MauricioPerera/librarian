@@ -93,6 +93,78 @@ func DynamicTableName(typeName string) string {
 	return DynamicTablePrefix + typeName
 }
 
+// StagingTablePrefix (CONTRACT-18) is the prefix of the TRANSIENT table used
+// while a dynamic type's fields are being edited. Editing a type rebuilds its
+// table (compat has neither ALTER TABLE nor RENAME), and the rebuild needs a
+// place to park the rows while the original is dropped and re-created under its
+// unchanged name.
+//
+// WHY IT IS DISJOINT FROM EVERYTHING ELSE — this is a structural argument, not
+// a naming convention:
+//
+//   - It cannot collide with a DYNAMIC table. A dynamic table is
+//     DynamicTablePrefix + <type name> = "cpt_" + name, so its 4th character is
+//     always '_'. A staging name's 4th character is 'm'. The underscore in
+//     "cpt_" is what makes the two families provably disjoint: a type called
+//     `mp_eventos` produces `cpt_mp_eventos`, never `cptmp_eventos`.
+//   - It cannot collide with a CODE table, and that half is enforced by a test
+//     over Build() (TestNoCodeTableUsesStagingPrefix), exactly like CONTRACT-17
+//     does for `cpt_`. Code tables are Go literals and never pass through any
+//     runtime validator, so only a test can guarantee it.
+//
+// It is NEVER shown to a user and never appears in any response: the staging
+// table exists only inside the single transaction that rebuilds a type.
+const StagingTablePrefix = "cptmp_"
+
+// StagingTableName is the FIXED name of the rebuild staging table.
+//
+// DECISION (CONTRACT-18) — it is a constant, NOT derived from the type name:
+//
+//   - A derived name ("cptmp_" + <type>) would be 6 + up to 28 = 34 bytes and
+//     would therefore FAIL ValidateIdentifier for a long-but-legal type name.
+//     The rebuild would then be impossible for exactly the types whose names sit
+//     at the top of the allowed budget — a silent, arbitrary restriction.
+//   - Nothing is gained by a per-type name: the table lives inside ONE
+//     transaction, schema-mutating requests are serialized by the HTTP layer's
+//     schemaMu, and compat pins the SQLite pool to a single connection, so two
+//     rebuilds can never be in flight at the same time.
+//
+// At 13 bytes it is always a legal identifier, whatever the type is called.
+const StagingTableName = StagingTablePrefix + "rebuild"
+
+// QuoteIdentifier is THE single place in the project where a dynamic name
+// becomes SQL text. It re-runs the CONTRACT-13 T1 gate before quoting, so an
+// identifier can only be interpolated if it still satisfies `[a-z][a-z0-9_]*`
+// (which contains no quote, no semicolon, no space and no unicode). The double
+// quotes are then belt-and-braces, not the protection: the alphabet alone makes
+// escaping moot.
+//
+// It lives here rather than in internal/server (where CONTRACT-14 first wrote
+// it) because CONTRACT-18 needs the very same function in internal/store to
+// build the copy statements of a table rebuild, and store cannot import server.
+// server/content.go's quoteIdentifier now delegates to this one, so there is
+// still exactly ONE implementation and one error message.
+func QuoteIdentifier(name string) (string, error) {
+	if err := ValidateIdentifier(name); err != nil {
+		return "", fmt.Errorf("refusing to build a query with identifier %q: %w", name, err)
+	}
+	return `"` + name + `"`, nil
+}
+
+// QuoteInternalIdentifier quotes a name this package itself owns (the staging
+// table, whose name is a compile-time constant of this file). It exists because
+// ValidateIdentifier legitimately rejects nothing about "cptmp_rebuild" — it
+// passes the pattern — but the staging name is NOT a dynamically supplied name
+// and must not be routed through the dynamic gate as if it were. Keeping the
+// two entry points separate makes every call site say which kind of name it is
+// handling.
+func QuoteInternalIdentifier(name string) (string, error) {
+	if !identifierPattern.MatchString(name) || len(name) > MaxIdentifierLength {
+		return "", fmt.Errorf("internal identifier %q is not a legal identifier", name)
+	}
+	return `"` + name + `"`, nil
+}
+
 // identifierPattern is the ONLY accepted shape: a lowercase ASCII letter
 // followed by lowercase ASCII letters, digits and underscores. This single
 // pattern is what rejects quotes, semicolons, spaces, uppercase, unicode,

@@ -3,7 +3,7 @@ module github.com/MauricioPerera/librarian
 go 1.26.4
 
 require (
-	github.com/MauricioPerera/sqlite-postgres-compat v0.1.0
+	github.com/MauricioPerera/sqlite-postgres-compat v0.2.0
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	golang.org/x/crypto v0.54.0
 )

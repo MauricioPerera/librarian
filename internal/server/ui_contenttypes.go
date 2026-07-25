@@ -48,6 +48,13 @@ var (
 	// Parsed standalone so the htmx "add one more row" route can render the
 	// fragment alone, exactly as ui_articles.go does with the article row.
 	adminContentTypeFieldRowTmpl = mustParseFS("templates/content_type_field_row.html")
+	// CONTRACT-18: the edit form and its own row fragment. The edit row is a
+	// DIFFERENT template from the create row because it carries one extra thing
+	// the create form has no notion of: the field's stored identity
+	// (content_type_fields.id), which is what turns "a different name in this
+	// position" into a RENAME instead of a drop-plus-add.
+	adminContentTypesEditTmpl        = mustParseFS("templates/layout.html", "templates/content_types_edit.html", "templates/content_type_edit_field_row.html")
+	adminContentTypeEditFieldRowTmpl = mustParseFS("templates/content_type_edit_field_row.html")
 )
 
 // fieldTypeOption is one <option> of the per-row field-type selector. The
@@ -91,6 +98,12 @@ func (h *handlers) registerAdminContentTypeRoutes(mux *http.ServeMux) {
 	mux.Handle("GET /admin/content-types/new", h.requireSession(http.HandlerFunc(h.handleAdminContentTypeNewForm)))
 	mux.Handle("GET /admin/content-types/new/field", h.requireSession(http.HandlerFunc(h.handleAdminContentTypeFieldRow)))
 	mux.Handle("POST /admin/content-types", h.requireSessionPermission("content_types.manage")(http.HandlerFunc(h.handleAdminContentTypeCreate)))
+	// CONTRACT-18 T3 — editing the fields of an applied type. Same permission,
+	// same mutex, same store operation as the JSON API: this file stays
+	// presentation-only.
+	mux.Handle("GET /admin/content-types/{name}/edit", h.requireSession(http.HandlerFunc(h.handleAdminContentTypeEditForm)))
+	mux.Handle("GET /admin/content-types/edit/field", h.requireSession(http.HandlerFunc(h.handleAdminContentTypeEditFieldRow)))
+	mux.Handle("POST /admin/content-types/{name}", h.requireSessionPermission("content_types.manage")(http.HandlerFunc(h.handleAdminContentTypeEdit)))
 }
 
 // handleAdminContentTypesList renders every persisted definition with its
@@ -169,6 +182,209 @@ func (h *handlers) handleAdminContentTypeCreate(w http.ResponseWriter, r *http.R
 		return
 	}
 	http.Redirect(w, r, "/admin/content-types", http.StatusSeeOther)
+}
+
+// contentTypeEditFieldRow is ONE row of the EDIT form. It is the create row
+// plus the stored identity: ID empty means "a new field", ID set means "this is
+// that stored field", so a changed Name in the same row is a rename.
+// TypeValue is the row's selected type as a plain string, needed because the
+// selector is disabled for an existing field (its type cannot change) and a
+// disabled control submits nothing — the hidden twin carries the value.
+type contentTypeEditFieldRow struct {
+	ID        string
+	Name      string
+	TypeValue string
+	Types     []fieldTypeOption
+}
+
+// adminContentTypeEditPage is the view model of the edit form.
+//
+// PendingRemovals is the heart of T3: when the submitted form implies removing
+// fields, the page is re-rendered listing EACH field by name and asking for a
+// second, explicit submit. The names double as hidden `confirm_remove` inputs,
+// so the confirmation the store demands is exactly the list the admin was shown
+// — it cannot silently cover a field that appeared in between.
+type adminContentTypeEditPage struct {
+	pageData
+	Name            string
+	Fields          []contentTypeEditFieldRow
+	Error           string
+	PendingRemovals []string
+}
+
+// handleAdminContentTypeEditForm renders the edit form for one type, with one
+// row per stored field carrying its identity.
+func (h *handlers) handleAdminContentTypeEditForm(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	_, fields, err := store.LoadContentTypeFields(r.Context(), h.db, name)
+	switch {
+	case errors.Is(err, store.ErrContentTypeNotFound):
+		h.renderNotFound(w, r)
+		return
+	case err != nil:
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	rows := make([]contentTypeEditFieldRow, 0, len(fields)+1)
+	for _, f := range fields {
+		rows = append(rows, contentTypeEditFieldRow{
+			ID:        f.ID,
+			Name:      f.Name,
+			TypeValue: string(f.Type),
+			Types:     fieldTypeOptions(string(f.Type)),
+		})
+	}
+	rows = append(rows, blankContentTypeEditFieldRow())
+	h.renderContentTypeEdit(w, r, http.StatusOK, name, rows, "", nil)
+}
+
+// handleAdminContentTypeEditFieldRow returns ONE blank row (no identity ⇒ a new
+// field) for htmx to append, exactly like the create form's fragment route.
+func (h *handlers) handleAdminContentTypeEditFieldRow(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_ = adminContentTypeEditFieldRowTmpl.ExecuteTemplate(w, "content_type_edit_field_row", blankContentTypeEditFieldRow())
+}
+
+// handleAdminContentTypeEdit applies the edit form (content_types.manage).
+//
+// The two-step confirmation is the whole point of the handler: the FIRST submit
+// that implies losing data never reaches the store — it comes back as the same
+// form with the warning naming every field to be destroyed. Only a submit that
+// carries the matching `confirm_remove` values proceeds, and the store re-checks
+// them anyway (store.EditContentType refuses an unconfirmed removal), so the UI
+// is not the only thing standing between an admin and lost data.
+func (h *handlers) handleAdminContentTypeEdit(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	typeID, stored, err := store.LoadContentTypeFields(r.Context(), h.db, name)
+	switch {
+	case errors.Is(err, store.ErrContentTypeNotFound):
+		h.renderNotFound(w, r)
+		return
+	case err != nil:
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	edits, rows, confirmed, ok := parseContentTypeEditForm(r, stored)
+	if !ok {
+		h.renderContentTypeEdit(w, r, http.StatusBadRequest, name, rows, "Formulario inválido.", nil)
+		return
+	}
+	plan, err := store.PlanContentTypeEdit(name, typeID, stored, edits)
+	if err != nil {
+		h.renderContentTypeEdit(w, r, http.StatusBadRequest, name, rows, "Definición inválida: "+err.Error(), nil)
+		return
+	}
+	if missing := unconfirmed(plan.Removed, confirmed); len(missing) > 0 {
+		h.renderContentTypeEdit(w, r, http.StatusOK, name, rows, "", missing)
+		return
+	}
+
+	h.schemaMu.Lock()
+	_, err = store.EditContentType(r.Context(), store.FromDB(h.db), name, edits, plan.Removed)
+	h.schemaMu.Unlock()
+	if err != nil {
+		h.renderContentTypeEdit(w, r, http.StatusBadRequest, name, rows,
+			"No se pudo editar el tipo de contenido: "+err.Error(), nil)
+		return
+	}
+	http.Redirect(w, r, "/admin/content-types", http.StatusSeeOther)
+}
+
+// unconfirmed returns the removals the submitted form did not confirm.
+func unconfirmed(removed, confirmed []string) []string {
+	got := make(map[string]struct{}, len(confirmed))
+	for _, c := range confirmed {
+		got[c] = struct{}{}
+	}
+	var missing []string
+	for _, name := range removed {
+		if _, ok := got[name]; !ok {
+			missing = append(missing, name)
+		}
+	}
+	return missing
+}
+
+// parseContentTypeEditForm reads the edit form into the field list plus the rows
+// to echo back.
+//
+// A row whose NAME is blank is DROPPED from the list — for a row with an
+// identity that means "remove this field", which is precisely why it then needs
+// the explicit confirmation. Blank spare rows (no identity, no name) simply
+// vanish, like in the create form.
+//
+// The TYPE of an existing field is taken from the STORED value, never from the
+// form: its selector is disabled in the UI, and trusting the submitted value
+// would let a hand-crafted POST attempt a type change that the store would then
+// have to reject. Rejecting it is still correct (and tested through the API);
+// pinning it here means the honest UI path can never produce one.
+func parseContentTypeEditForm(r *http.Request, stored []store.PersistedField) ([]store.FieldEdit, []contentTypeEditFieldRow, []string, bool) {
+	if err := r.ParseForm(); err != nil {
+		return nil, nil, nil, false
+	}
+	typeOf := make(map[string]schema.FieldType, len(stored))
+	for _, f := range stored {
+		typeOf[f.ID] = f.Type
+	}
+	ids := r.PostForm["field_id"]
+	names := r.PostForm["field_name"]
+	types := r.PostForm["field_type"]
+
+	edits := make([]store.FieldEdit, 0, len(names))
+	rows := make([]contentTypeEditFieldRow, 0, len(names))
+	for i, raw := range names {
+		name := strings.TrimSpace(raw)
+		id := ""
+		if i < len(ids) {
+			id = strings.TrimSpace(ids[i])
+		}
+		typeValue := ""
+		if i < len(types) {
+			typeValue = strings.TrimSpace(types[i])
+		}
+		if stored, ok := typeOf[id]; ok {
+			typeValue = string(stored)
+		}
+		rows = append(rows, contentTypeEditFieldRow{
+			ID:        id,
+			Name:      name,
+			TypeValue: typeValue,
+			Types:     fieldTypeOptions(typeValue),
+		})
+		if name == "" {
+			continue
+		}
+		edits = append(edits, store.FieldEdit{ID: id, Name: name, Type: schema.FieldType(typeValue)})
+	}
+	confirmed := make([]string, 0, len(r.PostForm["confirm_remove"]))
+	for _, c := range r.PostForm["confirm_remove"] {
+		confirmed = append(confirmed, strings.TrimSpace(c))
+	}
+	rows = append(rows, blankContentTypeEditFieldRow())
+	return edits, rows, confirmed, true
+}
+
+// renderContentTypeEdit writes the edit form with the given status.
+func (h *handlers) renderContentTypeEdit(w http.ResponseWriter, r *http.Request, status int, name string, rows []contentTypeEditFieldRow, msg string, pending []string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
+	_ = adminContentTypesEditTmpl.ExecuteTemplate(w, "layout", adminContentTypeEditPage{
+		pageData:        h.page(r, "Editar campos — librarian"),
+		Name:            name,
+		Fields:          rows,
+		Error:           msg,
+		PendingRemovals: pending,
+	})
+}
+
+// blankContentTypeEditFieldRow is one empty row with no identity (⇒ a new
+// field) and the default selector state.
+func blankContentTypeEditFieldRow() contentTypeEditFieldRow {
+	return contentTypeEditFieldRow{
+		TypeValue: string(schema.FieldText),
+		Types:     fieldTypeOptions(string(schema.FieldText)),
+	}
 }
 
 // parseContentTypeForm reads the create form into a definition plus the rows to

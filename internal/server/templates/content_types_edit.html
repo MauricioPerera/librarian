@@ -1,0 +1,39 @@
+{{define "content"}}
+<div class="card form-card">
+  <h1>Editar campos de <code>{{.Name}}</code></h1>
+  {{if .Error}}<p class="error" role="alert">{{.Error}}</p>{{end}}
+  {{if .PendingRemovals}}
+  <div class="error" role="alert" id="data-loss-warning">
+    <p><strong>Atención: esta edición BORRA datos y no se puede deshacer.</strong></p>
+    <p>Se van a perder los datos guardados en {{if eq (len .PendingRemovals) 1}}el campo{{else}}los campos{{end}}:</p>
+    <ul>
+      {{range .PendingRemovals}}<li><code class="removed-field">{{.}}</code></li>{{end}}
+    </ul>
+    <p>Si estás de acuerdo, volvé a enviar el formulario con el botón «Confirmar y aplicar».</p>
+  </div>
+  {{end}}
+  <form method="post" action="/admin/content-types/{{.Name}}" class="form">
+    {{range .PendingRemovals}}<input type="hidden" name="confirm_remove" value="{{.}}">{{end}}
+    <fieldset class="fields-fieldset">
+      <legend>Campos</legend>
+      <div id="content-type-fields">
+        {{range .Fields}}{{template "content_type_edit_field_row" .}}{{end}}
+      </div>
+      <button type="button" class="btn btn-ghost" id="add-field"
+              hx-get="/admin/content-types/edit/field"
+              hx-target="#content-type-fields"
+              hx-swap="beforeend">Agregar campo</button>
+      <p class="muted">
+        Cambiar el nombre de un campo existente lo RENOMBRA y conserva sus datos.
+        Vaciar el nombre de un campo existente lo QUITA y pierde sus datos.
+        Una fila nueva agrega un campo, que queda vacío en el contenido que ya existe.
+        El tipo de un campo existente no se puede cambiar.
+      </p>
+    </fieldset>
+    <div class="form-actions">
+      <button type="submit" class="btn btn-primary">{{if .PendingRemovals}}Confirmar y aplicar{{else}}Guardar cambios{{end}}</button>
+      <a class="btn btn-ghost" href="/admin/content-types">Cancelar</a>
+    </div>
+  </form>
+</div>
+{{end}}

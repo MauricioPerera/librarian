@@ -7,7 +7,7 @@
 <div class="table-scroll">
 <table class="table" id="content-types-table">
   <thead>
-    <tr><th>Nombre</th><th>Campos</th><th>Contenido</th></tr>
+    <tr><th>Nombre</th><th>Campos</th><th>Acciones</th></tr>
   </thead>
   <tbody>
     {{range .Types}}
@@ -17,7 +17,10 @@
         {{if .Fields}}{{range .Fields}}<code>{{.Name}}</code> <span class="muted">({{.Type}})</span> {{end}}
         {{else}}<span class="muted">sin campos propios</span>{{end}}
       </td>
-      <td class="cell-actions"><a class="btn btn-ghost" href="/admin/content/{{.Name}}">Ver contenido</a></td>
+      <td class="cell-actions">
+        <a class="btn btn-ghost" href="/admin/content/{{.Name}}">Ver contenido</a>
+        <a class="btn btn-ghost" href="/admin/content-types/{{.Name}}/edit">Editar campos</a>
+      </td>
     </tr>
     {{end}}
   </tbody>
@@ -26,5 +29,5 @@
 {{else}}
 <p class="empty">No hay tipos de contenido dinámicos todavía. <a href="/admin/content-types/new">Creá el primero</a>.</p>
 {{end}}
-<p class="muted">Los campos de un tipo quedan congelados al crearlo: para cambiarlos hay que crear un tipo nuevo.</p>
+<p class="muted">Los campos de un tipo se pueden editar: agregar uno nuevo (queda vacío en el contenido que ya existe) o renombrar uno existente (conserva sus datos). Quitar un campo BORRA sus datos y pide confirmación. El tipo de un campo no se puede cambiar.</p>
 {{end}}

@@ -53,7 +53,23 @@ contra el auto-bloqueo (dejar el sistema sin nadie que pueda administrarlo).
 
 ## 2. Editar campos de un tipo de contenido dinámico (MEDIA)
 
-**Estado:** fuera de alcance por decisión, documentado en
+**Estado:** RESUELTO por CONTRACT-18 (`specs/CONTRACT-18-editar-campos-cpt.md`,
+reporte en `docs/reports/CONTRACT-18-REPORT.md`). Un tipo dinámico ya no es
+crear-solamente: `PUT /content-types/{nombre}` y `/admin/content-types/{nombre}/edit`
+(ambos gateados por `content_types.manage`, sin permiso nuevo) agregan, renombran
+y quitan campos. La tabla real se RECONSTRUYE dentro de UNA transacción
+(crear tabla de paso con la forma nueva → copiar → borrar la original → crearla
+otra vez con el mismo nombre → copiar de vuelta → borrar la de paso), componiendo
+solo operaciones que `compat` ya expresa (`CompileDDL` + `CompileDropTable` de
+v0.2.0): **no** se agregó ningún mecanismo de migración por fuera de `compat`, así
+que la objeción de abajo sigue respetada. Los datos de los campos que sobreviven
+se preservan (el mapeo es por `content_type_fields.id`, no por nombre, así que un
+renombre cruzado `a`→`b` / `b`→`a` funciona), los `id` de las filas no cambian, y
+quitar un campo exige confirmación explícita campo por campo. Cambiar el TIPO de
+un campo sigue fuera de alcance por la divergencia de casteo entre motores. Se
+conserva el texto de abajo como registro de por qué estuvo abierto tanto tiempo.
+
+**Estado anterior:** fuera de alcance por decisión, documentado en
 `DEFINITION-CPT-DINAMICOS.md`.
 
 `sqlite-postgres-compat` no tiene ningún soporte de `ALTER TABLE` (verificado:
