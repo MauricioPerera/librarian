@@ -34,6 +34,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/MauricioPerera/librarian/internal/dual"
 	"github.com/MauricioPerera/librarian/internal/schema"
 	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
@@ -77,7 +78,7 @@ func SetRolePermissions(ctx context.Context, store *compat.Store, roleName strin
 	defer tx.Rollback()
 
 	var roleID string
-	lookupRole := `SELECT "id" FROM "roles" WHERE "name" = ` + bind(engine, 1)
+	lookupRole := `SELECT "id" FROM "roles" WHERE "name" = ` + dual.Bind(engine, 1)
 	if err := tx.QueryRowContext(ctx, lookupRole, roleName).Scan(&roleID); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("%w %q", ErrRoleNotFound, roleName)
@@ -92,13 +93,13 @@ func SetRolePermissions(ctx context.Context, store *compat.Store, roleName strin
 		return err
 	}
 
-	clear := `DELETE FROM "role_permissions" WHERE "role_id" = ` + bind(engine, 1)
+	clear := `DELETE FROM "role_permissions" WHERE "role_id" = ` + dual.Bind(engine, 1)
 	if _, err := tx.ExecContext(ctx, clear, roleID); err != nil {
 		return fmt.Errorf("clear role permissions: %w", err)
 	}
 	grant := `INSERT INTO "role_permissions" ("role_id", "permission_id") VALUES (` +
-		bind(engine, 1) + `, ` + bind(engine, 2) + `)`
-	for _, pid := range dedupe(permIDs) {
+		dual.Bind(engine, 1) + `, ` + dual.Bind(engine, 2) + `)`
+	for _, pid := range dual.Dedupe(permIDs) {
 		if _, err := tx.ExecContext(ctx, grant, roleID, pid); err != nil {
 			return fmt.Errorf("grant permission: %w", err)
 		}
@@ -111,12 +112,30 @@ func SetRolePermissions(ctx context.Context, store *compat.Store, roleName strin
 
 // RolePermissions returns the permission names currently granted to a role, by
 // role NAME. found is false when the role is not in the catalog (never a raw SQL
-// error), so the caller maps it to a 404. Names are ordered for a stable view —
-// the ORDER BY is declared in the routine, so both engines return the same
-// sequence.
+// error), so the caller maps it to a 404.
+//
+// CONTRACT-20B — THIS is the listing that carried the defect, and it carried it
+// in PRODUCTION, not in a hypothetical. The routine declares
+// `ORDER BY permission_name`, which CONTRACT-19 took to mean both engines return
+// the same sequence. They do not: PostgreSQL orders TEXT by the database
+// COLLATION and SQLite orders it by BYTES, and the FIXED catalog
+// (schema.Permissions) contains `content.update` and `content_types.manage` —
+// the exact pair CONTRACT-20 measured diverging:
+//
+//	SQLite  : content.update , content_types.manage
+//	Postgres: content_types.manage , content.update
+//
+// The `administrator` role of production holds all eight catalog permissions, so
+// the divergent pair is in the database today; it stayed invisible only because
+// the application is still SQLite-only and because the CONTRACT-19 battery's
+// fixtures never granted both names to the same role.
+//
+// The routine's ORDER BY stays as a stable base and the final order is imposed
+// here in Go, by BYTE comparison — engine-independent by construction, and the
+// same sequence SQLite produces today, so nothing production observes changes.
 func RolePermissions(ctx context.Context, store *compat.Store, roleName string) ([]string, bool, error) {
 	roleRows, err := store.QueryRoutine(ctx, authSchema, schema.RoutineRoleIDByName, map[string]compat.Value{
-		"name": textValue(roleName),
+		"name": dual.TextValue(roleName),
 	})
 	if err != nil {
 		return nil, false, fmt.Errorf("lookup role: %w", err)
@@ -125,15 +144,16 @@ func RolePermissions(ctx context.Context, store *compat.Store, roleName string) 
 		return nil, false, nil
 	}
 	rows, err := store.QueryRoutine(ctx, authSchema, schema.RoutineRolePermissionNames, map[string]compat.Value{
-		"role_id": uuidValue(rowText(roleRows[0], "id")),
+		"role_id": dual.UUIDValue(dual.RowText(roleRows[0], "id")),
 	})
 	if err != nil {
 		return nil, false, fmt.Errorf("query role permissions: %w", err)
 	}
 	var names []string
 	for _, row := range rows {
-		names = append(names, rowText(row, "permission_name"))
+		names = append(names, dual.RowText(row, "permission_name"))
 	}
+	dual.SortStrings(names)
 	return names, true, nil
 }
 
@@ -144,8 +164,8 @@ func RolePermissions(ctx context.Context, store *compat.Store, roleName string) 
 // Like roleIDsForNames it stays a raw statement instead of the
 // auth_permission_id_by_name routine, because it must read inside the caller's
 // transaction and QueryRoutine would open its own.
-func permissionIDsForNames(ctx context.Context, tx txQuerier, engine compat.Engine, permissionNames []string) ([]string, error) {
-	statement := `SELECT "id" FROM "permissions" WHERE "name" = ` + bind(engine, 1)
+func permissionIDsForNames(ctx context.Context, tx dual.TxQuerier, engine compat.Engine, permissionNames []string) ([]string, error) {
+	statement := `SELECT "id" FROM "permissions" WHERE "name" = ` + dual.Bind(engine, 1)
 	ids := make([]string, 0, len(permissionNames))
 	for _, name := range permissionNames {
 		var pid string

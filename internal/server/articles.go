@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/MauricioPerera/librarian/internal/dual"
 	"github.com/MauricioPerera/librarian/internal/schema"
 	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
@@ -285,7 +286,7 @@ func (h *handlers) handleDeleteArticle(w http.ResponseWriter, r *http.Request) {
 // surfaces as a raw SQL error.
 func (h *handlers) fetchArticle(r *http.Request, id string) (article, bool, error) {
 	row, found, err := h.queryOne(r.Context(), schema.RoutineArticleByID,
-		map[string]compat.Value{"article_id": uuidValue(id)})
+		map[string]compat.Value{"article_id": dual.UUIDValue(id)})
 	if err != nil || !found {
 		return article{}, false, err
 	}
@@ -342,7 +343,7 @@ func (h *handlers) insertArticleBasic(ctx context.Context, authorID, title, body
 // primary sort key of listArticles and the two engines render CURRENT_TIMESTAMP
 // differently, so leaving it to the DEFAULT would make the LIST ORDER diverge.
 func (h *handlers) insertArticle(ctx context.Context, authorID, title, body string, optional []string, extra []any) (string, error) {
-	id, err := newUUID()
+	id, err := dual.NewUUID()
 	if err != nil {
 		return "", err
 	}
@@ -408,7 +409,7 @@ func (h *handlers) listArticles(ctx context.Context, limit, offset int) ([]artic
 // relation's own columns, so it selects `id`. The answer is identical.
 func (h *handlers) articleExists(ctx context.Context, id string) (bool, error) {
 	_, found, err := h.queryOne(ctx, schema.RoutineArticleExists,
-		map[string]compat.Value{"article_id": uuidValue(id)})
+		map[string]compat.Value{"article_id": dual.UUIDValue(id)})
 	return found, err
 }
 
@@ -419,10 +420,10 @@ func (h *handlers) articleExists(ctx context.Context, id string) (bool, error) {
 func (h *handlers) updateArticleTitleBody(ctx context.Context, id, title, body string) (sql.Result, error) {
 	engine := h.engine()
 	statement := `UPDATE ` + quote("articles") + ` SET ` +
-		quote("title") + ` = ` + bind(engine, 1) + `, ` +
-		quote("body") + ` = ` + bind(engine, 2) + `, ` +
-		quote("updated_at") + ` = ` + bind(engine, 3) +
-		` WHERE ` + quote("id") + ` = ` + bind(engine, 4)
+		quote("title") + ` = ` + dual.Bind(engine, 1) + `, ` +
+		quote("body") + ` = ` + dual.Bind(engine, 2) + `, ` +
+		quote("updated_at") + ` = ` + dual.Bind(engine, 3) +
+		` WHERE ` + quote("id") + ` = ` + dual.Bind(engine, 4)
 	return h.db.ExecContext(ctx, statement, title, body, nowCanonical(), id)
 }
 
@@ -436,11 +437,11 @@ func (h *handlers) updateArticleTitleBody(ctx context.Context, id, title, body s
 func (h *handlers) updateArticleWithEmbedding(ctx context.Context, id, title, body string, embedding any) (sql.Result, error) {
 	engine := h.engine()
 	statement := `UPDATE ` + quote("articles") + ` SET ` +
-		quote("title") + ` = ` + bind(engine, 1) + `, ` +
-		quote("body") + ` = ` + bind(engine, 2) + `, ` +
-		quote("embedding") + ` = ` + bind(engine, 3) + `, ` +
-		quote("updated_at") + ` = ` + bind(engine, 4) +
-		` WHERE ` + quote("id") + ` = ` + bind(engine, 5)
+		quote("title") + ` = ` + dual.Bind(engine, 1) + `, ` +
+		quote("body") + ` = ` + dual.Bind(engine, 2) + `, ` +
+		quote("embedding") + ` = ` + dual.Bind(engine, 3) + `, ` +
+		quote("updated_at") + ` = ` + dual.Bind(engine, 4) +
+		` WHERE ` + quote("id") + ` = ` + dual.Bind(engine, 5)
 	return h.db.ExecContext(ctx, statement, title, body, embedding, nowCanonical(), id)
 }
 
@@ -464,15 +465,15 @@ func (h *handlers) publishArticleByID(ctx context.Context, id string) (published
 	engine := h.engine()
 	stamp := nowCanonical()
 	statement := `UPDATE ` + quote("articles") + ` SET ` +
-		quote("published_at") + ` = ` + bind(engine, 1) + `, ` +
-		quote("updated_at") + ` = ` + bind(engine, 2) +
-		` WHERE ` + quote("id") + ` = ` + bind(engine, 3) +
+		quote("published_at") + ` = ` + dual.Bind(engine, 1) + `, ` +
+		quote("updated_at") + ` = ` + dual.Bind(engine, 2) +
+		` WHERE ` + quote("id") + ` = ` + dual.Bind(engine, 3) +
 		` AND ` + quote("published_at") + ` IS NULL`
 	if _, err := h.db.ExecContext(ctx, statement, stamp, stamp, id); err != nil {
 		return nil, true, err
 	}
 	row, ok, err := h.queryOne(ctx, schema.RoutineArticlePublishedAt,
-		map[string]compat.Value{"article_id": uuidValue(id)})
+		map[string]compat.Value{"article_id": dual.UUIDValue(id)})
 	if err != nil {
 		return nil, true, err
 	}
@@ -486,7 +487,7 @@ func (h *handlers) publishArticleByID(ctx context.Context, id string) (published
 // by the JSON delete route and the admin UI delete button.
 func (h *handlers) deleteArticleByID(ctx context.Context, id string) (int64, error) {
 	engine := h.engine()
-	statement := `DELETE FROM ` + quote("articles") + ` WHERE ` + quote("id") + ` = ` + bind(engine, 1)
+	statement := `DELETE FROM ` + quote("articles") + ` WHERE ` + quote("id") + ` = ` + dual.Bind(engine, 1)
 	res, err := h.db.ExecContext(ctx, statement, id)
 	if err != nil {
 		return 0, err
@@ -504,16 +505,16 @@ func (h *handlers) deleteArticleByID(ctx context.Context, id string) (int64, err
 // never the raw text, exactly as before.
 func articleFromRow(row compat.Row) (article, error) {
 	a := article{
-		ID:          rowText(row, "id"),
-		AuthorID:    rowText(row, "author_id"),
-		Title:       rowText(row, "title"),
-		Body:        rowText(row, "body"),
+		ID:          dual.RowText(row, "id"),
+		AuthorID:    dual.RowText(row, "author_id"),
+		Title:       dual.RowText(row, "title"),
+		Body:        dual.RowText(row, "body"),
 		PublishedAt: rowTextPointer(row, "published_at"),
-		CreatedAt:   rowText(row, "created_at"),
-		UpdatedAt:   rowText(row, "updated_at"),
+		CreatedAt:   dual.RowText(row, "created_at"),
+		UpdatedAt:   dual.RowText(row, "updated_at"),
 	}
-	if !rowIsNull(row, "embedding") {
-		if text := rowText(row, "embedding"); text != "" {
+	if !dual.RowIsNull(row, "embedding") {
+		if text := dual.RowText(row, "embedding"); text != "" {
 			components, err := ParseVector(text)
 			if err != nil {
 				return article{}, err

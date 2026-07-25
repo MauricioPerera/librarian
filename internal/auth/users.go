@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/MauricioPerera/librarian/internal/dual"
 	"github.com/MauricioPerera/librarian/internal/schema"
 	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 	"golang.org/x/crypto/bcrypt"
@@ -103,7 +104,7 @@ func CreateUser(ctx context.Context, store *compat.Store, email, password string
 	if err != nil {
 		return nil, fmt.Errorf("hash password: %w", err)
 	}
-	id, err := newUUID()
+	id, err := dual.NewUUID()
 	if err != nil {
 		return nil, fmt.Errorf("generate user id: %w", err)
 	}
@@ -117,8 +118,8 @@ func CreateUser(ctx context.Context, store *compat.Store, email, password string
 	defer tx.Rollback()
 
 	insertUser := `INSERT INTO "users" ("id", "email", "password_hash", "status", "created_at", "updated_at")` +
-		` VALUES (` + bind(engine, 1) + `, ` + bind(engine, 2) + `, ` + bind(engine, 3) +
-		`, ` + bind(engine, 4) + `, ` + bind(engine, 5) + `, ` + bind(engine, 6) + `)`
+		` VALUES (` + dual.Bind(engine, 1) + `, ` + dual.Bind(engine, 2) + `, ` + dual.Bind(engine, 3) +
+		`, ` + dual.Bind(engine, 4) + `, ` + dual.Bind(engine, 5) + `, ` + dual.Bind(engine, 6) + `)`
 	if _, err := tx.ExecContext(ctx, insertUser, id, email, string(hash), statusActive, timestamp, timestamp); err != nil {
 		return nil, fmt.Errorf("insert user: %w", err)
 	}
@@ -152,7 +153,7 @@ func CreateUser(ctx context.Context, store *compat.Store, email, password string
 // leak this function already avoids for missing emails.
 func VerifyCredentials(ctx context.Context, store *compat.Store, email, password string) (*User, error) {
 	rows, err := store.QueryRoutine(ctx, authSchema, schema.RoutineUserCredentialsByEmail, map[string]compat.Value{
-		"email": textValue(email),
+		"email": dual.TextValue(email),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("query user: %w", err)
@@ -164,9 +165,9 @@ func VerifyCredentials(ctx context.Context, store *compat.Store, email, password
 		_ = bcrypt.CompareHashAndPassword(dummyHash, []byte(password))
 		return nil, ErrInvalidCredentials
 	}
-	id := rowText(rows[0], "id")
-	hash := rowText(rows[0], "password_hash")
-	status := rowText(rows[0], "status")
+	id := dual.RowText(rows[0], "id")
+	hash := dual.RowText(rows[0], "password_hash")
+	status := dual.RowText(rows[0], "status")
 
 	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)); err != nil {
 		return nil, ErrInvalidCredentials
@@ -193,9 +194,21 @@ func VerifyCredentials(ctx context.Context, store *compat.Store, email, password
 // catalog is small and this runs on an admin page, so the per-user query is
 // acceptable and avoids duplicating an aggregation query.
 //
-// The ORDER BY is declared in the routine, not here. email is UNIQUE, so it is a
-// TOTAL order and the two engines return the same SEQUENCE, not merely the same
-// set — the divergence a listing test that only compares contents never sees.
+// The routine's declared ORDER BY (email, which is UNIQUE, so it is TOTAL)
+// provides a stable base, and CONTRACT-20B imposes the FINAL order here, in Go,
+// by BYTE comparison.
+//
+// Declaring the ORDER BY was not enough, and that is the defect this contract
+// fixes: PostgreSQL orders TEXT by the database COLLATION while SQLite orders it
+// by BYTES, so the same declared `ORDER BY email` returns the same rows in a
+// DIFFERENT SEQUENCE on the two engines whenever two emails differ in
+// punctuation or in case — `soporte.web@…` before `soporte_admin@…` on SQLite
+// and after it on PostgreSQL; `Redaccion@…` before `prensa@…` on SQLite and
+// after it on PostgreSQL. Both are addresses an admin can register today.
+// Sorting here is engine-independent by construction, and BYTE comparison
+// specifically because that is what SQLite already does — the order production
+// observes does not change. This listing is not paginated, so re-ordering after
+// the read chooses the whole set rather than reshuffling a page.
 func ListUsers(ctx context.Context, store *compat.Store) ([]UserRecord, error) {
 	rows, err := store.QueryRoutine(ctx, authSchema, schema.RoutineListUsers, nil)
 	if err != nil {
@@ -204,11 +217,12 @@ func ListUsers(ctx context.Context, store *compat.Store) ([]UserRecord, error) {
 	var out []UserRecord
 	for _, row := range rows {
 		out = append(out, UserRecord{
-			ID:     rowText(row, "id"),
-			Email:  rowText(row, "email"),
-			Status: rowText(row, "status"),
+			ID:     dual.RowText(row, "id"),
+			Email:  dual.RowText(row, "email"),
+			Status: dual.RowText(row, "status"),
 		})
 	}
+	dual.SortByKeys(out, func(u UserRecord) []dual.Key { return dual.Ascending(u.Email) })
 	for i := range out {
 		roles, err := rolesForUser(ctx, store, out[i].ID)
 		if err != nil {
@@ -224,7 +238,7 @@ func ListUsers(ctx context.Context, store *compat.Store) ([]UserRecord, error) {
 // caller maps it to a 404; err is non-nil only on a real DB failure.
 func GetUser(ctx context.Context, store *compat.Store, id string) (UserRecord, bool, error) {
 	rows, err := store.QueryRoutine(ctx, authSchema, schema.RoutineUserByID, map[string]compat.Value{
-		"id": uuidValue(id),
+		"id": dual.UUIDValue(id),
 	})
 	if err != nil {
 		return UserRecord{}, false, fmt.Errorf("query user: %w", err)
@@ -233,9 +247,9 @@ func GetUser(ctx context.Context, store *compat.Store, id string) (UserRecord, b
 		return UserRecord{}, false, nil
 	}
 	u := UserRecord{
-		ID:     rowText(rows[0], "id"),
-		Email:  rowText(rows[0], "email"),
-		Status: rowText(rows[0], "status"),
+		ID:     dual.RowText(rows[0], "id"),
+		Email:  dual.RowText(rows[0], "email"),
+		Status: dual.RowText(rows[0], "status"),
 	}
 	roles, err := rolesForUser(ctx, store, u.ID)
 	if err != nil {
@@ -262,7 +276,7 @@ func UpdateUserStatus(ctx context.Context, store *compat.Store, id, status strin
 		return fmt.Errorf("%w %q", ErrInvalidStatus, status)
 	}
 	rows, err := store.QueryRoutine(ctx, authSchema, schema.RoutineUserByID, map[string]compat.Value{
-		"id": uuidValue(id),
+		"id": dual.UUIDValue(id),
 	})
 	if err != nil {
 		return fmt.Errorf("update status: %w", err)
@@ -271,8 +285,8 @@ func UpdateUserStatus(ctx context.Context, store *compat.Store, id, status strin
 		return ErrUserNotFound
 	}
 	if err := store.CallRoutine(ctx, authSchema, schema.RoutineUpdateUserStatus, map[string]compat.Value{
-		"id":         uuidValue(id),
-		"status":     textValue(status),
+		"id":         dual.UUIDValue(id),
+		"status":     dual.TextValue(status),
 		"updated_at": timestampValue(now()),
 	}); err != nil {
 		return fmt.Errorf("update status: %w", err)
@@ -301,7 +315,7 @@ func SetUserRoles(ctx context.Context, store *compat.Store, userID string, roleN
 	defer tx.Rollback()
 
 	var exists string
-	lookupUser := `SELECT "id" FROM "users" WHERE "id" = ` + bind(engine, 1)
+	lookupUser := `SELECT "id" FROM "users" WHERE "id" = ` + dual.Bind(engine, 1)
 	if err := tx.QueryRowContext(ctx, lookupUser, userID).Scan(&exists); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrUserNotFound
@@ -315,7 +329,7 @@ func SetUserRoles(ctx context.Context, store *compat.Store, userID string, roleN
 		return err
 	}
 
-	clear := `DELETE FROM "user_roles" WHERE "user_id" = ` + bind(engine, 1)
+	clear := `DELETE FROM "user_roles" WHERE "user_id" = ` + dual.Bind(engine, 1)
 	if _, err := tx.ExecContext(ctx, clear, userID); err != nil {
 		return fmt.Errorf("clear roles: %w", err)
 	}
@@ -332,10 +346,10 @@ func SetUserRoles(ctx context.Context, store *compat.Store, userID string, roleN
 // a role name repeated by the caller inserts one row instead of colliding with
 // the composite primary key — the behavior `ON CONFLICT DO NOTHING` used to give,
 // obtained here by making the conflict impossible instead of tolerating it.
-func insertUserRoles(ctx context.Context, tx txQuerier, engine compat.Engine, userID string, roleIDs []string) error {
+func insertUserRoles(ctx context.Context, tx dual.TxQuerier, engine compat.Engine, userID string, roleIDs []string) error {
 	assign := `INSERT INTO "user_roles" ("user_id", "role_id") VALUES (` +
-		bind(engine, 1) + `, ` + bind(engine, 2) + `)`
-	for _, rid := range dedupe(roleIDs) {
+		dual.Bind(engine, 1) + `, ` + dual.Bind(engine, 2) + `)`
+	for _, rid := range dual.Dedupe(roleIDs) {
 		if _, err := tx.ExecContext(ctx, assign, userID, rid); err != nil {
 			return fmt.Errorf("assign role: %w", err)
 		}
@@ -360,8 +374,8 @@ func validStatus(s string) bool {
 // purpose: it runs INSIDE the caller's transaction, and QueryRoutine would open
 // its own — the resolve-before-mutate guarantee would then read a catalog
 // outside the transaction that is about to delete and re-insert.
-func roleIDsForNames(ctx context.Context, tx txQuerier, engine compat.Engine, roleNames []string) ([]string, error) {
-	statement := `SELECT "id" FROM "roles" WHERE "name" = ` + bind(engine, 1)
+func roleIDsForNames(ctx context.Context, tx dual.TxQuerier, engine compat.Engine, roleNames []string) ([]string, error) {
+	statement := `SELECT "id" FROM "roles" WHERE "name" = ` + dual.Bind(engine, 1)
 	ids := make([]string, 0, len(roleNames))
 	for _, name := range roleNames {
 		var rid string
@@ -378,18 +392,27 @@ func roleIDsForNames(ctx context.Context, tx txQuerier, engine compat.Engine, ro
 
 // rolesForUser returns the names of the roles assigned to a user, via the
 // user_role_names view (the user_roles → roles JOIN, declared in the canonical
-// schema so compat compiles it for both engines). Names come back ordered, so
-// the two engines agree on the sequence and not only on the set.
+// schema so compat compiles it for both engines).
+//
+// CONTRACT-20B: the routine's declared ORDER BY is a stable base and the final
+// order is imposed here in Go, by BYTE comparison, for the same reason as
+// ListUsers. Measured honestly, this particular listing CANNOT diverge today —
+// schema.Roles is a fixed catalog of four names made of lower-case letters only,
+// where a byte comparison and a collation comparison provably agree — so this
+// call changes nothing observable and is not what fixed the defect. It is here so
+// the guarantee holds by construction rather than by a property of the current
+// catalog: role names are the kind of value a later contract could make editable.
 func rolesForUser(ctx context.Context, store *compat.Store, userID string) ([]string, error) {
 	rows, err := store.QueryRoutine(ctx, authSchema, schema.RoutineUserRoleNames, map[string]compat.Value{
-		"user_id": uuidValue(userID),
+		"user_id": dual.UUIDValue(userID),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("query user roles: %w", err)
 	}
 	var names []string
 	for _, row := range rows {
-		names = append(names, rowText(row, "role_name"))
+		names = append(names, dual.RowText(row, "role_name"))
 	}
+	dual.SortStrings(names)
 	return names, nil
 }

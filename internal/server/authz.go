@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/MauricioPerera/librarian/internal/auth"
+	"github.com/MauricioPerera/librarian/internal/dual"
 	"github.com/MauricioPerera/librarian/internal/schema"
 	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
@@ -205,7 +206,7 @@ func (h *handlers) permissionsForRoles(ctx context.Context, roleNames []string) 
 	// The final order is imposed HERE, not by the engine: permission names carry
 	// `.` and `_`, and PostgreSQL's collation ranks those differently from
 	// SQLite's byte order. See the COLLATION note in dual.go.
-	sortStrings(names)
+	dual.SortStrings(names)
 	return names, nil
 }
 
@@ -216,15 +217,15 @@ func (h *handlers) permissionsForRoles(ctx context.Context, roleNames []string) 
 // hand was already declared there and is simply reused.
 func (h *handlers) permissionsForRoleID(ctx context.Context, roleID string) ([]string, error) {
 	rows, err := h.queryRoutine(ctx, schema.RoutinePermissionsByRoleID,
-		map[string]compat.Value{"role_id": uuidValue(roleID)})
+		map[string]compat.Value{"role_id": dual.UUIDValue(roleID)})
 	if err != nil {
 		return nil, fmt.Errorf("query role permissions: %w", err)
 	}
 	var names []string
 	for _, row := range rows {
-		names = append(names, rowText(row, "permission_name"))
+		names = append(names, dual.RowText(row, "permission_name"))
 	}
-	sortStrings(names)
+	dual.SortStrings(names)
 	return names, nil
 }
 

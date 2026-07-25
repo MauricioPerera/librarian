@@ -59,6 +59,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/MauricioPerera/librarian/internal/dual"
 	"github.com/MauricioPerera/librarian/internal/schema"
 	"github.com/MauricioPerera/librarian/internal/store"
 	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
@@ -157,26 +158,26 @@ func (h *handlers) resolveType(w http.ResponseWriter, r *http.Request) (schema.C
 //     canonical KIND, never from an empty string.
 func rowJSON(row compat.Row, def schema.ContentTypeDefinition) (map[string]any, error) {
 	out := map[string]any{
-		colID:        rowText(row, colID),
-		colAuthorID:  rowText(row, colAuthorID),
-		colCreatedAt: rowText(row, colCreatedAt),
-		colUpdatedAt: rowText(row, colUpdatedAt),
+		colID:        dual.RowText(row, colID),
+		colAuthorID:  dual.RowText(row, colAuthorID),
+		colCreatedAt: dual.RowText(row, colCreatedAt),
+		colUpdatedAt: dual.RowText(row, colUpdatedAt),
 		colMetadata:  nil,
 	}
 	// metadata is the JSON escape column. It is not writable through this
 	// surface; when a row has one (written by another path) it is surfaced as
 	// raw JSON, never as a re-encoded string.
-	if !rowIsNull(row, colMetadata) {
-		if text := strings.TrimSpace(rowText(row, colMetadata)); text != "" {
+	if !dual.RowIsNull(row, colMetadata) {
+		if text := strings.TrimSpace(dual.RowText(row, colMetadata)); text != "" {
 			out[colMetadata] = json.RawMessage(text)
 		}
 	}
 	for _, f := range def.Fields {
-		if rowIsNull(row, f.Name) {
+		if dual.RowIsNull(row, f.Name) {
 			out[f.Name] = nil
 			continue
 		}
-		text := rowText(row, f.Name)
+		text := dual.RowText(row, f.Name)
 		switch f.Type {
 		case schema.FieldText, schema.FieldDate, schema.FieldDecimal:
 			out[f.Name] = text
@@ -517,7 +518,7 @@ func (h *handlers) fetchContentRow(ctx context.Context, def schema.ContentTypeDe
 		return nil, false, err
 	}
 	rows, err := h.store.QueryRoutine(ctx, dyn, schema.DynamicReadRoutine(def),
-		map[string]compat.Value{"row_id": uuidValue(id)})
+		map[string]compat.Value{"row_id": dual.UUIDValue(id)})
 	if err != nil {
 		return nil, false, err
 	}
@@ -547,7 +548,7 @@ func (h *handlers) insertContentRow(ctx context.Context, def schema.ContentTypeD
 	if err != nil {
 		return "", err
 	}
-	id, err := newUUID()
+	id, err := dual.NewUUID()
 	if err != nil {
 		return "", err
 	}
@@ -593,15 +594,15 @@ func (h *handlers) updateContentRow(ctx context.Context, def schema.ContentTypeD
 		if err != nil {
 			return 0, err
 		}
-		assignments = append(assignments, quoted+" = "+bind(engine, position))
+		assignments = append(assignments, quoted+" = "+dual.Bind(engine, position))
 		args = append(args, values[i])
 		position++
 	}
-	assignments = append(assignments, quote(colUpdatedAt)+" = "+bind(engine, position))
+	assignments = append(assignments, quote(colUpdatedAt)+" = "+dual.Bind(engine, position))
 	args = append(args, nowCanonical())
 	position++
 	query := `UPDATE ` + table + ` SET ` + strings.Join(assignments, ", ") +
-		` WHERE ` + quote(colID) + ` = ` + bind(engine, position)
+		` WHERE ` + quote(colID) + ` = ` + dual.Bind(engine, position)
 	args = append(args, id)
 	res, err := h.db.ExecContext(ctx, query, args...)
 	if err != nil {
@@ -618,7 +619,7 @@ func (h *handlers) deleteContentRow(ctx context.Context, def schema.ContentTypeD
 		return 0, err
 	}
 	engine := h.engine()
-	query := `DELETE FROM ` + table + ` WHERE ` + quote(colID) + ` = ` + bind(engine, 1)
+	query := `DELETE FROM ` + table + ` WHERE ` + quote(colID) + ` = ` + dual.Bind(engine, 1)
 	res, err := h.db.ExecContext(ctx, query, id)
 	if err != nil {
 		return 0, err

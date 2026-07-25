@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/MauricioPerera/librarian/internal/dual"
 	"github.com/MauricioPerera/librarian/internal/schema"
 	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
@@ -51,16 +52,16 @@ func MintAPIKey(ctx context.Context, store *compat.Store, label, roleID string) 
 		return "", fmt.Errorf("generate key: %w", err)
 	}
 	keyHash := hashSecret(secret)
-	id, err := newUUID()
+	id, err := dual.NewUUID()
 	if err != nil {
 		return "", fmt.Errorf("generate api key id: %w", err)
 	}
 
 	if err := store.CallRoutine(ctx, authSchema, schema.RoutineInsertAPIKey, map[string]compat.Value{
-		"id":         uuidValue(id),
-		"label":      textValue(label),
-		"key_hash":   textValue(keyHash),
-		"role_id":    uuidValue(roleID),
+		"id":         dual.UUIDValue(id),
+		"label":      dual.TextValue(label),
+		"key_hash":   dual.TextValue(keyHash),
+		"role_id":    dual.UUIDValue(roleID),
 		"created_at": timestampValue(now()),
 	}); err != nil {
 		return "", fmt.Errorf("insert api key: %w", err)
@@ -79,7 +80,7 @@ func MintAPIKey(ctx context.Context, store *compat.Store, label, roleID string) 
 // it, and nothing observable changes.
 func RevokeAPIKey(ctx context.Context, store *compat.Store, secret string) error {
 	if err := store.CallRoutine(ctx, authSchema, schema.RoutineRevokeAPIKeyByHash, map[string]compat.Value{
-		"key_hash":   textValue(hashSecret(secret)),
+		"key_hash":   dual.TextValue(hashSecret(secret)),
 		"revoked_at": timestampValue(now()),
 	}); err != nil {
 		return fmt.Errorf("revoke api key: %w", err)
@@ -97,7 +98,7 @@ func RevokeAPIKey(ctx context.Context, store *compat.Store, secret string) error
 // errors. The id is bound as a parameter, never interpolated.
 func RevokeAPIKeyByID(ctx context.Context, store *compat.Store, id string) error {
 	if err := store.CallRoutine(ctx, authSchema, schema.RoutineRevokeAPIKeyByID, map[string]compat.Value{
-		"id":         uuidValue(id),
+		"id":         dual.UUIDValue(id),
 		"revoked_at": timestampValue(now()),
 	}); err != nil {
 		return fmt.Errorf("revoke api key by id: %w", err)
@@ -124,10 +125,20 @@ type APIKeyRecord struct {
 // per-row lookup). The view never projects key_hash, so the secret's hash cannot
 // leak into the UI even by accident.
 //
-// The ordering (created_at DESC, label) is declared in the routine, so both
-// engines return the same SEQUENCE and not only the same set. The timestamps
-// come back canonicalized to RFC3339Nano by the `timestamp` family declared on
-// the read action, identically on SQLite and PostgreSQL.
+// The ordering (created_at DESC, label ASC) is declared in the routine as a
+// stable base, and CONTRACT-20B imposes the FINAL order here, in Go, by BYTE
+// comparison per key.
+//
+// The declared ORDER BY alone was not enough. `label` is FREE ADMIN TEXT and it
+// is the tie-break key, so it is exactly the sort of value where punctuation and
+// case decide the sequence — and PostgreSQL compares TEXT by the database
+// COLLATION while SQLite compares it by BYTES. Two keys labelled `informes.web`
+// and `informes_anuales`, created in the same instant, come back in opposite
+// order on the two engines. The timestamps themselves come back canonicalized to
+// RFC3339Nano by the `timestamp` family declared on the read action, identically
+// on both engines, so comparing them here as text is comparing the SAME strings.
+// This listing is not paginated, so ordering it after the read chooses the whole
+// set rather than reshuffling a page.
 func ListAPIKeys(ctx context.Context, store *compat.Store) ([]APIKeyRecord, error) {
 	rows, err := store.QueryRoutine(ctx, authSchema, schema.RoutineListAPIKeys, nil)
 	if err != nil {
@@ -137,6 +148,15 @@ func ListAPIKeys(ctx context.Context, store *compat.Store) ([]APIKeyRecord, erro
 	for _, row := range rows {
 		out = append(out, apiKeyRecord(row))
 	}
+	// The id is a THIRD key the routine does not declare, so the order is TOTAL:
+	// label is not unique, and two identically labelled keys created in the same
+	// instant left each engine free to pick its own natural order. Same move
+	// CONTRACT-20 made for its three partial orders. The id is a UUID, whose
+	// hyphens sit at identical offsets in every value, so a byte comparison and a
+	// collation comparison provably agree on it.
+	dual.SortByKeys(out, func(k APIKeyRecord) []dual.Key {
+		return []dual.Key{dual.Desc(k.CreatedAt), dual.Asc(k.Label), dual.Asc(k.ID)}
+	})
 	if len(out) == 0 {
 		return nil, nil
 	}
@@ -150,7 +170,7 @@ func ListAPIKeys(ctx context.Context, store *compat.Store) ([]APIKeyRecord, erro
 // a 500. It is used to re-render the single row fragment after a revoke.
 func GetAPIKey(ctx context.Context, store *compat.Store, id string) (APIKeyRecord, bool, error) {
 	rows, err := store.QueryRoutine(ctx, authSchema, schema.RoutineAPIKeyByID, map[string]compat.Value{
-		"id": uuidValue(id),
+		"id": dual.UUIDValue(id),
 	})
 	if err != nil {
 		return APIKeyRecord{}, false, fmt.Errorf("query api key: %w", err)
@@ -166,14 +186,14 @@ func GetAPIKey(ctx context.Context, store *compat.Store, id string) (APIKeyRecor
 // is tested by the canonical value KIND, not by an empty string.
 func apiKeyRecord(row compat.Row) APIKeyRecord {
 	rec := APIKeyRecord{
-		ID:        rowText(row, "id"),
-		Label:     rowText(row, "label"),
-		RoleName:  rowText(row, "role_name"),
-		CreatedAt: rowText(row, "created_at"),
+		ID:        dual.RowText(row, "id"),
+		Label:     dual.RowText(row, "label"),
+		RoleName:  dual.RowText(row, "role_name"),
+		CreatedAt: dual.RowText(row, "created_at"),
 	}
-	if !rowIsNull(row, "revoked_at") {
+	if !dual.RowIsNull(row, "revoked_at") {
 		rec.Revoked = true
-		rec.RevokedAt = rowText(row, "revoked_at")
+		rec.RevokedAt = dual.RowText(row, "revoked_at")
 	}
 	return rec
 }
@@ -189,7 +209,7 @@ func VerifyAPIKey(ctx context.Context, store *compat.Store, secret string) (*API
 		return nil, ErrAPIKeyRejected
 	}
 	rows, err := store.QueryRoutine(ctx, authSchema, schema.RoutineAPIKeyByHash, map[string]compat.Value{
-		"key_hash": textValue(hashSecret(secret)),
+		"key_hash": dual.TextValue(hashSecret(secret)),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("query api key: %w", err)
@@ -200,13 +220,13 @@ func VerifyAPIKey(ctx context.Context, store *compat.Store, secret string) (*API
 	// revoked_at is a nullable timestamp; a non-NULL value means revoked. The
 	// test is on the canonical NULL kind, which is the same answer on both
 	// engines regardless of how each driver surfaces a null column.
-	if !rowIsNull(rows[0], "revoked_at") {
+	if !dual.RowIsNull(rows[0], "revoked_at") {
 		return nil, ErrAPIKeyRejected
 	}
 	return &APIKey{
-		ID:     rowText(rows[0], "id"),
-		Label:  rowText(rows[0], "label"),
-		RoleID: rowText(rows[0], "role_id"),
+		ID:     dual.RowText(rows[0], "id"),
+		Label:  dual.RowText(rows[0], "label"),
+		RoleID: dual.RowText(rows[0], "role_id"),
 	}, nil
 }
 

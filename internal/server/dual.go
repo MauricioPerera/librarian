@@ -1,10 +1,9 @@
 package server
 
 // CONTRACT-20 — the engine-neutral plumbing every statement in this package now
-// uses. It is the exact counterpart of internal/auth/dual.go (CONTRACT-19); the
-// two files exist separately only because they serve different packages.
+// uses.
 //
-// Before this contract every statement in `server` was hand-written SQL with `?`
+// Before that contract every statement in `server` was hand-written SQL with `?`
 // placeholders, which is SQLite syntax; PostgreSQL's driver requires `$n`. The
 // package now reaches the database through exactly two doors, and NO other:
 //
@@ -26,15 +25,21 @@ package server
 // inside a consumer transaction (insertTerm, updateTerm, setContentTerms).
 // Simulating the row count with a prior read would add a round trip and a race
 // where there is none today, which the contract forbids explicitly.
+//
+// CONTRACT-20B moved everything this file shared verbatim with
+// internal/auth/dual.go — bind, newUUID, rowText, rowIsNull, textValue,
+// uuidValue, dedupe, the txQuerier interface and the byte-wise ordering helpers —
+// to internal/dual. What remains here is what only `server` has: the per-request
+// engine accessor, the bind LIST, identifier quoting, the fixed-width canonical
+// instant its paginated listings depend on, and the routine plumbing bound to
+// this package's schema handle.
 
 import (
 	"context"
-	"crypto/rand"
-	"database/sql"
 	"fmt"
-	"sort"
 	"time"
 
+	"github.com/MauricioPerera/librarian/internal/dual"
 	"github.com/MauricioPerera/librarian/internal/schema"
 	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
@@ -46,27 +51,22 @@ func (h *handlers) engine() compat.Engine {
 	return h.store.Target.Engine
 }
 
-// bind composes the engine's bind marker for the 1-based argument position. It
-// is a thin, local name for compat.Placeholder so a raw statement reads as SQL
-// with holes rather than as string concatenation, and so there is exactly ONE
-// place that knows about `?` vs `$n` — compat's.
-func bind(engine compat.Engine, position int) string {
-	return compat.Placeholder(engine, position)
-}
-
 // bindList composes "p1, p2, ... pn" starting at the given 1-based position, for
 // the two places that need a list: an IN predicate over a variable-size set of
 // role names, and the VALUES list of a dynamic INSERT whose column count is only
 // known at runtime. The caller passes its arguments in exactly this order, which
 // is the contract compat.Placeholder documents (SQLite binds by appearance,
 // PostgreSQL by number; they agree only when the emitted sequence is 1,2,3,…).
+//
+// It stays in this package because no other consumer composes a variable-arity
+// statement — CONTRACT-20B moves only what is genuinely duplicated.
 func bindList(engine compat.Engine, first, count int) string {
 	out := ""
 	for i := 0; i < count; i++ {
 		if i > 0 {
 			out += ", "
 		}
-		out += bind(engine, first+i)
+		out += dual.Bind(engine, first+i)
 	}
 	return out
 }
@@ -85,7 +85,7 @@ func quote(name string) string {
 	return `"` + name + `"`
 }
 
-// now returns the current instant in the canonical timestamp form of the
+// nowCanonical returns the current instant in the canonical timestamp form of the
 // `timestamp` family: RFC3339Nano, UTC, stored as TEXT on BOTH engines.
 //
 // This replaces every CURRENT_TIMESTAMP this package used to write inside an
@@ -119,111 +119,26 @@ func nowCanonical() string {
 // agree. This matters because created_at is the primary sort key of the three
 // PAGINATED listings, where the order decides WHICH ROWS a page contains and
 // cannot be re-sorted after the fact in Go.
+//
+// It is deliberately NOT shared with internal/auth: nothing in `auth` is
+// paginated, every auth listing is ordered in Go over the value compat hands
+// back (which is re-rendered TRIMMED regardless of what was stored), so adopting
+// this layout there would change the stored text of api_keys.created_at — and
+// the sequence production observes — while buying no ordering guarantee at all.
+// See internal/auth/dual.go.
 const canonicalTimestampLayout = "2006-01-02T15:04:05.000000000Z07:00"
 
-// COLLATION — the divergence this contract's battery actually caught, and the
-// reason the helpers below exist.
-//
-// PostgreSQL orders TEXT by the database collation; SQLite orders it by bytes.
-// On a stock PostgreSQL (en_US.utf8) `content_types.manage` sorts BEFORE
-// `content.update`, because the collation gives `.` and `_` no primary weight;
-// on SQLite `content.update` comes first, because `.` (0x2E) < `_` (0x5F). Same
-// rows, different sequence, on the same declared `ORDER BY permission_name`.
-//
-// It cannot be fixed in the schema: expressing it would need `COLLATE "C"` on
-// PostgreSQL and `COLLATE BINARY` on SQLite — different syntax, i.e. exactly the
-// engine-specific SQL this contract removes — and compat's declared routine
-// ORDER BY is a plain column name with no collation to give. So for every
-// listing that is NOT paginated, the routine's ORDER BY provides a stable base
-// and the FINAL order is imposed here, in Go, with plain byte comparison. That
-// is engine-independent by construction: it is the application's order, not the
-// database's opinion of the application's order.
-//
-// The three PAGINATED listings cannot use this (their LIMIT/OFFSET selects rows
-// inside the engine, so re-sorting afterwards would reorder a page rather than
-// choose it). They are safe by a different argument: their keys are created_at,
-// made fixed-width above, and the primary-key UUID, whose hyphens sit at
-// identical offsets in every value — both are shapes for which a collation-aware
-// and a byte-wise comparison provably agree.
-
-// sortStrings orders a slice of strings by BYTE value, in place.
-func sortStrings(values []string) {
-	sort.Slice(values, func(i, j int) bool { return values[i] < values[j] })
-}
-
-// sortByKeys orders items by a sequence of string keys, comparing each key by
-// BYTE value. It is the engine-independent replacement for a multi-column
-// ORDER BY over text.
-func sortByKeys[T any](items []T, keys func(T) []string) {
-	sort.SliceStable(items, func(i, j int) bool {
-		a, b := keys(items[i]), keys(items[j])
-		for k := range a {
-			if a[k] != b[k] {
-				return a[k] < b[k]
-			}
-		}
-		return false
-	})
-}
-
-// newUUID returns a random RFC 4122 v4 UUID in the canonical 8-4-4-4-12 text
-// form, using crypto/rand — the same helper and the same reasoning as
-// internal/auth (CONTRACT-19 decision 3).
-//
-// It replaces every `INSERT ... RETURNING id` in this package. compat
-// deliberately does not implement RETURNING (a consumer that needs a
-// database-generated id passes it in instead), the id column keeps its DEFAULT
-// gen_random_uuid() as a safety net, and the identifier becomes known BEFORE the
-// write rather than after it.
-func newUUID() (string, error) {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "", err
-	}
-	b[6] = (b[6] & 0x0f) | 0x40 // version 4
-	b[8] = (b[8] & 0x3f) | 0x80 // RFC 4122 variant
-	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16]), nil
-}
-
-// value constructors --------------------------------------------------------------
-//
-// A routine argument is a compat.Value: an explicit canonical KIND plus its
-// text. Declaring the kind at the call site is what lets compat bind the value
-// the way the destination engine expects instead of guessing from the Go type.
-
-func textValue(v string) compat.Value {
-	return compat.Value{Kind: compat.TextValue, Value: v}
-}
-
-func uuidValue(v string) compat.Value {
-	return compat.Value{Kind: compat.UUIDValue, Value: v}
-}
-
+// integerValue builds a canonical integer routine argument. It stays local: this
+// is the only package that passes a bound LIMIT/OFFSET to a routine.
 func integerValue(v int) compat.Value {
 	return compat.Value{Kind: compat.IntegerValue, Value: fmt.Sprintf("%d", v)}
 }
 
-// row accessors --------------------------------------------------------------------
-
-// rowText returns the canonical text of a column of a routine result row. A NULL
-// reads as "".
-func rowText(row compat.Row, column string) string {
-	return row[column].Value
-}
-
-// rowIsNull reports whether a column of a routine result row is SQL NULL. It
-// tests the canonical KIND, not the emptiness of the text, so a genuinely empty
-// string is never mistaken for a NULL — the distinction articles.published_at,
-// terms.parent_id and every nullable dynamic field depend on.
-func rowIsNull(row compat.Row, column string) bool {
-	return row[column].Kind == compat.NullValue
-}
-
 // rowTextPointer returns a *string that is nil exactly when the column is NULL.
 // It is the shape the JSON views of this package use for a nullable text/uuid
-// column (article.PublishedAt, term.ParentID).
+// column (article.PublishedAt, term.ParentID), and no other package needs it.
 func rowTextPointer(row compat.Row, column string) *string {
-	if rowIsNull(row, column) {
+	if dual.RowIsNull(row, column) {
 		return nil
 	}
 	v := row[column].Value
@@ -258,11 +173,3 @@ func (h *handlers) queryRoutine(ctx context.Context, routine string, args map[st
 // own schema per request from the persisted definition (content.go), because
 // that is the only place the type's column set is known.
 var serverSchema = schema.Build()
-
-// txQuerier is the subset of *sql.Tx the raw-SQL helpers need, so a helper can
-// be read without caring whether it runs on a transaction or a pool — the term
-// resolvers always run on the caller's transaction.
-type txQuerier interface {
-	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
-	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
-}

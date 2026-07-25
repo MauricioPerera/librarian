@@ -30,6 +30,7 @@ import (
 	"net/http"
 
 	"github.com/MauricioPerera/librarian/internal/auth"
+	"github.com/MauricioPerera/librarian/internal/dual"
 	"github.com/MauricioPerera/librarian/internal/schema"
 	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
@@ -225,9 +226,9 @@ func renderAPIKeyNew(w http.ResponseWriter, status int, data adminAPIKeyNewPage)
 // so the handler maps it to a 400 rather than a 500.
 func (h *handlers) roleIDForName(ctx context.Context, name string) (string, bool, error) {
 	row, found, err := h.queryOne(ctx, schema.RoutineRoleIDByNameServer,
-		map[string]compat.Value{"role_name": textValue(name)})
+		map[string]compat.Value{"role_name": dual.TextValue(name)})
 	if err != nil || !found {
 		return "", false, err
 	}
-	return rowText(row, "id"), true, nil
+	return dual.RowText(row, "id"), true, nil
 }

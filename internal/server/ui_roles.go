@@ -32,6 +32,7 @@ import (
 	"net/http"
 
 	"github.com/MauricioPerera/librarian/internal/auth"
+	"github.com/MauricioPerera/librarian/internal/dual"
 	"github.com/MauricioPerera/librarian/internal/schema"
 	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
@@ -239,11 +240,11 @@ func (h *handlers) actorRoleNames(ctx context.Context, id *Identity) ([]string, 
 		return id.Roles, nil
 	}
 	row, found, err := h.queryOne(ctx, schema.RoutineRoleNameByID,
-		map[string]compat.Value{"role_id": uuidValue(id.RoleID)})
+		map[string]compat.Value{"role_id": dual.UUIDValue(id.RoleID)})
 	if err != nil || !found {
 		return nil, err
 	}
-	return []string{rowText(row, "name")}, nil
+	return []string{dual.RowText(row, "name")}, nil
 }
 
 // lockoutMessage is the guard's user-facing explanation: why it was refused and

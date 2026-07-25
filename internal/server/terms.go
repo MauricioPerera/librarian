@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/MauricioPerera/librarian/internal/dual"
 	"github.com/MauricioPerera/librarian/internal/schema"
 	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
@@ -284,7 +285,7 @@ var errContentNotFound = errors.New("content not found")
 // compat.Placeholder, so it is dual-engine.
 func taxonomyIDForName(ctx context.Context, q queryer, engine compat.Engine, name string) (string, error) {
 	statement := `SELECT ` + quote("id") + ` FROM ` + quote("taxonomies") +
-		` WHERE ` + quote("name") + ` = ` + bind(engine, 1)
+		` WHERE ` + quote("name") + ` = ` + dual.Bind(engine, 1)
 	var id string
 	err := q.QueryRowContext(ctx, statement, name).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -298,13 +299,13 @@ func taxonomyIDForName(ctx context.Context, q queryer, engine compat.Engine, nam
 
 // queryer is the tiny shared surface of *sql.DB and *sql.Tx used by the term
 // helpers so the same resolver works inside or outside a transaction.
-type queryer = txQuerier
+type queryer = dual.TxQuerier
 
 // termExists reports whether a term id is present, inside the caller's
 // transaction. Raw SQL for the same reason taxonomyIDForName is.
 func termExists(ctx context.Context, q queryer, engine compat.Engine, id string) (bool, error) {
 	statement := `SELECT ` + quote("id") + ` FROM ` + quote("terms") +
-		` WHERE ` + quote("id") + ` = ` + bind(engine, 1)
+		` WHERE ` + quote("id") + ` = ` + dual.Bind(engine, 1)
 	var found string
 	err := q.QueryRowContext(ctx, statement, id).Scan(&found)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -338,7 +339,7 @@ func (h *handlers) insertTerm(ctx context.Context, req termBody) (term, error) {
 	// CONTRACT-20: the id is generated here instead of being read back with
 	// RETURNING (compat deliberately has no RETURNING; the column DEFAULT
 	// gen_random_uuid() stays as a safety net for writes not coming from the app).
-	id, err := newUUID()
+	id, err := dual.NewUUID()
 	if err != nil {
 		return term{}, err
 	}
@@ -387,11 +388,11 @@ func (h *handlers) updateTerm(ctx context.Context, id string, req termBody) (ter
 		return term{}, err
 	}
 	statement := `UPDATE ` + quote("terms") + ` SET ` +
-		quote("taxonomy_id") + ` = ` + bind(engine, 1) + `, ` +
-		quote("name") + ` = ` + bind(engine, 2) + `, ` +
-		quote("slug") + ` = ` + bind(engine, 3) + `, ` +
-		quote("parent_id") + ` = ` + bind(engine, 4) +
-		` WHERE ` + quote("id") + ` = ` + bind(engine, 5)
+		quote("taxonomy_id") + ` = ` + dual.Bind(engine, 1) + `, ` +
+		quote("name") + ` = ` + dual.Bind(engine, 2) + `, ` +
+		quote("slug") + ` = ` + dual.Bind(engine, 3) + `, ` +
+		quote("parent_id") + ` = ` + dual.Bind(engine, 4) +
+		` WHERE ` + quote("id") + ` = ` + dual.Bind(engine, 5)
 	_, err = tx.ExecContext(ctx, statement, taxID, req.Name, req.Slug, parent, id)
 	if h.isUniqueSlugViolation(err) {
 		return term{}, errDuplicateSlug
@@ -451,7 +452,7 @@ func (h *handlers) listTerms(ctx context.Context) ([]term, error) {
 	// The final order is imposed HERE, not by the engine. taxonomy/name/slug are
 	// arbitrary user text, and PostgreSQL orders text by the database collation
 	// while SQLite orders it by bytes. See the COLLATION note in dual.go.
-	sortByKeys(out, func(t term) []string { return []string{t.Taxonomy, t.Name, t.Slug} })
+	dual.SortByKeys(out, func(t term) []dual.Key { return dual.Ascending(t.Taxonomy, t.Name, t.Slug) })
 	return out, nil
 }
 
@@ -460,7 +461,7 @@ func (h *handlers) listTerms(ctx context.Context) ([]term, error) {
 // non-UUID simply matches nothing.
 func (h *handlers) fetchTerm(ctx context.Context, id string) (term, bool, error) {
 	row, found, err := h.queryOne(ctx, schema.RoutineTermByID,
-		map[string]compat.Value{"term_id": uuidValue(id)})
+		map[string]compat.Value{"term_id": dual.UUIDValue(id)})
 	if err != nil || !found {
 		return term{}, false, err
 	}
@@ -472,7 +473,7 @@ func (h *handlers) fetchTerm(ctx context.Context, id string) (term, bool, error)
 // here, and simulating it with a prior read would add a round trip and a race.
 func (h *handlers) deleteTermByID(ctx context.Context, id string) (int64, error) {
 	engine := h.engine()
-	statement := `DELETE FROM ` + quote("terms") + ` WHERE ` + quote("id") + ` = ` + bind(engine, 1)
+	statement := `DELETE FROM ` + quote("terms") + ` WHERE ` + quote("id") + ` = ` + dual.Bind(engine, 1)
 	res, err := h.db.ExecContext(ctx, statement, id)
 	if err != nil {
 		return 0, err
@@ -486,10 +487,10 @@ func (h *handlers) deleteTermByID(ctx context.Context, id string) (int64, error)
 // the schema forbids anyway) can never be confused.
 func termFromRow(row compat.Row) term {
 	return term{
-		ID:       rowText(row, "id"),
-		Taxonomy: rowText(row, "taxonomy"),
-		Name:     rowText(row, "name"),
-		Slug:     rowText(row, "slug"),
+		ID:       dual.RowText(row, "id"),
+		Taxonomy: dual.RowText(row, "taxonomy"),
+		Name:     dual.RowText(row, "name"),
+		Slug:     dual.RowText(row, "slug"),
 		ParentID: rowTextPointer(row, "parent_id"),
 	}
 }
@@ -511,7 +512,7 @@ func (h *handlers) setContentTerms(ctx context.Context, contentTable, junction, 
 	engine := h.engine()
 	var exists string
 	existsStatement := `SELECT ` + quote("id") + ` FROM ` + quote(contentTable) +
-		` WHERE ` + quote("id") + ` = ` + bind(engine, 1)
+		` WHERE ` + quote("id") + ` = ` + dual.Bind(engine, 1)
 	if err := tx.QueryRowContext(ctx, existsStatement, contentID).Scan(&exists); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return errContentNotFound
@@ -531,7 +532,7 @@ func (h *handlers) setContentTerms(ctx context.Context, contentTable, junction, 
 	}
 
 	deleteStatement := `DELETE FROM ` + quote(junction) +
-		` WHERE ` + quote(idCol) + ` = ` + bind(engine, 1)
+		` WHERE ` + quote(idCol) + ` = ` + dual.Bind(engine, 1)
 	if _, err := tx.ExecContext(ctx, deleteStatement, contentID); err != nil {
 		return err
 	}
@@ -545,30 +546,12 @@ func (h *handlers) setContentTerms(ctx context.Context, contentTable, junction, 
 	// repeated id produced one row before and produces one row now.
 	insertStatement := `INSERT INTO ` + quote(junction) + ` (` +
 		quote(idCol) + `, ` + quote("term_id") + `) VALUES (` + bindList(engine, 1, 2) + `)`
-	for _, tid := range dedupe(termIDs) {
+	for _, tid := range dual.Dedupe(termIDs) {
 		if _, err := tx.ExecContext(ctx, insertStatement, contentID, tid); err != nil {
 			return err
 		}
 	}
 	return tx.Commit()
-}
-
-// dedupe returns ids without repetitions, preserving first-appearance order. See
-// setContentTerms for why it replaces ON CONFLICT DO NOTHING.
-func dedupe(ids []string) []string {
-	if len(ids) < 2 {
-		return ids
-	}
-	seen := make(map[string]struct{}, len(ids))
-	out := make([]string, 0, len(ids))
-	for _, id := range ids {
-		if _, exists := seen[id]; exists {
-			continue
-		}
-		seen[id] = struct{}{}
-		out = append(out, id)
-	}
-	return out
 }
 
 // assignedTermsFor returns the terms assigned to a piece of content.
@@ -588,19 +571,19 @@ func (h *handlers) assignedTermsFor(ctx context.Context, junction, idCol, conten
 		routine = schema.RoutineProductAssignedTerm
 	}
 	rows, err := h.queryRoutine(ctx, routine,
-		map[string]compat.Value{"content_id": uuidValue(contentID)})
+		map[string]compat.Value{"content_id": dual.UUIDValue(contentID)})
 	if err != nil {
 		return nil, err
 	}
 	out := make([]assignedTerm, 0, len(rows))
 	for _, row := range rows {
 		out = append(out, assignedTerm{
-			ID:       rowText(row, "term_id"),
-			Name:     rowText(row, "term_name"),
-			Slug:     rowText(row, "term_slug"),
-			Taxonomy: rowText(row, "taxonomy"),
+			ID:       dual.RowText(row, "term_id"),
+			Name:     dual.RowText(row, "term_name"),
+			Slug:     dual.RowText(row, "term_slug"),
+			Taxonomy: dual.RowText(row, "taxonomy"),
 		})
 	}
-	sortByKeys(out, func(a assignedTerm) []string { return []string{a.Taxonomy, a.Name, a.Slug} })
+	dual.SortByKeys(out, func(a assignedTerm) []dual.Key { return dual.Ascending(a.Taxonomy, a.Name, a.Slug) })
 	return out, nil
 }

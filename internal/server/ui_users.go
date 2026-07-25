@@ -36,6 +36,7 @@ import (
 	"net/http"
 
 	"github.com/MauricioPerera/librarian/internal/auth"
+	"github.com/MauricioPerera/librarian/internal/dual"
 	"github.com/MauricioPerera/librarian/internal/schema"
 )
 
@@ -340,13 +341,13 @@ func (h *handlers) rolesWithPermissions(ctx context.Context) ([]rolePermsView, e
 	type roleRow struct{ id, name string }
 	roleRows := make([]roleRow, 0, len(rows))
 	for _, row := range rows {
-		roleRows = append(roleRows, roleRow{id: rowText(row, "id"), name: rowText(row, "name")})
+		roleRows = append(roleRows, roleRow{id: dual.RowText(row, "id"), name: dual.RowText(row, "name")})
 	}
 	// The final order is imposed HERE, not by the engine — see the COLLATION
 	// note in dual.go. Role names happen to be punctuation-free today, so the
 	// two engines already agree on them; sorting in Go keeps that true if a role
 	// is ever added whose name is not.
-	sortByKeys(roleRows, func(r roleRow) []string { return []string{r.name} })
+	dual.SortByKeys(roleRows, func(r roleRow) []dual.Key { return dual.Ascending(r.name) })
 	out := make([]rolePermsView, 0, len(roleRows))
 	for _, rr := range roleRows {
 		perms, err := h.permissionsForRoleID(ctx, rr.id)

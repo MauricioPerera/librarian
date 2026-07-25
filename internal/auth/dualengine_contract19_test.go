@@ -257,6 +257,57 @@ func runAuthScenario(t *testing.T, engine string, st *compat.Store) []string {
 	}
 	tr.add("createUser alpha email=%s roles=%v", alpha.Email, alpha.Roles)
 
+	// --- 1b. CONTRACT-20B: fixtures that CAN diverge --------------------------
+	//
+	// This battery already compared the ORDER of every listing, and it passed
+	// anyway — because its fixtures could not produce a divergent pair. Every
+	// email, label, role and permission it used ranked the same way under a BYTE
+	// comparison (SQLite) and under a COLLATION comparison (PostgreSQL,
+	// en_US.utf8). A comparison test whose data cannot differ proves nothing.
+	//
+	// The pairs below are chosen so the two comparisons provably DISAGREE. The
+	// shape is the one CONTRACT-20 measured on the real catalog
+	// (`content.update` vs `content_types.manage`):
+	//
+	//   * PUNCTUATION: `soporte.web` vs `soporte_admin`. By bytes `.` (0x2E) <
+	//     `_` (0x5F), so `soporte.web` is first. Under en_US.utf8 neither `.` nor
+	//     `_` carries primary weight, so the comparison is `soporteweb…` vs
+	//     `soporteadmin…` and `a` < `w` puts `soporte_admin` first.
+	//   * CASE: `Redaccion` vs `prensa`. By bytes `R` (0x52) < `p` (0x70), so
+	//     `Redaccion` is first. Under en_US.utf8 the primary weight is
+	//     case-insensitive, so `prensa` < `redaccion` and `prensa` is first.
+	//
+	// Both are ordinary values an admin can create today through the real UI.
+	for _, spec := range []struct {
+		email string
+		roles []string
+	}{
+		{"soporte.web@example.com", []string{"editor"}},
+		{"soporte_admin@example.com", []string{"editor"}},
+		{"Redaccion@example.com", []string{"author"}},
+		{"prensa@example.com", []string{"author"}},
+		// The `+` sub-address form, which the contract's red-team asks about
+		// explicitly. `+` (0x2B) is punctuation with no primary weight either, so
+		// it behaves like `.`: by bytes `boletin+news` precedes `boletinalta`
+		// (0x2B < 0x61), under the collation `boletinalta` precedes `boletinnews`.
+		{"boletin+news@example.com", []string{"contributor"}},
+		{"boletinalta@example.com", []string{"contributor"}},
+	} {
+		if _, err := auth.CreateUser(ctx, st, spec.email, "collation-fixture", spec.roles); err != nil {
+			t.Fatalf("[%s] create %s: %v", engine, spec.email, err)
+		}
+	}
+
+	// A user holding the WHOLE role catalog, so the role-name ordering of
+	// rolesForUser is observed on more than one element. The four catalog role
+	// names are pure lower-case letters, so this pair cannot diverge by
+	// construction — it is recorded to document that, not to provoke a failure.
+	quad, err := auth.CreateUser(ctx, st, "todos@example.com", "all-roles", schema.Roles)
+	if err != nil {
+		t.Fatalf("[%s] create todos: %v", engine, err)
+	}
+	tr.add("createUser todos roles=%v", quad.Roles)
+
 	got, err := auth.VerifyCredentials(ctx, st, "alpha@example.com", "s3cret")
 	tr.add("verify alpha correct err=%s email=%s roles=%v", errName(err), userEmail(got), userRoles(got))
 
@@ -278,6 +329,9 @@ func runAuthScenario(t *testing.T, engine string, st *compat.Store) []string {
 	for _, u := range users {
 		tr.add("listUsers row email=%s status=%s roles=%v", u.Email, u.Status, u.Roles)
 	}
+
+	quadRecord, _, err := auth.GetUser(ctx, st, quad.ID)
+	tr.add("getUser todos err=%s roles-order=%v", errName(err), quadRecord.Roles)
 
 	record, found, err := auth.GetUser(ctx, st, alpha.ID)
 	tr.add("getUser alpha found=%t err=%s email=%s status=%s roles=%v",
@@ -334,6 +388,28 @@ func runAuthScenario(t *testing.T, engine string, st *compat.Store) []string {
 		errName(auth.SetRolePermissions(ctx, st, "editor", []string{"content.create", "content.update"})))
 	perms, found, err := auth.RolePermissions(ctx, st, "editor")
 	tr.add("rolePermissions editor found=%t err=%s order=%v", found, errName(err), perms)
+
+	// CONTRACT-20B: the REAL catalog pair. `content.update` and
+	// `content_types.manage` are both in schema.Permissions, and CONTRACT-20
+	// measured them ranking DIFFERENTLY on the two engines with the same declared
+	// `ORDER BY permission_name`:
+	//
+	//	SQLite  : content.update , content_types.manage
+	//	Postgres: content_types.manage , content.update
+	//
+	// This is not an invented case: the `administrator` role in PRODUCTION holds
+	// all eight catalog permissions, so the pair is in the database today.
+	tr.add("setRolePermissions editor collation-pair err=%s",
+		errName(auth.SetRolePermissions(ctx, st, "editor",
+			[]string{"content.update", "content_types.manage"})))
+	perms, _, _ = auth.RolePermissions(ctx, st, "editor")
+	tr.add("rolePermissions editor collation-pair order=%v", perms)
+
+	// The production shape itself: administrator with the WHOLE catalog.
+	tr.add("setRolePermissions administrator-full err=%s",
+		errName(auth.SetRolePermissions(ctx, st, "administrator", schema.Permissions)))
+	perms, _, _ = auth.RolePermissions(ctx, st, "administrator")
+	tr.add("rolePermissions administrator full order=%v", perms)
 
 	tr.add("setRolePermissions replace err=%s",
 		errName(auth.SetRolePermissions(ctx, st, "editor", []string{"terms.manage", "content.publish"})))
@@ -449,6 +525,46 @@ func runAuthScenario(t *testing.T, engine string, st *compat.Store) []string {
 	_, parseErr := time.Parse(time.RFC3339Nano, keys[0].CreatedAt)
 	tr.add("created_at canonical-rfc3339nano=%t", parseErr == nil)
 
+	// --- 6b. CONTRACT-20B: the label tie-break, with a divergent pair ---------
+	//
+	// ListAPIKeys orders by (created_at DESC, label). `label` is free admin text,
+	// so it is exactly the kind of value where punctuation decides the order —
+	// but it only DECIDES anything when created_at ties, and minting two keys
+	// never produces the same nanosecond. The tie is therefore forced here with a
+	// raw UPDATE (a timestamp column is TEXT on both engines), so the SECOND sort
+	// key alone chooses the sequence.
+	//
+	// `informes.web` vs `informes_anuales` is the same shape as the real catalog
+	// pair: by bytes `.` < `_` puts `informes.web` first; under en_US.utf8 the
+	// punctuation has no primary weight, so `informesanuales` < `informesweb` and
+	// `informes_anuales` is first.
+	//
+	// The last two share BOTH keys — same created_at and the same label — which is
+	// the tie the routine's declared order cannot break. Nothing forbids an admin
+	// from labelling two keys the same, and with both sort keys equal each engine
+	// was free to return them in its own natural order. The id (a UUID, whose
+	// hyphens sit at identical offsets in every value, so the two comparisons
+	// provably agree) is added as a third key to make the order TOTAL — the same
+	// move CONTRACT-20 made for its three partial orders.
+	for _, label := range []string{"informes.web", "informes_anuales", "informes.web", "informes.web"} {
+		if _, err := auth.MintAPIKey(ctx, st, label, editorRole); err != nil {
+			t.Fatalf("[%s] mint %s: %v", engine, label, err)
+		}
+	}
+	tie := `UPDATE "api_keys" SET "created_at" = ` + compat.Placeholder(st.Target.Engine, 1) +
+		` WHERE "label" = ` + compat.Placeholder(st.Target.Engine, 2) +
+		` OR "label" = ` + compat.Placeholder(st.Target.Engine, 3)
+	if _, err := st.DB.ExecContext(ctx, tie, "2030-01-01T00:00:00Z", "informes.web", "informes_anuales"); err != nil {
+		t.Fatalf("[%s] force created_at tie: %v", engine, err)
+	}
+	keys, _ = auth.ListAPIKeys(ctx, st)
+	tr.add("listAPIKeys tie-broken-by-label order=%v", labelsWithPrefix(keys, "informes"))
+	tr.add("listAPIKeys full order=%v", keyLabels(keys))
+	// With label ALSO tied, the id decides. The ids themselves are per-run, so
+	// what is recorded is that the sequence is TOTAL: the ids of the equal-label
+	// block come back sorted, which is a property both engines must share.
+	tr.add("listAPIKeys total-order ids-sorted=%t", idsAscending(keys, "informes.web"))
+
 	// --- 7. the user created first is still intact ---------------------------
 	got, err = auth.VerifyCredentials(ctx, st, "zeta@example.com", "correct-horse")
 	tr.add("verify zeta err=%s roles=%v", errName(err), userRoles(got))
@@ -498,6 +614,36 @@ func keyLabels(keys []auth.APIKeyRecord) []string {
 	out := make([]string, 0, len(keys))
 	for _, k := range keys {
 		out = append(out, k.Label)
+	}
+	return out
+}
+
+// idsAscending reports whether the keys carrying exactly the given label come
+// back with their ids in ascending BYTE order — i.e. whether the listing's order
+// is TOTAL once created_at and label have both tied.
+func idsAscending(keys []auth.APIKeyRecord, label string) bool {
+	previous := ""
+	for _, k := range keys {
+		if k.Label != label {
+			continue
+		}
+		if previous != "" && k.ID <= previous {
+			return false
+		}
+		previous = k.ID
+	}
+	return true
+}
+
+// labelsWithPrefix keeps the listing ORDER but narrows the observation to the
+// keys of one CONTRACT-20B fixture group, so the divergence it provokes is
+// readable on its own line.
+func labelsWithPrefix(keys []auth.APIKeyRecord, prefix string) []string {
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		if strings.HasPrefix(k.Label, prefix) {
+			out = append(out, k.Label)
+		}
 	}
 	return out
 }

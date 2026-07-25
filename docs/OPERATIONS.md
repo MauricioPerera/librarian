@@ -401,7 +401,11 @@ el test la mide y la reporta en vez de esconderla.
 
 > **Colación.** PostgreSQL ordena `TEXT` por la colación de la base
 > (típicamente `en_US.utf8`) y SQLite por bytes, así que un `ORDER BY` sobre
-> texto con puntuación NO da la misma secuencia en los dos motores. Los listados
-> no paginados de `internal/server` imponen su orden final en Go; los paginados
-> ordenan por `created_at` (ancho fijo) e `id` (UUID), formas para las que ambas
-> comparaciones coinciden. Ver la nota COLLATION en `internal/server/dual.go`.
+> texto con puntuación o mayúsculas NO da la misma secuencia en los dos motores.
+> Los listados NO paginados imponen su orden final en Go (comparación byte a
+> byte, que es la que SQLite ya hace, así que el orden que ve producción no
+> cambia); los paginados de `internal/server` ordenan por `created_at` (ancho
+> fijo) e `id` (UUID), formas para las que ambas comparaciones coinciden.
+> CONTRACT-20B extendió esto a `internal/auth` —`ListUsers`, `ListAPIKeys`,
+> `RolePermissions` y `rolesForUser`— y consolidó los helpers compartidos en
+> `internal/dual`. Ver la nota COLLATION en `internal/dual/dual.go`.

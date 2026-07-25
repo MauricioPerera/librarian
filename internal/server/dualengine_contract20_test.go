@@ -41,6 +41,7 @@ import (
 	"time"
 
 	"github.com/MauricioPerera/librarian/internal/auth"
+	"github.com/MauricioPerera/librarian/internal/dual"
 	"github.com/MauricioPerera/librarian/internal/schema"
 	"github.com/MauricioPerera/librarian/internal/store"
 	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
@@ -245,7 +246,7 @@ func createDynamicType(t *testing.T, st *compat.Store, def schema.ContentTypeDef
 
 func mustUUID(t *testing.T) string {
 	t.Helper()
-	id, err := newUUID()
+	id, err := dual.NewUUID()
 	if err != nil {
 		t.Fatalf("uuid: %v", err)
 	}

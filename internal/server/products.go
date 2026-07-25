@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/MauricioPerera/librarian/internal/dual"
 	"github.com/MauricioPerera/librarian/internal/schema"
 	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
@@ -299,7 +300,7 @@ func validateDecimalText(s string) (string, bool) {
 // sort key of listProducts and the two engines render CURRENT_TIMESTAMP
 // differently, so leaving it to the engine would make the LIST ORDER diverge.
 func (h *handlers) insertProduct(ctx context.Context, authorID, title, body, price, sku string) (string, error) {
-	id, err := newUUID()
+	id, err := dual.NewUUID()
 	if err != nil {
 		return "", err
 	}
@@ -347,7 +348,7 @@ func (h *handlers) listProducts(ctx context.Context, limit, offset int) ([]produ
 // or malformed id); err is non-nil only on a real DB failure.
 func (h *handlers) fetchProduct(ctx context.Context, id string) (product, bool, error) {
 	row, found, err := h.queryOne(ctx, schema.RoutineProductByID,
-		map[string]compat.Value{"product_id": uuidValue(id)})
+		map[string]compat.Value{"product_id": dual.UUIDValue(id)})
 	if err != nil || !found {
 		return product{}, false, err
 	}
@@ -370,7 +371,7 @@ func (h *handlers) fetchProduct(ctx context.Context, id string) (product, bool, 
 // identical (a row matched, or none did) and nothing observable changes.
 func (h *handlers) productExists(ctx context.Context, id string) (bool, error) {
 	_, found, err := h.queryOne(ctx, schema.RoutineProductExists,
-		map[string]compat.Value{"product_id": uuidValue(id)})
+		map[string]compat.Value{"product_id": dual.UUIDValue(id)})
 	return found, err
 }
 
@@ -381,12 +382,12 @@ func (h *handlers) productExists(ctx context.Context, id string) (bool, error) {
 func (h *handlers) updateProductFields(ctx context.Context, id, title, body, price, sku string) (sql.Result, error) {
 	engine := h.engine()
 	statement := `UPDATE ` + quote("products") + ` SET ` +
-		quote("title") + ` = ` + bind(engine, 1) + `, ` +
-		quote("body") + ` = ` + bind(engine, 2) + `, ` +
-		quote("price") + ` = ` + bind(engine, 3) + `, ` +
-		quote("sku") + ` = ` + bind(engine, 4) + `, ` +
-		quote("updated_at") + ` = ` + bind(engine, 5) +
-		` WHERE ` + quote("id") + ` = ` + bind(engine, 6)
+		quote("title") + ` = ` + dual.Bind(engine, 1) + `, ` +
+		quote("body") + ` = ` + dual.Bind(engine, 2) + `, ` +
+		quote("price") + ` = ` + dual.Bind(engine, 3) + `, ` +
+		quote("sku") + ` = ` + dual.Bind(engine, 4) + `, ` +
+		quote("updated_at") + ` = ` + dual.Bind(engine, 5) +
+		` WHERE ` + quote("id") + ` = ` + dual.Bind(engine, 6)
 	res, err := h.db.ExecContext(ctx, statement, title, body, price, sku, nowCanonical(), id)
 	if h.isUniqueSKUViolation(err) {
 		return nil, errDuplicateSKU
@@ -398,7 +399,7 @@ func (h *handlers) updateProductFields(ctx context.Context, id, title, body, pri
 // for the same reason updateProductFields is.
 func (h *handlers) deleteProductByID(ctx context.Context, id string) (int64, error) {
 	engine := h.engine()
-	statement := `DELETE FROM ` + quote("products") + ` WHERE ` + quote("id") + ` = ` + bind(engine, 1)
+	statement := `DELETE FROM ` + quote("products") + ` WHERE ` + quote("id") + ` = ` + dual.Bind(engine, 1)
 	res, err := h.db.ExecContext(ctx, statement, id)
 	if err != nil {
 		return 0, err
@@ -409,13 +410,13 @@ func (h *handlers) deleteProductByID(ctx context.Context, id string) (int64, err
 // productFromRow maps one canonicalized routine row to the JSON view.
 func productFromRow(row compat.Row) product {
 	return product{
-		ID:        rowText(row, "id"),
-		AuthorID:  rowText(row, "author_id"),
-		Title:     rowText(row, "title"),
-		Body:      rowText(row, "body"),
-		Price:     rowText(row, "price"),
-		SKU:       rowText(row, "sku"),
-		CreatedAt: rowText(row, "created_at"),
-		UpdatedAt: rowText(row, "updated_at"),
+		ID:        dual.RowText(row, "id"),
+		AuthorID:  dual.RowText(row, "author_id"),
+		Title:     dual.RowText(row, "title"),
+		Body:      dual.RowText(row, "body"),
+		Price:     dual.RowText(row, "price"),
+		SKU:       dual.RowText(row, "sku"),
+		CreatedAt: dual.RowText(row, "created_at"),
+		UpdatedAt: dual.RowText(row, "updated_at"),
 	}
 }
