@@ -2,13 +2,29 @@
 
 Runbook reproducible para exportar una instancia real de `librarian` (SQLite
 embebido) a PostgreSQL bajo demanda, usando el CLI `compat` de
-`sqlite-postgres-compat` — sin ventana de corte, sin reescribir la app.
+`sqlite-postgres-compat` — sin reescribir la app.
 
 Este es el camino que un operador usaría de verdad. Los comandos son los
-MISMOS que se ejecutaron y verificaron en CONTRACT-04 T3 (no una versión
-idealizada). La fuente de verdad del esquema es Go (`schema.Build()`); el JSON
-del esquema se **genera** con `librarian --dump-schema`, nunca se mantiene a
-mano.
+MISMOS que se ejecutaron y verificaron en CONTRACT-04 T3 y, sobre la base REAL
+de producción, el 2026-07-25 (no una versión idealizada). La fuente de verdad
+del esquema es Go (`schema.Build()`); el JSON del esquema se **genera** con
+`librarian --dump-schema`, nunca se mantiene a mano.
+
+## Qué garantiza esto — y qué NO
+
+**`librarian` no CORRE sobre PostgreSQL.** libSQL es el motor de la aplicación;
+Postgres es un **destino de exportación bajo demanda**, tal como lo declara
+`DEFINITION.md`. Lo que este runbook garantiza es que el esquema y los datos se
+trasladan sin pérdida y sin reescritura, verificado por digest. Después de
+exportar, el binario sigue hablándole a libSQL. "Migrable" no es "multi-motor".
+
+`compat copy` —el camino de este runbook— es una migración por **snapshot**: se
+exporta un estado y se importa. Las escrituras que ocurran durante la copia no
+viajan. Para migrar sin ventana de corte existe `compat cutover` (captura de
+cambios, drenaje y corte), que **nunca se ejercitó contra `librarian`**: está
+probado en la suite e2e del propio paquete, no con este esquema ni con estos
+datos. Si algún día hace falta, es trabajo nuevo con su propio ensayo contra una
+copia.
 
 ## Fundamento
 
@@ -27,9 +43,13 @@ lo importa en el destino, re-exporta el snapshot del destino y compara digests:
 - El CLI `compat` instalado una sola vez:
 
   ```powershell
-  go install github.com/MauricioPerera/sqlite-postgres-compat/cmd/compat@v0.1.0
+  go install github.com/MauricioPerera/sqlite-postgres-compat/cmd/compat@v0.2.0
   # queda en $env:USERPROFILE\go\bin\compat.exe  (en el PATH de Go)
   ```
+
+  > Usá la MISMA versión que declara el `go.mod` de librarian. Si un tag recién
+  > publicado falla con un 500 de `sum.golang.org`, es propagación del checksum:
+  > reintentá una vez antes de diagnosticar.
 
   > No uses `go run` para medir exit codes de `compat`: en Windows `go run`
   > colapsa cualquier exit≠0 a 1, invalidando la verificación. Corre el
@@ -42,6 +62,38 @@ lo importa en el destino, re-exporta el snapshot del destino y compara digests:
   variable en memoria y siempre se enmascara como `***` al pegar salidas.
 - La instancia SQLite de librarian que se quiere exportar (archivo real con
   datos generados por la app).
+- **La extensión `pgvector` habilitada en el destino.** Ver abajo: no es
+  opcional y la auditoría NO te avisa si falta.
+
+### `pgvector` es un prerrequisito duro (y el audit no lo detecta)
+
+`articles.embedding` es una columna `vector(1536)` (CONTRACT-05). En PostgreSQL
+compila a `vector(N)`, que **requiere la extensión `pgvector` en el destino**.
+
+Contra un Postgres sin la extensión, el export falla así:
+
+```json
+{"status":"error","code":"ERR_SNAPSHOT","message":"apply base schema: ERROR: type \"vector\" does not exist (SQLSTATE 42704)"}
+```
+
+**Esto es deliberado, no un bug de `compat`**: el paquete declara la capacidad
+explícitamente en vez de degradarla en silencio a `TEXT` (ver su `AGENTS.md`).
+Pero la consecuencia operativa importa y hay que conocerla: **el paso 3 no lo
+detecta**. `compat audit` devuelve `canonical_vectors: exact` porque es una
+comprobación ESTÁTICA del contrato entre motores, no una sonda del destino. El
+fallo aparece recién en el paso 4, al aplicar el esquema.
+
+Por eso el chequeo va acá, antes de todo lo demás:
+
+```powershell
+psql $env:LIBRARIAN_EXPORT_PG_DSN -c "CREATE EXTENSION IF NOT EXISTS vector;"
+psql $env:LIBRARIAN_EXPORT_PG_DSN -tAc "select extversion from pg_extension where extname='vector'"
+# p.ej. 0.8.5
+```
+
+Si el destino es un PostgreSQL administrado que no ofrece `pgvector`, el export
+**no se puede hacer** tal cual: hay que decidir primero qué pasa con esa
+columna. No lo descubras el día del corte.
 
 ## Paso a paso
 
@@ -137,6 +189,17 @@ Salida esperada (stdout, una línea JSON con un `Finding` por feature, todas
  {"feature":"tables","status":"exact"}]
 ```
 
+Las features son las que `InferFeatures` deriva del esquema, así que la lista
+CRECE con el esquema: desde CONTRACT-05 aparece también `canonical_vectors`
+(`status: exact`). No trates esta lista como fija ni la declares a mano en el
+contrato — `required_features` va vacío y `compat copy` las infiere solo; una
+lista mantenida a mano es una segunda fuente de verdad que se desincroniza.
+
+**`canonical_vectors: exact` no significa que el destino pueda recibirlo.**
+Significa que la capacidad se traduce sin pérdida entre motores. Que el destino
+tenga `pgvector` es un hecho de infraestructura que este paso no mira — ver los
+prerrequisitos.
+
 ### 4. Exportar (`compat copy`)
 
 ```powershell
@@ -174,6 +237,52 @@ PG metadata (canonical) == SQLite metadata (canonical) == {"lang":"es","tags":["
 EXPORT_VERIFY_DONE: PG count=3, published title MATCH, metadata JSON MATCH.
 ```
 
+Para una instancia real (no la fixture), ese test no aplica. Consultá el destino
+a mano, y **mirá estas tres cosas** — son las que un digest verde no distingue
+de un problema:
+
+**a) Las tablas dinámicas y la IDENTIDAD de sus filas.** Son las que más
+transformaciones atravesaron: `CONTRACT-18` reconstruye la tabla entera en cada
+edición de campos.
+
+```powershell
+psql $env:LIBRARIAN_EXPORT_PG_DSN -tAc "select id, created_at from cpt_eventos"
+```
+
+Los `id` y `created_at` tienen que ser **los mismos** que en la origen. Un
+registro con los mismos valores pero identidad nueva es otro registro que se le
+parece, y toda referencia externa a él ya está rota.
+
+**b) El recuento de tablas.** Esperá las del esquema canónico **+1**: `compat`
+crea `__compat_schema`, su propia metadata. (Las otras tres tablas internas del
+paquete —`__compat_change_journal`, `__compat_applied_changes`,
+`__compat_capture_state`— solo aparecen con captura de cambios, que `copy` no
+usa.)
+
+**c) La columna vectorial, CON DATOS.** Este punto existe porque en la ejecución
+real del 2026-07-25 casi se omite: `articles` estaba **vacía** en producción, así
+que el export "pasó" sin haber ejercitado nunca la columna `vector(1536)`. Un
+digest verde sobre una tabla vacía no prueba nada sobre su tipo más delicado.
+
+Si la tabla vectorial está vacía en la origen, cargá una fila de prueba **en una
+copia** antes de exportar, y confirmá en el destino que llegó como tipo NATIVO y
+que es operable:
+
+```powershell
+psql $env:LIBRARIAN_EXPORT_PG_DSN -tAc "select format_type(a.atttypid, a.atttypmod) from pg_attribute a join pg_class c on c.oid = a.attrelid where c.relname='articles' and a.attname='embedding'"
+# esperado: vector(1536)   <- no 'text'
+psql $env:LIBRARIAN_EXPORT_PG_DSN -tAc "select vector_dims(embedding) from articles limit 1"                        # 1536
+psql $env:LIBRARIAN_EXPORT_PG_DSN -tAc "select round((embedding <=> embedding)::numeric, 10) from articles limit 1" # 0
+```
+
+El operador `<=>` corriendo sobre el dato migrado es la prueba de que no es texto
+copiado: es un vector que pgvector entiende.
+
+> Nota de formato, para no reportar un falso positivo: pgvector re-imprime los
+> componentes en su forma canónica (`0.000000` se ve como `0`). No es pérdida —
+> el digest de `compat` compara la forma canónica del portador, y por eso da
+> igual.
+
 ### 6. Limpiar el directorio temporal
 
 ```powershell
@@ -198,6 +307,14 @@ de la gramática canónica (una expresión fuera de la Sección 3, un CHECK no
 determinista con `gen_random_uuid`, un `VIRTUAL` en vez de `STORED`, etc.).
 Corregir `schema.Build()` en Go, regenerar el JSON (paso 2) y re-auditar. No
 reintentar ciegamente: un audit no-exact es un hecho, no un transient.
+
+### `compat copy` falla con `type "vector" does not exist` (`ERR_SNAPSHOT`)
+
+Le falta `pgvector` al destino. **No es un problema de librarian ni de compat**:
+es infraestructura faltante, y la auditoría no podía avisarlo. Ver
+[el prerrequisito](#pgvector-es-un-prerrequisito-duro-y-el-audit-no-lo-detecta),
+habilitá la extensión y re-corré desde el paso 4. No hay nada que corregir en el
+esquema.
 
 ### `compat copy` diverge (`ERR_VERIFY_DIVERGED`)
 
