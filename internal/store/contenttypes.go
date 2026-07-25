@@ -12,11 +12,10 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
-	"strings"
 
+	"github.com/MauricioPerera/librarian/internal/dual"
 	"github.com/MauricioPerera/librarian/internal/schema"
 	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
@@ -33,42 +32,28 @@ var ErrDuplicateContentType = errors.New("content type already exists")
 // with that name exists (→ 404).
 var ErrContentTypeNotFound = errors.New("content type not found")
 
-// FromDB wraps an existing *sql.DB in a compat.Store bound to librarian's
-// SQLite target. compat.Store is a two-field struct ({Target, DB}) with both
-// fields exported, so this is an honest, allocation-only adapter — NOT a second
-// connection: it shares the very same pool (which compat pins to a single
-// connection for the foreign-keys pragma). It exists so the HTTP layer, which
-// only ever carries a *sql.DB, can go through the exact same schema-application
-// path as startup without changing server.Deps or NewMux's signature (the
-// public contract of contracts 01-12 stays untouched).
-func FromDB(db *sql.DB) *compat.Store {
-	return &compat.Store{Target: schema.SQLiteTarget, DB: db}
-}
-
 // registryPresent reports whether the content_types registry table physically
 // exists in the database.
 //
-// This deliberately consults SQLite's own catalog (sqlite_master) and NOT
-// compat's InspectSchema: InspectSchema prefers the __compat_schema metadata
-// row, which is exactly the thing EnsureSchema is about to rewrite. Asking the
-// physical catalog is the only answer that cannot be circular.
+// CONTRACT-21 T1 — ONE OF THE TWO CATALOG PROBES. It used to be a hand-written
+// `SELECT count(*) FROM sqlite_master`, which is not merely non-portable: the
+// relation does not exist on PostgreSQL at all, and PostgreSQL's equivalent
+// (pg_class joined to pg_namespace, restricted to current_schema()) has no
+// SQLite counterpart. That is exactly the shape compat.Store.TableExists exists
+// for, and it is used here instead of a probe of our own.
 //
-// librarian's runtime engine is always SQLite (store.Open → compat.OpenSQLite);
-// any other engine is a programming error and fails loudly rather than silently
-// reporting "no registry" (which would produce an incomplete canonical schema).
+// The reason this place avoids compat's InspectSchema is UNCHANGED and still
+// valid: InspectSchema prefers the __compat_schema metadata row, which is
+// exactly the thing EnsureSchema is about to rewrite, so the metadata cannot
+// also be the oracle. TableExists documents that same property as its own
+// raison d'être ("it asks the engine, not the cache"), so the probe and the
+// reason for the probe now agree by design rather than by comment.
 func registryPresent(ctx context.Context, store *compat.Store) (bool, error) {
-	if store.Target.Engine != compat.SQLite {
-		return false, fmt.Errorf("content-type registry lookup: unsupported engine %q (librarian's runtime engine is SQLite)", store.Target.Engine)
-	}
-	var n int
-	err := store.DB.QueryRowContext(ctx,
-		`SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?`,
-		schema.ContentTypesTable,
-	).Scan(&n)
+	present, err := store.TableExists(ctx, schema.ContentTypesTable)
 	if err != nil {
-		return false, fmt.Errorf("look up %s in sqlite_master: %w", schema.ContentTypesTable, err)
+		return false, fmt.Errorf("look up %s in the engine catalog: %w", schema.ContentTypesTable, err)
 	}
-	return n > 0, nil
+	return present, nil
 }
 
 // LoadContentTypeDefinitions reads every persisted dynamic content-type
@@ -80,8 +65,22 @@ func registryPresent(ctx context.Context, store *compat.Store) (bool, error) {
 // that fails (only possible if the registry was written outside the API) is a
 // HARD ERROR, never a skipped entry: silently dropping a persisted type is what
 // would make the dump — and therefore the export — incomplete.
-func LoadContentTypeDefinitions(ctx context.Context, db *sql.DB) ([]schema.ContentTypeDefinition, error) {
-	rows, err := db.QueryContext(ctx,
+//
+// CONTRACT-21 T1 — WHY THE FINAL ORDER IS IMPOSED IN GO. The statement keeps
+// `ORDER BY t.name, f.ordinal` as a stable base (it is what groups a type's
+// field rows together and puts them in ordinal order — an INTEGER key, which
+// both engines order identically), but the order of the TYPES is re-imposed
+// here, byte-wise, by dual.SortByKeys. The reason is the collation divergence
+// CONTRACT-20 measured: PostgreSQL orders TEXT by the database collation and
+// SQLite by bytes, and a type name may contain `_` (`blog_posts` vs `bloga`
+// sorts differently under the two rules). This order is not cosmetic — it is the
+// order of the tables in the COMPOSED CANONICAL SCHEMA, so it decides the
+// contents of `--dump-schema` and the order ApplySchema creates tables in. Two
+// instances of librarian with the same content types must produce the same
+// canonical schema whichever engine they run on; that is what makes the dumps
+// comparable and the export faithful.
+func LoadContentTypeDefinitions(ctx context.Context, store *compat.Store) ([]schema.ContentTypeDefinition, error) {
+	rows, err := store.DB.QueryContext(ctx,
 		`SELECT t.name, COALESCE(f.name, ''), COALESCE(f.field_type, '')
 		   FROM `+schema.ContentTypesTable+` t
 		   LEFT JOIN `+schema.ContentTypeFieldsTable+` f ON f.content_type_id = t.id
@@ -119,6 +118,9 @@ func LoadContentTypeDefinitions(ctx context.Context, db *sql.DB) ([]schema.Conte
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate content type definitions: %w", err)
 	}
+	dual.SortByKeys(out, func(d schema.ContentTypeDefinition) []dual.Key {
+		return dual.Ascending(d.Name)
+	})
 	for _, d := range out {
 		if err := d.Validate(); err != nil {
 			return nil, fmt.Errorf("persisted content type definition %q is invalid: %w", d.Name, err)
@@ -144,7 +146,7 @@ func LoadDefinitions(ctx context.Context, store *compat.Store) ([]schema.Content
 	if !present {
 		return nil, nil
 	}
-	return LoadContentTypeDefinitions(ctx, store.DB)
+	return LoadContentTypeDefinitions(ctx, store)
 }
 
 // CanonicalSchema returns THE canonical schema of this database: the code
@@ -168,8 +170,8 @@ func CanonicalSchema(ctx context.Context, store *compat.Store) (compat.Schema, e
 // ErrContentTypeNotFound. The name is NOT validated first on purpose: a lookup
 // of a syntactically impossible name simply finds nothing (404), and the value
 // is bound as a parameter, never interpolated.
-func FetchContentType(ctx context.Context, db *sql.DB, name string) (schema.ContentTypeDefinition, error) {
-	defs, err := LoadContentTypeDefinitions(ctx, db)
+func FetchContentType(ctx context.Context, store *compat.Store, name string) (schema.ContentTypeDefinition, error) {
+	defs, err := LoadContentTypeDefinitions(ctx, store)
 	if err != nil {
 		return schema.ContentTypeDefinition{}, err
 	}
@@ -193,9 +195,27 @@ func FetchContentType(ctx context.Context, db *sql.DB, name string) (schema.Cont
 // direction: the table would be invisible to the composed schema and therefore
 // silently excluded from every export, together with its data.
 //
-// HOW: everything happens inside ONE database transaction. SQLite executes DDL
-// transactionally, so the CREATE TABLE, the two INSERTs and the
-// __compat_schema metadata update commit or roll back together. The steps are
+// HOW: everything happens inside ONE database transaction. BOTH engines execute
+// DDL transactionally — SQLite by design, PostgreSQL likewise (it is one of the
+// few engines that do) — so the CREATE TABLE, the two INSERTs and the
+// __compat_schema metadata update commit or roll back together on either one.
+//
+// CONTRACT-21 T1 — WHAT MAKES THE ROLLBACK IDENTICAL ON BOTH ENGINES, and it is
+// not luck. PostgreSQL marks the WHOLE transaction as aborted at the first
+// failing statement: every later statement then fails with 25P02 and only
+// ROLLBACK is accepted. SQLite does not; a failed statement leaves the
+// transaction usable. That divergence is invisible here because this function
+// RETURNS at the first error and the `defer tx.Rollback()` is what runs next —
+// no statement is ever issued after a failure. The two engines therefore reach
+// the same end state by different internal routes. Any future edit that tries to
+// "recover" from a mid-transaction error and continue would break atomicity on
+// PostgreSQL only, and silently: that is why this is written down rather than
+// left as a property of the current control flow.
+//
+// The catalog probe (missingTables → InspectSchema) and the compilation both
+// happen BEFORE the transaction opens. That is deliberate on both engines and
+// load-bearing on SQLite, where compat pins the pool to a single connection, so
+// a query on the pool while a transaction is open would deadlock. The steps are
 // deliberately the SAME machinery EnsureSchema uses — compose, diff against
 // what exists (missingTables), compile with compat.CompileDDL, write the FULL
 // composed metadata — rather than a loose ApplySchema, so there is exactly one
@@ -260,27 +280,60 @@ func CreateContentType(ctx context.Context, store *compat.Store, def schema.Cont
 	}
 
 	// 5. One transaction: definition rows + CREATE TABLE + full metadata.
+	engine := store.Target.Engine
+	// The ids are generated HERE rather than read back with RETURNING, the same
+	// resolution CONTRACT-19 and CONTRACT-20 gave every other insert of this
+	// project: compat deliberately does not implement RETURNING, the columns keep
+	// their DEFAULT gen_random_uuid() as a safety net for writes that do not come
+	// from the application, and — the part that matters for THIS function — the
+	// id of the new type is known BEFORE the write, so the field inserts no longer
+	// depend on a value the previous statement had to hand back.
+	typeID, err := dual.NewUUID()
+	if err != nil {
+		return fmt.Errorf("generate id for content type %q: %w", def.Name, err)
+	}
+
 	tx, err := store.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 
-	var typeID string
-	err = tx.QueryRowContext(ctx,
-		`INSERT INTO `+schema.ContentTypesTable+` (name) VALUES (?) RETURNING id`,
-		def.Name,
-	).Scan(&typeID)
-	if isDuplicateContentTypeViolation(err) {
+	_, err = tx.ExecContext(ctx,
+		`INSERT INTO `+schema.ContentTypesTable+` (id, name, created_at) VALUES (`+
+			dual.Bind(engine, 1)+`, `+dual.Bind(engine, 2)+`, `+dual.Bind(engine, 3)+`)`,
+		typeID, def.Name, dual.Now(),
+	)
+	// CONTRACT-21 T1 — CLASSIFY BY DRIVER CODE, NEVER BY MESSAGE TEXT. This used
+	// to match the string "UNIQUE constraint failed" plus "content_types.name",
+	// which is SQLite's wording; PostgreSQL says "duplicate key value violates
+	// unique constraint" and reports SQLSTATE 23505, so the match would NEVER have
+	// fired there and a duplicate content-type name would have become a raw 500
+	// instead of the clean 400 CONTRACT-13 specified — with nothing failing to
+	// compile. It is the same latent defect CONTRACT-20 found in products.sku and
+	// terms.slug, in the one place that contract could not reach.
+	//
+	// compat.Store.IsUniqueViolation cannot say WHICH constraint was violated
+	// (documented limitation), and content_types carries two: PRIMARY KEY(id) and
+	// UNIQUE(name). Attributing any violation of this INSERT to the name is
+	// sound because the id is a v4 UUID this function generated three lines
+	// above — the same argument products/terms use for their own tables.
+	if store.IsUniqueViolation(err) {
 		return ErrDuplicateContentType
 	}
 	if err != nil {
 		return fmt.Errorf("insert content type %q: %w", def.Name, err)
 	}
 	for i, f := range def.Fields {
+		fieldID, err := dual.NewUUID()
+		if err != nil {
+			return fmt.Errorf("generate id for field %q of content type %q: %w", f.Name, def.Name, err)
+		}
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO `+schema.ContentTypeFieldsTable+` (content_type_id, name, field_type, ordinal) VALUES (?, ?, ?, ?)`,
-			typeID, f.Name, string(f.Type), i,
+			`INSERT INTO `+schema.ContentTypeFieldsTable+` (id, content_type_id, name, field_type, ordinal) VALUES (`+
+				dual.Bind(engine, 1)+`, `+dual.Bind(engine, 2)+`, `+dual.Bind(engine, 3)+`, `+
+				dual.Bind(engine, 4)+`, `+dual.Bind(engine, 5)+`)`,
+			fieldID, typeID, f.Name, string(f.Type), i,
 		); err != nil {
 			return fmt.Errorf("insert field %q of content type %q: %w", f.Name, def.Name, err)
 		}
@@ -293,23 +346,8 @@ func CreateContentType(ctx context.Context, store *compat.Store, def schema.Cont
 	// The FULL composed schema (code + every dynamic type, including the new
 	// one) — never the reduced one — so InspectSchema's canonical-metadata view
 	// stays accurate and the next restart neither loses nor re-creates anything.
-	if err := writeFullSchemaMetadata(ctx, tx, want); err != nil {
+	if err := writeFullSchemaMetadata(ctx, engine, tx, want); err != nil {
 		return fmt.Errorf("record full schema metadata: %w", err)
 	}
 	return tx.Commit()
-}
-
-// isDuplicateContentTypeViolation reports whether err is the UNIQUE(name)
-// constraint failure on content_types. SQLite (modernc driver) phrases it as
-// "UNIQUE constraint failed: content_types.name". Matching the message keeps
-// this dependency-free and is the same technique isUniqueSKUViolation /
-// isUniqueSlugViolation already use. The constraint is the real guarantee; this
-// only turns the DB error into a clean 400.
-func isDuplicateContentTypeViolation(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "UNIQUE constraint failed") &&
-		strings.Contains(msg, schema.ContentTypesTable+".name")
 }

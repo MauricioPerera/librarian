@@ -337,7 +337,7 @@ func TestContract17EnsureSchemaIsIdempotentWithPrefixedTables(t *testing.T) {
 	}
 	before := countTables(t, db)
 
-	if err := store.EnsureSchema(context.Background(), store.FromDB(db)); err != nil {
+	if err := store.EnsureSchema(context.Background(), storeFor(db)); err != nil {
 		t.Fatalf("EnsureSchema after creating a dynamic type: %v", err)
 	}
 	if after := countTables(t, db); after != before {
@@ -347,7 +347,7 @@ func TestContract17EnsureSchemaIsIdempotentWithPrefixedTables(t *testing.T) {
 		t.Fatal("cpt_boletines disappeared across EnsureSchema")
 	}
 	// A second run must be just as quiet.
-	if err := store.EnsureSchema(context.Background(), store.FromDB(db)); err != nil {
+	if err := store.EnsureSchema(context.Background(), storeFor(db)); err != nil {
 		t.Fatalf("second EnsureSchema: %v", err)
 	}
 	t.Logf("RESTART OK: EnsureSchema twice after creating 'boletines'; cpt_boletines intact, %d tables unchanged", before)

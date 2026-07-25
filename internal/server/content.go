@@ -115,7 +115,7 @@ func quoteTable(def schema.ContentTypeDefinition) (string, error) {
 // unknown, malformed or hostile name simply matches no definition and produces
 // a 404 — with no query against any dynamic table ever being built.
 func (h *handlers) resolveType(w http.ResponseWriter, r *http.Request) (schema.ContentTypeDefinition, bool) {
-	def, err := store.FetchContentType(r.Context(), h.db, r.PathValue("type"))
+	def, err := store.FetchContentType(r.Context(), h.store, r.PathValue("type"))
 	switch {
 	case errors.Is(err, store.ErrContentTypeNotFound):
 		writeError(w, http.StatusNotFound, "content type not found")

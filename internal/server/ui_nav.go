@@ -91,7 +91,7 @@ var navSections = []navSection{
 // static sections (including "Tipos de contenido", from which the admin can see
 // the real list) always render.
 func (h *handlers) dynamicNavSections(ctx context.Context) []navSection {
-	defs, err := store.LoadDefinitions(ctx, store.FromDB(h.db))
+	defs, err := store.LoadDefinitions(ctx, h.store)
 	if err != nil {
 		return nil
 	}

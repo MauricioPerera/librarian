@@ -5,10 +5,12 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 
 	"github.com/MauricioPerera/librarian/internal/schema"
 	"github.com/MauricioPerera/librarian/internal/server"
+	"github.com/MauricioPerera/librarian/internal/store"
 	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
 
@@ -26,7 +28,15 @@ func storeFor(db *sql.DB) *compat.Store {
 // {"status":"ok"}. Uses a real httptest server + client (no lingering
 // foreground process).
 func TestHealth(t *testing.T) {
-	mux, err := server.NewMux(server.Deps{JWTSecret: "test-secret"})
+	// CONTRACT-21 T2: Deps carries the *compat.Store (connection AND engine), so
+	// even a route that touches no database needs a store to build the mux —
+	// NewMux no longer has an engine it could assume.
+	sdb, err := store.Open(compat.SQLite, filepath.Join(t.TempDir(), "health.db"))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer sdb.Close()
+	mux, err := server.NewMux(server.Deps{Store: sdb, JWTSecret: "test-secret"})
 	if err != nil {
 		t.Fatalf("NewMux: %v", err)
 	}

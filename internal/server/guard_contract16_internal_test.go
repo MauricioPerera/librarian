@@ -27,7 +27,7 @@ import (
 // guardDB opens a seeded temp database and returns handlers wired to it.
 func guardDB(t *testing.T) (*handlers, *compat.Store, func()) {
 	t.Helper()
-	sdb, err := store.Open(filepath.Join(t.TempDir(), "guard.db"))
+	sdb, err := store.Open(compat.SQLite, filepath.Join(t.TempDir(), "guard.db"))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -35,7 +35,7 @@ func guardDB(t *testing.T) (*handlers, *compat.Store, func()) {
 	if err := store.EnsureSchema(ctx, sdb); err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
-	if err := store.SeedCatalogs(ctx, sdb.DB); err != nil {
+	if err := store.SeedCatalogs(ctx, sdb); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	return &handlers{db: sdb.DB, store: sdb, jwtSecret: "guard-secret"}, sdb, func() { _ = sdb.Close() }

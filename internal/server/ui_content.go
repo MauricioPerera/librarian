@@ -132,7 +132,7 @@ func (h *handlers) registerAdminContentRoutes(mux *http.ServeMux) {
 // page instead of the JSON envelope. It is the ONLY door into every handler
 // below, so no {type} from a request can reach a query unresolved.
 func (h *handlers) resolveTypeUI(w http.ResponseWriter, r *http.Request) (schema.ContentTypeDefinition, bool) {
-	def, err := store.FetchContentType(r.Context(), h.db, r.PathValue("type"))
+	def, err := store.FetchContentType(r.Context(), h.store, r.PathValue("type"))
 	switch {
 	case errors.Is(err, store.ErrContentTypeNotFound):
 		h.renderNotFound(w, r)

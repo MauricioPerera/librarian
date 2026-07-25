@@ -14,38 +14,44 @@ import (
 	"time"
 
 	"github.com/MauricioPerera/librarian/internal/auth"
-	"github.com/MauricioPerera/librarian/internal/schema"
 	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
 
 // Deps carries the runtime dependencies the routes need. JWTSecret must be
 // non-empty — NewMux fails (fail-closed) if it is not, so the server never
-// starts with a default/hardcoded secret. DB is the shared *sql.DB from
-// compat.Store.DB.
+// starts with a default/hardcoded secret.
+//
+// CONTRACT-21 T2 REPLACED `DB *sql.DB` WITH `Store *compat.Store`, and that is
+// the whole point of the change rather than a tidy-up. A *sql.DB cannot say
+// which engine it belongs to, so anyone holding one has to SUPPLY the engine —
+// which is what NewMux used to do, with a literal `schema.SQLiteTarget` written
+// by hand. That line was correct only because librarian had exactly one engine;
+// the moment there are two, a hand-written target is a way to run a PostgreSQL
+// pool while emitting `?` placeholders and compiling SQLite DDL, and it compiles
+// perfectly. Taking the compat.Store — which store.Open builds with the target
+// it opened the connection FROM — makes the mismatch unrepresentable instead of
+// merely discouraged.
 type Deps struct {
-	DB        *sql.DB
+	Store     *compat.Store
 	JWTSecret string
 }
 
 // NewMux returns the librarian HTTP handler wired with the auth routes. It
-// fails if JWTSecret is empty — there is no default secret, by contract.
+// fails if JWTSecret is empty — there is no default secret, by contract — and
+// if Store is nil, since there is no longer any engine it could assume.
 func NewMux(deps Deps) (*http.ServeMux, error) {
 	if deps.JWTSecret == "" {
 		return nil, errors.New("JWT secret must not be empty (set LIBRARIAN_JWT_SECRET)")
 	}
+	if deps.Store == nil {
+		return nil, errors.New("Deps.Store must be the *compat.Store returned by store.Open (connection AND engine)")
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", handleHealth)
 
-	// CONTRACT-19: internal/auth now takes a *compat.Store (connection AND
-	// engine) instead of a bare *sql.DB, because compat.Placeholder /
-	// QueryRoutine / CallRoutine need to know the engine. Deps is deliberately
-	// unchanged and the store is composed here from the handle the server
-	// already receives: librarian still runs on SQLite only — choosing the
-	// engine is CONTRACT-21, and this is the single line that changes when it
-	// arrives.
 	h := &handlers{
-		db:        deps.DB,
-		store:     &compat.Store{Target: schema.SQLiteTarget, DB: deps.DB},
+		db:        deps.Store.DB,
+		store:     deps.Store,
 		jwtSecret: deps.JWTSecret,
 		now:       time.Now,
 	}
@@ -55,10 +61,10 @@ func NewMux(deps Deps) (*http.ServeMux, error) {
 
 // registerRoutes wires every route onto the mux. It is split out of NewMux with
 // NO behavior change so a handlers value built over a DIFFERENT engine can be
-// given the same routes — which is what the CONTRACT-20 dual-engine battery
-// needs to drive the real HTTP surface against PostgreSQL. NewMux remains the
-// only public constructor and still composes the SQLite store; choosing the
-// engine stays CONTRACT-21.
+// given the same routes — which is what the dual-engine batteries need to drive
+// the real HTTP surface against PostgreSQL. Since CONTRACT-21 the production
+// path does the same thing: NewMux is engine-agnostic and takes whichever store
+// the process opened.
 func (h *handlers) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /auth/login", h.handleLogin)
 	mux.HandleFunc("GET /whoami", h.handleWhoami)

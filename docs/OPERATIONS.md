@@ -12,11 +12,17 @@ del esquema es Go (`schema.Build()`); el JSON del esquema se **genera** con
 
 ## Qué garantiza esto — y qué NO
 
-**`librarian` no CORRE sobre PostgreSQL.** libSQL es el motor de la aplicación;
-Postgres es un **destino de exportación bajo demanda**, tal como lo declara
-`DEFINITION.md`. Lo que este runbook garantiza es que el esquema y los datos se
-trasladan sin pérdida y sin reescritura, verificado por digest. Después de
-exportar, el binario sigue hablándole a libSQL. "Migrable" no es "multi-motor".
+> **CAMBIO DE CONTRACT-21.** La frase que abría esta sección —"`librarian` no
+> CORRE sobre PostgreSQL"— **ya no es cierta**. Desde CONTRACT-21 el binario
+> arranca y sirve contra PostgreSQL 17 con `pgvector`, eligiendo el motor por
+> configuración (ver § "Elegir el motor"). Lo que sigue describiendo este
+> runbook es la otra mitad: **mover los DATOS** de una instancia SQLite ya en
+> producción a PostgreSQL. Son cosas distintas y las dos hacen falta —
+> CONTRACT-21 tiene como premisa explícita la **instalación en limpio** y NO
+> implementa ninguna ruta de migración de datos existentes.
+
+Lo que este runbook garantiza es que el esquema y los datos se trasladan sin
+pérdida y sin reescritura, verificado por digest.
 
 `compat copy` —el camino de este runbook— es una migración por **snapshot**: se
 exporta un estado y se importa. Las escrituras que ocurran durante la copia no
@@ -409,3 +415,93 @@ el test la mide y la reporta en vez de esconderla.
 > CONTRACT-20B extendió esto a `internal/auth` —`ListUsers`, `ListAPIKeys`,
 > `RolePermissions` y `rolesForUser`— y consolidó los helpers compartidos en
 > `internal/dual`. Ver la nota COLLATION en `internal/dual/dual.go`.
+
+---
+
+## Elegir el motor (CONTRACT-21)
+
+Desde CONTRACT-21 el binario arranca y sirve sobre **SQLite/libSQL o
+PostgreSQL 17**, y lo decide la configuración. Dos variables, una sola decisión:
+
+| Variable | Valores | Qué hace |
+|---|---|---|
+| `LIBRARIAN_ENGINE` | `sqlite` (por defecto), `postgres` | elige el motor |
+| `LIBRARIAN_DB` | ruta de archivo, o DSN de PostgreSQL | la conexión |
+
+```powershell
+# SQLite — exactamente lo que corre hoy; no hace falta declarar nada
+$env:LIBRARIAN_DB = "/opt/librarian/data/librarian.db"
+
+# PostgreSQL
+$env:LIBRARIAN_ENGINE = "postgres"
+$env:LIBRARIAN_DB     = "postgres://user:***@host:5432/librarian?sslmode=disable"
+```
+
+**La elección es inequívoca y falla cerrada.** Una configuración contradictoria
+NO arranca, y el mensaje dice qué se esperaba. En particular, un `LIBRARIAN_DB`
+que es una URL de PostgreSQL con `LIBRARIAN_ENGINE` sin definir **se rechaza**:
+caer a SQLite ahí crearía un archivo local vacío y el servicio quedaría sano,
+sirviendo de una base vacía, que es el modo de falla que este diseño existe para
+volver imposible.
+
+```
+librarian: LIBRARIAN_DB is a PostgreSQL connection URL but LIBRARIAN_ENGINE is not set
+(which defaults to sqlite): refusing to start on SQLite with a PostgreSQL DSN, because
+that would silently create an empty local database file and serve from it.
+Set LIBRARIAN_ENGINE=postgres, or point LIBRARIAN_DB at a file path
+```
+
+`--dump-schema` usa la MISMA resolución, así que el dump y la instancia nunca
+pueden discrepar sobre qué es este despliegue. `--db` sigue sobrescribiendo solo
+el DSN.
+
+### pgvector es un prerrequisito, no un detalle
+
+El esquema canónico declara `articles.embedding vector(1536)` (CONTRACT-05), así
+que en PostgreSQL **la extensión `pgvector` es obligatoria** y el primer arranque
+de una instalación en limpio falla sin ella — con un mensaje que lo dice:
+
+```
+librarian: the pgvector extension is required on PostgreSQL and its `vector` type is not
+resolvable by this connection: librarian's canonical schema declares articles.embedding as
+vector(1536) (CONTRACT-05), so the schema cannot be created without it.
+Run `CREATE EXTENSION IF NOT EXISTS vector;` in the target database as a superuser, and if it
+is installed into a schema other than the one this connection uses, make that schema visible
+on the connection's search_path
+```
+
+La comprobación es `to_regtype('vector')`, no `pg_extension`: lo que importa no
+es que la extensión esté instalada sino que **esta conexión pueda nombrar el
+tipo**, que es distinto si `pgvector` vive en un esquema fuera del `search_path`.
+
+### Instalación en limpio sobre PostgreSQL
+
+```sql
+CREATE DATABASE librarian;
+\c librarian
+CREATE EXTENSION IF NOT EXISTS vector;   -- requiere superusuario
+```
+
+y arrancar con `LIBRARIAN_ENGINE=postgres`. El binario crea todo el esquema
+(tablas, vistas y metadata) en el primer arranque; el segundo es un no-op.
+
+**La primera identidad se crea fuera de banda**, igual que en SQLite (ver
+`docs/DEPLOY.md` § "Conseguir una identidad"): una superficie que exige una
+identidad no puede ser la que crea la primera. A partir de ahí todo va por HTTP.
+
+## Batería dual-motor de `internal/store` (CONTRACT-21)
+
+```powershell
+$env:COMPAT_POSTGRES_DSN = "postgres://user:***@host:5432/db?sslmode=disable"
+go test -tags dualengine -run TestDualEngineStore -count=1 -v ./internal/store
+```
+
+Es la más importante de las tres: `internal/store` es el único paquete cuyas
+sentencias corren dentro de **transacciones que mezclan DDL, SQL propio y
+metadata**, y su modo de falla no es una respuesta equivocada sino una base a
+medio cambiar. La batería corre el arranque en limpio, la creación y la EDICIÓN
+de un tipo dinámico, y **fuerza fallos a mitad de las dos transacciones** (el
+`DROP TABLE` bloqueado por una FK, y el `INSERT` de metadata contra una tabla
+borrada), comparando el ESTADO de la base después. Los dos motores no se
+comportan igual ante un error dentro de una transacción — PostgreSQL la envenena
+entera (25P02), SQLite no —, así que la igualdad hay que medirla, no suponerla.

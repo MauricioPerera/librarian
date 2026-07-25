@@ -59,6 +59,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/MauricioPerera/librarian/internal/dual"
 	"github.com/MauricioPerera/librarian/internal/schema"
 	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
@@ -194,19 +195,24 @@ func (e UnexpectedConfirmationError) Error() string {
 //
 // The name is bound as a parameter, never interpolated; an unknown name is
 // ErrContentTypeNotFound (→ 404), never an error about SQL.
-func LoadContentTypeFields(ctx context.Context, db *sql.DB, typeName string) (string, []PersistedField, error) {
+// CONTRACT-21 T1: both statements bind through compat's marker for the engine.
+// The ORDER BY key is `ordinal`, an INTEGER, so it needs no Go-side reordering:
+// the collation divergence of CONTRACT-20 is a property of TEXT comparison only,
+// and both engines order integers identically.
+func LoadContentTypeFields(ctx context.Context, store *compat.Store, typeName string) (string, []PersistedField, error) {
+	engine := store.Target.Engine
 	var typeID string
-	err := db.QueryRowContext(ctx,
-		`SELECT id FROM `+schema.ContentTypesTable+` WHERE name = ?`, typeName).Scan(&typeID)
+	err := store.DB.QueryRowContext(ctx,
+		`SELECT id FROM `+schema.ContentTypesTable+` WHERE name = `+dual.Bind(engine, 1), typeName).Scan(&typeID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil, ErrContentTypeNotFound
 	}
 	if err != nil {
 		return "", nil, fmt.Errorf("look up content type %q: %w", typeName, err)
 	}
-	rows, err := db.QueryContext(ctx,
+	rows, err := store.DB.QueryContext(ctx,
 		`SELECT id, name, field_type FROM `+schema.ContentTypeFieldsTable+`
-		  WHERE content_type_id = ? ORDER BY ordinal`, typeID)
+		  WHERE content_type_id = `+dual.Bind(engine, 1)+` ORDER BY ordinal`, typeID)
 	if err != nil {
 		return "", nil, fmt.Errorf("query fields of content type %q: %w", typeName, err)
 	}
@@ -314,7 +320,7 @@ func sameOrder(stored []PersistedField, carried []CarriedField) bool {
 // duplicates are irrelevant). Anything else is refused with DataLossError or
 // UnexpectedConfirmationError before a single statement runs.
 func EditContentType(ctx context.Context, store *compat.Store, typeName string, edits []FieldEdit, confirmedRemovals []string) (ContentTypeEdit, error) {
-	typeID, stored, err := LoadContentTypeFields(ctx, store.DB, typeName)
+	typeID, stored, err := LoadContentTypeFields(ctx, store, typeName)
 	if err != nil {
 		return ContentTypeEdit{}, err
 	}
@@ -356,9 +362,11 @@ func EditContentType(ctx context.Context, store *compat.Store, typeName string, 
 		return ContentTypeEdit{}, err
 	}
 
-	// The two catalog preconditions. Both are consulted on SQLite's OWN catalog
-	// rather than compat's metadata: the metadata is precisely what this
-	// operation rewrites, so it cannot also be the oracle.
+	// The two catalog preconditions. Both are consulted on the ENGINE'S OWN
+	// catalog rather than compat's metadata: the metadata is precisely what this
+	// operation rewrites, so it cannot also be the oracle. They also run BEFORE
+	// the transaction opens — required on SQLite, where compat pins the pool to a
+	// single connection, and correct on both engines.
 	present, err := physicalTableExists(ctx, store, plan.New.TableName())
 	if err != nil {
 		return ContentTypeEdit{}, err
@@ -385,13 +393,13 @@ func EditContentType(ctx context.Context, store *compat.Store, typeName string, 
 			return ContentTypeEdit{}, fmt.Errorf("rebuild table for content type %q: %w", typeName, err)
 		}
 	}
-	if err := applyRegistryEdit(ctx, tx, plan); err != nil {
+	if err := applyRegistryEdit(ctx, store.Target.Engine, tx, plan); err != nil {
 		return ContentTypeEdit{}, err
 	}
 	// The FULL composed schema — the responsibility inherited from not using
 	// compat.Store.DropTable, and the thing InspectSchema prefers over the
 	// physical catalog.
-	if err := writeFullSchemaMetadata(ctx, tx, full); err != nil {
+	if err := writeFullSchemaMetadata(ctx, store.Target.Engine, tx, full); err != nil {
 		return ContentTypeEdit{}, fmt.Errorf("record full schema metadata: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
@@ -434,17 +442,23 @@ func checkConfirmation(removed, confirmed []string) error {
 	return nil
 }
 
-// physicalTableExists asks SQLite's own catalog whether a table exists.
+// physicalTableExists asks the ENGINE'S own catalog whether a table exists.
+//
+// CONTRACT-21 T1 — THE SECOND OF THE TWO CATALOG PROBES, and the same story as
+// registryPresent: a hand-written `sqlite_master` lookup, replaced by
+// compat.Store.TableExists, which is the primitive that exists precisely for
+// this question. Everything the old comment claimed is preserved and now
+// enforced by the primitive rather than by prose: it asks the physical catalog
+// (never __compat_schema, which this operation rewrites), it matches the name
+// byte for byte on both engines, and on PostgreSQL it restricts the lookup to
+// current_schema() — which is exactly where an unqualified CREATE TABLE from
+// this same code lands, so the probe and the DDL agree about "here".
 func physicalTableExists(ctx context.Context, store *compat.Store, name string) (bool, error) {
-	if store.Target.Engine != compat.SQLite {
-		return false, fmt.Errorf("content-type rebuild: unsupported engine %q (librarian's runtime engine is SQLite)", store.Target.Engine)
+	present, err := store.TableExists(ctx, name)
+	if err != nil {
+		return false, fmt.Errorf("look up %q in the engine catalog: %w", name, err)
 	}
-	var n int
-	if err := store.DB.QueryRowContext(ctx,
-		`SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?`, name).Scan(&n); err != nil {
-		return false, fmt.Errorf("look up %q in sqlite_master: %w", name, err)
-	}
-	return n > 0, nil
+	return present, nil
 }
 
 // compileRebuild produces, in order, every statement of the rebuild. It is pure
@@ -572,14 +586,25 @@ func compileRebuild(target compat.Target, plan ContentTypeEdit) ([]string, error
 // update. So every carried row is first parked on a value that provably cannot
 // collide (a name derived from its own uuid; a negative ordinal, which no real
 // field ever has) and only then set to its final value.
-func applyRegistryEdit(ctx context.Context, tx *sql.Tx, plan ContentTypeEdit) error {
+//
+// CONTRACT-21 T1 — THE PARK IS NOW LOAD-BEARING ON BOTH ENGINES, AND MORE SO ON
+// PostgreSQL. PostgreSQL also enforces a UNIQUE index per statement (its
+// constraints are not DEFERRABLE unless declared so, and the canonical schema
+// does not declare them that way), so the same halfway violation happens there.
+// The difference that matters is the consequence: on SQLite the offending
+// statement fails and the transaction survives, while on PostgreSQL the
+// transaction is poisoned and the rebuild — already past its DDL — could only be
+// abandoned. Parking makes the violation unreachable on both, which is why it is
+// kept exactly as it was rather than traded for a deferred-constraint trick that
+// only one engine can express.
+func applyRegistryEdit(ctx context.Context, engine compat.Engine, tx *sql.Tx, plan ContentTypeEdit) error {
 	keep := make(map[string]struct{}, len(plan.Carried))
 	for _, c := range plan.Carried {
 		keep[c.ID] = struct{}{}
 	}
 	// Removals first: their names and ordinals become free for the survivors.
 	rows, err := tx.QueryContext(ctx,
-		`SELECT id FROM `+schema.ContentTypeFieldsTable+` WHERE content_type_id = ?`, plan.TypeID)
+		`SELECT id FROM `+schema.ContentTypeFieldsTable+` WHERE content_type_id = `+dual.Bind(engine, 1), plan.TypeID)
 	if err != nil {
 		return fmt.Errorf("read field ids of content type %q: %w", plan.TypeName, err)
 	}
@@ -599,16 +624,18 @@ func applyRegistryEdit(ctx context.Context, tx *sql.Tx, plan ContentTypeEdit) er
 		return err
 	}
 	rows.Close()
+	deleteField := `DELETE FROM ` + schema.ContentTypeFieldsTable + ` WHERE id = ` + dual.Bind(engine, 1)
 	for _, id := range obsolete {
-		if _, err := tx.ExecContext(ctx,
-			`DELETE FROM `+schema.ContentTypeFieldsTable+` WHERE id = ?`, id); err != nil {
+		if _, err := tx.ExecContext(ctx, deleteField, id); err != nil {
 			return fmt.Errorf("delete removed field of content type %q: %w", plan.TypeName, err)
 		}
 	}
+	setNameOrdinal := `UPDATE ` + schema.ContentTypeFieldsTable +
+		` SET name = ` + dual.Bind(engine, 1) + `, ordinal = ` + dual.Bind(engine, 2) +
+		` WHERE id = ` + dual.Bind(engine, 3)
 	// Phase 1: park every survivor on a collision-free name and ordinal.
 	for i, c := range plan.Carried {
-		if _, err := tx.ExecContext(ctx,
-			`UPDATE `+schema.ContentTypeFieldsTable+` SET name = ?, ordinal = ? WHERE id = ?`,
+		if _, err := tx.ExecContext(ctx, setNameOrdinal,
 			"__parked_"+c.ID, -1-i, c.ID); err != nil {
 			return fmt.Errorf("park field %q of content type %q: %w", c.OldName, plan.TypeName, err)
 		}
@@ -620,8 +647,7 @@ func applyRegistryEdit(ctx context.Context, tx *sql.Tx, plan ContentTypeEdit) er
 		ordinalOf[f.Name] = i
 	}
 	for _, c := range plan.Carried {
-		if _, err := tx.ExecContext(ctx,
-			`UPDATE `+schema.ContentTypeFieldsTable+` SET name = ?, ordinal = ? WHERE id = ?`,
+		if _, err := tx.ExecContext(ctx, setNameOrdinal,
 			c.NewName, ordinalOf[c.NewName], c.ID); err != nil {
 			return fmt.Errorf("rename field %q of content type %q: %w", c.OldName, plan.TypeName, err)
 		}
@@ -632,13 +658,20 @@ func applyRegistryEdit(ctx context.Context, tx *sql.Tx, plan ContentTypeEdit) er
 	for _, c := range plan.Carried {
 		carriedNames[c.NewName] = struct{}{}
 	}
+	insertField := `INSERT INTO ` + schema.ContentTypeFieldsTable +
+		` (id, content_type_id, name, field_type, ordinal) VALUES (` +
+		dual.Bind(engine, 1) + `, ` + dual.Bind(engine, 2) + `, ` + dual.Bind(engine, 3) + `, ` +
+		dual.Bind(engine, 4) + `, ` + dual.Bind(engine, 5) + `)`
 	for i, f := range plan.New.Fields {
 		if _, ok := carriedNames[f.Name]; ok {
 			continue
 		}
-		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO `+schema.ContentTypeFieldsTable+` (content_type_id, name, field_type, ordinal) VALUES (?, ?, ?, ?)`,
-			plan.TypeID, f.Name, string(f.Type), i); err != nil {
+		fieldID, err := dual.NewUUID()
+		if err != nil {
+			return fmt.Errorf("generate id for new field %q of content type %q: %w", f.Name, plan.TypeName, err)
+		}
+		if _, err := tx.ExecContext(ctx, insertField,
+			fieldID, plan.TypeID, f.Name, string(f.Type), i); err != nil {
 			return fmt.Errorf("insert new field %q of content type %q: %w", f.Name, plan.TypeName, err)
 		}
 	}

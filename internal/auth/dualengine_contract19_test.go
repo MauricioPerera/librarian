@@ -88,7 +88,7 @@ func TestDualEngineAuth(t *testing.T) {
 // proves that the real startup path creates the CONTRACT-19 views.
 func openSQLiteEngine(t *testing.T) (*compat.Store, func()) {
 	t.Helper()
-	st, err := store.Open(filepath.Join(t.TempDir(), "dual.db"))
+	st, err := store.Open(compat.SQLite, filepath.Join(t.TempDir(), "dual.db"))
 	if err != nil {
 		t.Fatalf("sqlite open: %v", err)
 	}
@@ -96,7 +96,7 @@ func openSQLiteEngine(t *testing.T) (*compat.Store, func()) {
 	if err := store.EnsureSchema(ctx, st); err != nil {
 		t.Fatalf("sqlite ensure schema: %v", err)
 	}
-	if err := store.SeedCatalogs(ctx, st.DB); err != nil {
+	if err := store.SeedCatalogs(ctx, st); err != nil {
 		t.Fatalf("sqlite seed: %v", err)
 	}
 	return st, func() { _ = st.Close() }
@@ -106,12 +106,13 @@ func openSQLiteEngine(t *testing.T) (*compat.Store, func()) {
 // schema so a run can never collide with leftovers or with another consumer of
 // the same database, and drops it afterwards.
 //
-// The schema is applied with compat's own ApplySchema over schema.Build() — the
-// canonical schema, tables AND views. store.EnsureSchema is not reused here
-// because its metadata upsert (and store.SeedCatalogs) are still SQLite-only
-// statements; migrating internal/store is CONTRACT-21 and is deliberately not
-// anticipated. The catalogs are seeded here with compat.Placeholder, the same
-// primitive internal/auth uses.
+// CONTRACT-21 UPDATE. This used to apply the schema with compat's own
+// ApplySchema and seed the catalogs by hand, because internal/store's metadata
+// upsert and SeedCatalogs were still SQLite-only. They are not any more, so the
+// PostgreSQL side now goes through the SAME PRODUCTION PATH as the SQLite side
+// (store.Open → store.EnsureSchema → store.SeedCatalogs) and this battery gains
+// a second guarantee for free: that librarian's real startup path builds its
+// schema on PostgreSQL.
 func openPostgresEngine(t *testing.T, dsn string) (*compat.Store, func()) {
 	t.Helper()
 	ctx := context.Background()
@@ -126,7 +127,7 @@ func openPostgresEngine(t *testing.T, dsn string) (*compat.Store, func()) {
 		t.Fatalf("create schema: %v", err)
 	}
 
-	scoped, err := compat.OpenPostgres(schema.PostgresVersion, withSearchPath(dsn, schemaName))
+	scoped, err := store.Open(compat.Postgres, withSearchPath(dsn, schemaName))
 	if err != nil {
 		t.Fatalf("postgres open (scoped): %v", err)
 	}
@@ -138,10 +139,12 @@ func openPostgresEngine(t *testing.T, dsn string) (*compat.Store, func()) {
 		t.Fatalf("current_schema() = %q, want %q — the scoped connection is not isolated", current, schemaName)
 	}
 
-	if err := scoped.ApplySchema(ctx, schema.Build()); err != nil {
-		t.Fatalf("postgres apply schema: %v", err)
+	if err := store.EnsureSchema(ctx, scoped); err != nil {
+		t.Fatalf("postgres ensure schema: %v", err)
 	}
-	seedPostgresCatalogs(t, scoped)
+	if err := store.SeedCatalogs(ctx, scoped); err != nil {
+		t.Fatalf("postgres seed: %v", err)
+	}
 
 	return scoped, func() {
 		_ = scoped.Close()
@@ -167,25 +170,6 @@ func withSearchPath(dsn, schemaName string) string {
 		separator = "&"
 	}
 	return dsn + separator + "search_path=" + schemaName + ",public"
-}
-
-// seedPostgresCatalogs inserts the fixed role and permission catalogs on the
-// PostgreSQL side. The id is left to the column DEFAULT gen_random_uuid(), which
-// compat compiles natively for PostgreSQL.
-func seedPostgresCatalogs(t *testing.T, st *compat.Store) {
-	t.Helper()
-	ctx := context.Background()
-	insert := func(table string, names []string) {
-		statement := `INSERT INTO "` + table + `" ("name") VALUES (` + compat.Placeholder(compat.Postgres, 1) + `)`
-		for _, name := range names {
-			if _, err := st.DB.ExecContext(ctx, statement, name); err != nil {
-				t.Fatalf("seed %s %q: %v", table, name, err)
-			}
-		}
-	}
-	insert("roles", schema.Roles)
-	insert("permissions", schema.Permissions)
-	insert("taxonomies", schema.Taxonomies)
 }
 
 // --- the scenario ------------------------------------------------------------

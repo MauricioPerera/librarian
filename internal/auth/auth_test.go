@@ -19,7 +19,7 @@ import (
 func openDB(t *testing.T) (*compat.Store, func()) {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "auth.db")
-	sdb, err := store.Open(dbPath)
+	sdb, err := store.Open(compat.SQLite, dbPath)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -27,7 +27,7 @@ func openDB(t *testing.T) (*compat.Store, func()) {
 	if err := store.EnsureSchema(ctx, sdb); err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
-	if err := store.SeedCatalogs(ctx, sdb.DB); err != nil {
+	if err := store.SeedCatalogs(ctx, sdb); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	return sdb, func() { _ = sdb.Close() }

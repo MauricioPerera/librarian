@@ -42,7 +42,7 @@ func openWithType(t *testing.T, name string) (*compat.Store, string) {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), name)
 	ctx := context.Background()
-	db, err := store.Open(dbPath)
+	db, err := store.Open(compat.SQLite, dbPath)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -50,7 +50,7 @@ func openWithType(t *testing.T, name string) (*compat.Store, string) {
 	if err := store.EnsureSchema(ctx, db); err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
-	if err := store.SeedCatalogs(ctx, db.DB); err != nil {
+	if err := store.SeedCatalogs(ctx, db); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	if err := store.CreateContentType(ctx, db, eventosDef); err != nil {
@@ -138,7 +138,7 @@ func insertEvento(t *testing.T, db *sql.DB, authorID, titulo, lugar string, asis
 }
 
 // fieldIDs maps field name → stored id for a content type.
-func fieldIDs(t *testing.T, db *sql.DB, typeName string) map[string]string {
+func fieldIDs(t *testing.T, db *compat.Store, typeName string) map[string]string {
 	t.Helper()
 	_, fields, err := store.LoadContentTypeFields(context.Background(), db, typeName)
 	if err != nil {
@@ -152,7 +152,7 @@ func fieldIDs(t *testing.T, db *sql.DB, typeName string) map[string]string {
 }
 
 // storedFields returns "name:type:ordinal" triples in ordinal order.
-func storedFields(t *testing.T, db *sql.DB, typeName string) []string {
+func storedFields(t *testing.T, db *compat.Store, typeName string) []string {
 	t.Helper()
 	_, fields, err := store.LoadContentTypeFields(context.Background(), db, typeName)
 	if err != nil {
@@ -192,7 +192,7 @@ func TestEditContentTypeRoundTripWithRealData(t *testing.T) {
 		}
 	}
 
-	ids := fieldIDs(t, db.DB, "eventos")
+	ids := fieldIDs(t, db, "eventos")
 	// One edit that does everything: rename titulo→encabezado, keep asistentes
 	// and gratis (reordered), REMOVE lugar, ADD resumen.
 	edits := []store.FieldEdit{
@@ -268,11 +268,11 @@ func TestEditContentTypeRoundTripWithRealData(t *testing.T) {
 	}
 
 	// --- the registry: renamed row KEPT ITS IDENTITY, ordinals are the new ones ---
-	after := fieldIDs(t, db.DB, "eventos")
+	after := fieldIDs(t, db, "eventos")
 	if after["encabezado"] != ids["titulo"] {
 		t.Fatalf("renamed field lost its identity: id was %s, now %s", ids["titulo"], after["encabezado"])
 	}
-	if got := storedFields(t, db.DB, "eventos"); strings.Join(got, ",") != "encabezado:text,asistentes:integer,gratis:boolean,resumen:text" {
+	if got := storedFields(t, db, "eventos"); strings.Join(got, ",") != "encabezado:text,asistentes:integer,gratis:boolean,resumen:text" {
 		t.Fatalf("registry fields = %v", got)
 	}
 
@@ -293,7 +293,7 @@ func TestEditContentTypeCrossRename(t *testing.T) {
 	ctx := context.Background()
 
 	id := insertEvento(t, db.DB, author, "EL TITULO", "EL LUGAR", 7, true)
-	ids := fieldIDs(t, db.DB, "eventos")
+	ids := fieldIDs(t, db, "eventos")
 
 	edits := []store.FieldEdit{
 		{ID: ids["titulo"], Name: "lugar", Type: schema.FieldText},
@@ -315,11 +315,11 @@ func TestEditContentTypeCrossRename(t *testing.T) {
 		t.Fatalf("CROSS RENAME WRONG: titulo=%q lugar=%q, want titulo=%q lugar=%q", titulo, lugar, "EL LUGAR", "EL TITULO")
 	}
 	// The registry swapped too, keeping both identities.
-	after := fieldIDs(t, db.DB, "eventos")
+	after := fieldIDs(t, db, "eventos")
 	if after["lugar"] != ids["titulo"] || after["titulo"] != ids["lugar"] {
 		t.Fatalf("registry identities not swapped: %v vs %v", after, ids)
 	}
-	if got := storedFields(t, db.DB, "eventos"); strings.Join(got, ",") != "lugar:text,titulo:text,asistentes:integer,gratis:boolean" {
+	if got := storedFields(t, db, "eventos"); strings.Join(got, ",") != "lugar:text,titulo:text,asistentes:integer,gratis:boolean" {
 		t.Fatalf("registry fields after cross rename = %v", got)
 	}
 	t.Logf("CROSS-RENAME OK: values follow identity (titulo=%q, lugar=%q) and both registry rows kept their ids", titulo, lugar)
@@ -344,8 +344,8 @@ func TestEditContentTypeRollbackMidwayFK(t *testing.T) {
 		t.Fatalf("insert referencing row: %v", err)
 	}
 	beforeCols := columnsOf(t, db.DB, "cpt_eventos")
-	beforeFields := storedFields(t, db.DB, "eventos")
-	beforeIDs := fieldIDs(t, db.DB, "eventos")
+	beforeFields := storedFields(t, db, "eventos")
+	beforeIDs := fieldIDs(t, db, "eventos")
 	beforeMeta := metadataColumnsOf(t, db.DB, "cpt_eventos")
 
 	edits := []store.FieldEdit{
@@ -371,10 +371,10 @@ func TestEditContentTypeRollbackMidwayFK(t *testing.T) {
 	if titulo != "Charla" || lugar != "Montevideo" || asistentes != 40 {
 		t.Fatalf("original row damaged: %q/%q/%d", titulo, lugar, asistentes)
 	}
-	if got := storedFields(t, db.DB, "eventos"); strings.Join(got, ",") != strings.Join(beforeFields, ",") {
+	if got := storedFields(t, db, "eventos"); strings.Join(got, ",") != strings.Join(beforeFields, ",") {
 		t.Fatalf("registry changed despite the failure: %v, want %v", got, beforeFields)
 	}
-	if got := fieldIDs(t, db.DB, "eventos"); fmt.Sprint(got) != fmt.Sprint(beforeIDs) {
+	if got := fieldIDs(t, db, "eventos"); fmt.Sprint(got) != fmt.Sprint(beforeIDs) {
 		t.Fatalf("field identities changed despite the failure: %v, want %v", got, beforeIDs)
 	}
 	if got := metadataColumnsOf(t, db.DB, "cpt_eventos"); strings.Join(got, ",") != strings.Join(beforeMeta, ",") {
@@ -396,8 +396,8 @@ func TestEditContentTypeRollbackAtMetadataStep(t *testing.T) {
 
 	id := insertEvento(t, db.DB, author, "Charla", "Montevideo", 40, true)
 	beforeCols := columnsOf(t, db.DB, "cpt_eventos")
-	beforeFields := storedFields(t, db.DB, "eventos")
-	ids := fieldIDs(t, db.DB, "eventos")
+	beforeFields := storedFields(t, db, "eventos")
+	ids := fieldIDs(t, db, "eventos")
 
 	// Induce the failure at step 8 (outside the transaction, so the drop itself
 	// is not rolled back and the write is guaranteed to fail).
@@ -425,10 +425,10 @@ func TestEditContentTypeRollbackAtMetadataStep(t *testing.T) {
 	if err := db.DB.QueryRow(`SELECT titulo FROM "cpt_eventos" WHERE id = ?`, id).Scan(&titulo); err != nil || titulo != "Charla" {
 		t.Fatalf("row lost or damaged: %q (err=%v)", titulo, err)
 	}
-	if got := storedFields(t, db.DB, "eventos"); strings.Join(got, ",") != strings.Join(beforeFields, ",") {
+	if got := storedFields(t, db, "eventos"); strings.Join(got, ",") != strings.Join(beforeFields, ",") {
 		t.Fatalf("registry changed despite the failure: %v, want %v", got, beforeFields)
 	}
-	if got := fieldIDs(t, db.DB, "eventos"); fmt.Sprint(got) != fmt.Sprint(ids) {
+	if got := fieldIDs(t, db, "eventos"); fmt.Sprint(got) != fmt.Sprint(ids) {
 		t.Fatalf("field identities changed despite the failure")
 	}
 	if leftovers := stagingTables(t, db.DB); len(leftovers) != 0 {
@@ -444,14 +444,14 @@ func TestEditContentTypeSurvivesTwoRestarts(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "restart-edit.db")
 	ctx := context.Background()
 
-	db1, err := store.Open(dbPath)
+	db1, err := store.Open(compat.SQLite, dbPath)
 	if err != nil {
 		t.Fatalf("open #1: %v", err)
 	}
 	if err := store.EnsureSchema(ctx, db1); err != nil {
 		t.Fatalf("ensure #1: %v", err)
 	}
-	if err := store.SeedCatalogs(ctx, db1.DB); err != nil {
+	if err := store.SeedCatalogs(ctx, db1); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	if err := store.CreateContentType(ctx, db1, eventosDef); err != nil {
@@ -462,7 +462,7 @@ func TestEditContentTypeSurvivesTwoRestarts(t *testing.T) {
 		t.Fatalf("user: %v", err)
 	}
 	rowID := insertEvento(t, db1.DB, author, "Charla", "Montevideo", 40, true)
-	ids := fieldIDs(t, db1.DB, "eventos")
+	ids := fieldIDs(t, db1, "eventos")
 	if _, err := store.EditContentType(ctx, db1, "eventos", []store.FieldEdit{
 		{ID: ids["titulo"], Name: "encabezado", Type: schema.FieldText},
 		{ID: ids["asistentes"], Name: "asistentes", Type: schema.FieldInteger},
@@ -476,7 +476,7 @@ func TestEditContentTypeSurvivesTwoRestarts(t *testing.T) {
 	}
 
 	for boot := 1; boot <= 2; boot++ {
-		db, err := store.Open(dbPath)
+		db, err := store.Open(compat.SQLite, dbPath)
 		if err != nil {
 			t.Fatalf("open boot #%d: %v", boot, err)
 		}
@@ -512,7 +512,7 @@ func TestEditContentTypeSurvivesTwoRestarts(t *testing.T) {
 		if err := db.DB.QueryRow(`SELECT encabezado FROM "cpt_eventos" WHERE id = ?`, rowID).Scan(&encabezado); err != nil || encabezado != "Charla" {
 			t.Fatalf("boot #%d: row lost (%q, err=%v)", boot, encabezado, err)
 		}
-		if got := storedFields(t, db.DB, "eventos"); strings.Join(got, ",") != "encabezado:text,asistentes:integer,resumen:text" {
+		if got := storedFields(t, db, "eventos"); strings.Join(got, ",") != "encabezado:text,asistentes:integer,resumen:text" {
 			t.Fatalf("boot #%d: registry = %v", boot, got)
 		}
 		if leftovers := stagingTables(t, db.DB); len(leftovers) != 0 {
@@ -532,7 +532,7 @@ func TestEditContentTypeDumpSchemaReflectsNewShape(t *testing.T) {
 	db, _ := openWithType(t, "dump-edit.db")
 	ctx := context.Background()
 
-	ids := fieldIDs(t, db.DB, "eventos")
+	ids := fieldIDs(t, db, "eventos")
 	if _, err := store.EditContentType(ctx, db, "eventos", []store.FieldEdit{
 		{ID: ids["titulo"], Name: "encabezado", Type: schema.FieldText},
 		{Name: "resumen", Type: schema.FieldText},
@@ -576,7 +576,7 @@ func TestEditContentTypeEasyPaths(t *testing.T) {
 	ctx := context.Background()
 
 	// (1) zero rows: pure add.
-	ids := fieldIDs(t, db.DB, "eventos")
+	ids := fieldIDs(t, db, "eventos")
 	all := []store.FieldEdit{
 		{ID: ids["titulo"], Name: "titulo", Type: schema.FieldText},
 		{ID: ids["lugar"], Name: "lugar", Type: schema.FieldText},
@@ -597,7 +597,7 @@ func TestEditContentTypeEasyPaths(t *testing.T) {
 
 	// (2) rows present, edit that removes nothing (rename only).
 	id := insertEvento(t, db.DB, author, "Charla", "Montevideo", 40, true)
-	ids = fieldIDs(t, db.DB, "eventos")
+	ids = fieldIDs(t, db, "eventos")
 	if _, err := store.EditContentType(ctx, db, "eventos", []store.FieldEdit{
 		{ID: ids["titulo"], Name: "encabezado", Type: schema.FieldText},
 		{ID: ids["lugar"], Name: "lugar", Type: schema.FieldText},
@@ -613,7 +613,7 @@ func TestEditContentTypeEasyPaths(t *testing.T) {
 	}
 
 	// (3) the identical definition: a NO-OP that touches nothing.
-	ids = fieldIDs(t, db.DB, "eventos")
+	ids = fieldIDs(t, db, "eventos")
 	before := columnsOf(t, db.DB, "cpt_eventos")
 	plan, err = store.EditContentType(ctx, db, "eventos", []store.FieldEdit{
 		{ID: ids["encabezado"], Name: "encabezado", Type: schema.FieldText},
@@ -631,7 +631,7 @@ func TestEditContentTypeEasyPaths(t *testing.T) {
 	if got := columnsOf(t, db.DB, "cpt_eventos"); strings.Join(got, ",") != strings.Join(before, ",") {
 		t.Fatalf("no-op edit changed the table: %v vs %v", got, before)
 	}
-	if got := fieldIDs(t, db.DB, "eventos"); fmt.Sprint(got) != fmt.Sprint(ids) {
+	if got := fieldIDs(t, db, "eventos"); fmt.Sprint(got) != fmt.Sprint(ids) {
 		t.Fatal("no-op edit changed the field identities")
 	}
 	t.Logf("EASY PATHS OK: zero rows, no-removal edit and identical definition all behave")
@@ -643,9 +643,9 @@ func TestEditContentTypeRejections(t *testing.T) {
 	db, author := openWithType(t, "reject.db")
 	ctx := context.Background()
 	insertEvento(t, db.DB, author, "Charla", "Montevideo", 40, true)
-	ids := fieldIDs(t, db.DB, "eventos")
+	ids := fieldIDs(t, db, "eventos")
 	beforeCols := columnsOf(t, db.DB, "cpt_eventos")
-	beforeFields := storedFields(t, db.DB, "eventos")
+	beforeFields := storedFields(t, db, "eventos")
 
 	keepAll := func(extra ...store.FieldEdit) []store.FieldEdit {
 		base := []store.FieldEdit{
@@ -757,7 +757,7 @@ func TestEditContentTypeRejections(t *testing.T) {
 	if got := columnsOf(t, db.DB, "cpt_eventos"); strings.Join(got, ",") != strings.Join(beforeCols, ",") {
 		t.Fatalf("a rejected edit changed the table: %v, want %v", got, beforeCols)
 	}
-	if got := storedFields(t, db.DB, "eventos"); strings.Join(got, ",") != strings.Join(beforeFields, ",") {
+	if got := storedFields(t, db, "eventos"); strings.Join(got, ",") != strings.Join(beforeFields, ",") {
 		t.Fatalf("a rejected edit changed the registry: %v, want %v", got, beforeFields)
 	}
 	if leftovers := stagingTables(t, db.DB); len(leftovers) != 0 {
@@ -780,7 +780,7 @@ func TestEditContentTypeWithoutItsTable(t *testing.T) {
 	if _, err := db.DB.Exec(`DROP TABLE "cpt_eventos"`); err != nil {
 		t.Fatalf("drop table: %v", err)
 	}
-	ids := fieldIDs(t, db.DB, "eventos")
+	ids := fieldIDs(t, db, "eventos")
 	_, err := store.EditContentType(ctx, db, "eventos", []store.FieldEdit{
 		{ID: ids["titulo"], Name: "titulo", Type: schema.FieldText},
 		{ID: ids["lugar"], Name: "lugar", Type: schema.FieldText},
@@ -803,7 +803,7 @@ func TestEditContentTypeRefusesALeftoverStagingTable(t *testing.T) {
 	if _, err := db.DB.Exec(`CREATE TABLE "` + schema.StagingTableName + `" (x INTEGER)`); err != nil {
 		t.Fatalf("squat staging table: %v", err)
 	}
-	ids := fieldIDs(t, db.DB, "eventos")
+	ids := fieldIDs(t, db, "eventos")
 	_, err := store.EditContentType(ctx, db, "eventos", []store.FieldEdit{
 		{ID: ids["titulo"], Name: "encabezado", Type: schema.FieldText},
 		{ID: ids["lugar"], Name: "lugar", Type: schema.FieldText},
@@ -842,7 +842,7 @@ func TestEditWithManyRowsIsLinearAndComplete(t *testing.T) {
 		t.Fatalf("commit: %v", err)
 	}
 
-	ids := fieldIDs(t, db.DB, "eventos")
+	ids := fieldIDs(t, db, "eventos")
 	if _, err := store.EditContentType(ctx, db, "eventos", []store.FieldEdit{
 		{ID: ids["titulo"], Name: "encabezado", Type: schema.FieldText},
 		{ID: ids["asistentes"], Name: "asistentes", Type: schema.FieldInteger},

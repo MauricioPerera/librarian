@@ -23,6 +23,7 @@ import (
 	"github.com/MauricioPerera/librarian/internal/auth"
 	"github.com/MauricioPerera/librarian/internal/server"
 	"github.com/MauricioPerera/librarian/internal/store"
+	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
 
 // createDynamicType registers a dynamic content type through the real API.
@@ -752,17 +753,17 @@ func TestDynamicContentSurvivesRestart(t *testing.T) {
 	ctx := context.Background()
 
 	// --- process 1: define the type and load a row ---
-	sdb1, err := store.Open(dbPath)
+	sdb1, err := store.Open(compat.SQLite, dbPath)
 	if err != nil {
 		t.Fatalf("open 1: %v", err)
 	}
 	if err := store.EnsureSchema(ctx, sdb1); err != nil {
 		t.Fatalf("ensure 1: %v", err)
 	}
-	if err := store.SeedCatalogs(ctx, sdb1.DB); err != nil {
+	if err := store.SeedCatalogs(ctx, sdb1); err != nil {
 		t.Fatalf("seed 1: %v", err)
 	}
-	mux1, err := server.NewMux(server.Deps{DB: sdb1.DB, JWTSecret: testSecret})
+	mux1, err := server.NewMux(server.Deps{Store: sdb1, JWTSecret: testSecret})
 	if err != nil {
 		t.Fatalf("NewMux 1: %v", err)
 	}
@@ -781,7 +782,7 @@ func TestDynamicContentSurvivesRestart(t *testing.T) {
 	}
 
 	// --- process 2: a brand new connection, mux and handler set ---
-	sdb2, err := store.Open(dbPath)
+	sdb2, err := store.Open(compat.SQLite, dbPath)
 	if err != nil {
 		t.Fatalf("open 2: %v", err)
 	}
@@ -789,7 +790,7 @@ func TestDynamicContentSurvivesRestart(t *testing.T) {
 	if err := store.EnsureSchema(ctx, sdb2); err != nil {
 		t.Fatalf("ensure 2 (the composed schema must already match): %v", err)
 	}
-	mux2, err := server.NewMux(server.Deps{DB: sdb2.DB, JWTSecret: testSecret})
+	mux2, err := server.NewMux(server.Deps{Store: sdb2, JWTSecret: testSecret})
 	if err != nil {
 		t.Fatalf("NewMux 2: %v", err)
 	}

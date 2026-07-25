@@ -14,6 +14,7 @@ import (
 	"github.com/MauricioPerera/librarian/internal/auth"
 	"github.com/MauricioPerera/librarian/internal/server"
 	"github.com/MauricioPerera/librarian/internal/store"
+	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
 
 // timeNowUTC returns the current time in UTC — a thin helper so JWT issuance in
@@ -32,7 +33,7 @@ const testSecret = "contract-02-test-jwt-secret"
 func openAuthMux(t *testing.T) (*sql.DB, *httptest.Server, func()) {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "serverauth.db")
-	sdb, err := store.Open(dbPath)
+	sdb, err := store.Open(compat.SQLite, dbPath)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -40,10 +41,10 @@ func openAuthMux(t *testing.T) (*sql.DB, *httptest.Server, func()) {
 	if err := store.EnsureSchema(ctx, sdb); err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
-	if err := store.SeedCatalogs(ctx, sdb.DB); err != nil {
+	if err := store.SeedCatalogs(ctx, sdb); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	mux, err := server.NewMux(server.Deps{DB: sdb.DB, JWTSecret: testSecret})
+	mux, err := server.NewMux(server.Deps{Store: sdb, JWTSecret: testSecret})
 	if err != nil {
 		t.Fatalf("NewMux: %v", err)
 	}

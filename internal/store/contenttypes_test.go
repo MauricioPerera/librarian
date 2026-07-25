@@ -90,14 +90,14 @@ func TestDynamicTypeSurvivesRestartCycle(t *testing.T) {
 	ctx := context.Background()
 
 	// --- boot #1: normal startup, then an admin defines a dynamic type. ---
-	db1, err := store.Open(dbPath)
+	db1, err := store.Open(compat.SQLite, dbPath)
 	if err != nil {
 		t.Fatalf("open #1: %v", err)
 	}
 	if err := store.EnsureSchema(ctx, db1); err != nil {
 		t.Fatalf("ensure #1: %v", err)
 	}
-	if err := store.SeedCatalogs(ctx, db1.DB); err != nil {
+	if err := store.SeedCatalogs(ctx, db1); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	if err := store.CreateContentType(ctx, db1, reviewsDef); err != nil {
@@ -127,7 +127,7 @@ func TestDynamicTypeSurvivesRestartCycle(t *testing.T) {
 	}
 
 	// --- restart #1: exactly what the service does on boot. ---
-	db2, err := store.Open(dbPath)
+	db2, err := store.Open(compat.SQLite, dbPath)
 	if err != nil {
 		t.Fatalf("open #2: %v", err)
 	}
@@ -151,7 +151,7 @@ func TestDynamicTypeSurvivesRestartCycle(t *testing.T) {
 
 	// --- restart #2: the one that would fail if restart #1 corrupted the
 	// metadata (the corrupted row is only READ BACK on the next boot). ---
-	db3, err := store.Open(dbPath)
+	db3, err := store.Open(compat.SQLite, dbPath)
 	if err != nil {
 		t.Fatalf("open #3: %v", err)
 	}
@@ -185,7 +185,7 @@ func TestDumpSchemaIncludesDynamicType(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "dump.db")
 	ctx := context.Background()
 
-	db, err := store.Open(dbPath)
+	db, err := store.Open(compat.SQLite, dbPath)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -252,7 +252,7 @@ func TestCanonicalSchemaWithoutRegistry(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "legacy.db")
 	ctx := context.Background()
 
-	db, err := store.Open(dbPath)
+	db, err := store.Open(compat.SQLite, dbPath)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -278,7 +278,7 @@ func TestUpgradeFromPreContract13Database(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "upgrade.db")
 	ctx := context.Background()
 
-	db, err := store.Open(dbPath)
+	db, err := store.Open(compat.SQLite, dbPath)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -296,7 +296,7 @@ func TestUpgradeFromPreContract13Database(t *testing.T) {
 	if err := db.ApplySchema(ctx, old); err != nil {
 		t.Fatalf("apply pre-CONTRACT-13 schema: %v", err)
 	}
-	if err := store.SeedCatalogs(ctx, db.DB); err != nil {
+	if err := store.SeedCatalogs(ctx, db); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 	if _, err := db.DB.ExecContext(ctx,
@@ -348,7 +348,7 @@ func TestCreateContentTypeIsAtomic(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "atomic.db")
 	ctx := context.Background()
 
-	db, err := store.Open(dbPath)
+	db, err := store.Open(compat.SQLite, dbPath)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -394,7 +394,7 @@ func TestCreateContentTypeDuplicateName(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "dup.db")
 	ctx := context.Background()
 
-	db, err := store.Open(dbPath)
+	db, err := store.Open(compat.SQLite, dbPath)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -435,7 +435,7 @@ func TestCreateContentTypeRejectsHostileNames(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "hostile.db")
 	ctx := context.Background()
 
-	db, err := store.Open(dbPath)
+	db, err := store.Open(compat.SQLite, dbPath)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

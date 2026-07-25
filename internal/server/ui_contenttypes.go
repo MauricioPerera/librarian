@@ -109,7 +109,7 @@ func (h *handlers) registerAdminContentTypeRoutes(mux *http.ServeMux) {
 // handleAdminContentTypesList renders every persisted definition with its
 // fields, plus a link into each type's content listing.
 func (h *handlers) handleAdminContentTypesList(w http.ResponseWriter, r *http.Request) {
-	defs, err := store.LoadDefinitions(r.Context(), store.FromDB(h.db))
+	defs, err := store.LoadDefinitions(r.Context(), h.store)
 	if err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
@@ -166,7 +166,7 @@ func (h *handlers) handleAdminContentTypeCreate(w http.ResponseWriter, r *http.R
 	}
 
 	h.schemaMu.Lock()
-	err := store.CreateContentType(r.Context(), store.FromDB(h.db), def)
+	err := store.CreateContentType(r.Context(), h.store, def)
 	h.schemaMu.Unlock()
 
 	switch {
@@ -216,7 +216,7 @@ type adminContentTypeEditPage struct {
 // row per stored field carrying its identity.
 func (h *handlers) handleAdminContentTypeEditForm(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	_, fields, err := store.LoadContentTypeFields(r.Context(), h.db, name)
+	_, fields, err := store.LoadContentTypeFields(r.Context(), h.store, name)
 	switch {
 	case errors.Is(err, store.ErrContentTypeNotFound):
 		h.renderNotFound(w, r)
@@ -256,7 +256,7 @@ func (h *handlers) handleAdminContentTypeEditFieldRow(w http.ResponseWriter, _ *
 // is not the only thing standing between an admin and lost data.
 func (h *handlers) handleAdminContentTypeEdit(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	typeID, stored, err := store.LoadContentTypeFields(r.Context(), h.db, name)
+	typeID, stored, err := store.LoadContentTypeFields(r.Context(), h.store, name)
 	switch {
 	case errors.Is(err, store.ErrContentTypeNotFound):
 		h.renderNotFound(w, r)
@@ -281,7 +281,7 @@ func (h *handlers) handleAdminContentTypeEdit(w http.ResponseWriter, r *http.Req
 	}
 
 	h.schemaMu.Lock()
-	_, err = store.EditContentType(r.Context(), store.FromDB(h.db), name, edits, plan.Removed)
+	_, err = store.EditContentType(r.Context(), h.store, name, edits, plan.Removed)
 	h.schemaMu.Unlock()
 	if err != nil {
 		h.renderContentTypeEdit(w, r, http.StatusBadRequest, name, rows,

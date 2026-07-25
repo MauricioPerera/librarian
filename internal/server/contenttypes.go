@@ -128,7 +128,7 @@ func (h *handlers) handleCreateContentType(w http.ResponseWriter, r *http.Reques
 	h.schemaMu.Lock()
 	defer h.schemaMu.Unlock()
 
-	err := store.CreateContentType(r.Context(), store.FromDB(h.db), def)
+	err := store.CreateContentType(r.Context(), h.store, def)
 	switch {
 	case errors.Is(err, store.ErrDuplicateContentType):
 		writeError(w, http.StatusBadRequest, "a content type with this name already exists")
@@ -144,7 +144,7 @@ func (h *handlers) handleCreateContentType(w http.ResponseWriter, r *http.Reques
 // only a valid identity — reading is not permission-gated, like the rest of the
 // project.
 func (h *handlers) handleListContentTypes(w http.ResponseWriter, r *http.Request) {
-	defs, err := store.LoadDefinitions(r.Context(), store.FromDB(h.db))
+	defs, err := store.LoadDefinitions(r.Context(), h.store)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "could not list content types")
 		return
@@ -164,7 +164,7 @@ func (h *handlers) handleListContentTypes(w http.ResponseWriter, r *http.Request
 // route that emits it — it is the route an editor reads before editing.
 func (h *handlers) handleGetContentType(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	def, err := store.FetchContentType(r.Context(), h.db, name)
+	def, err := store.FetchContentType(r.Context(), h.store, name)
 	switch {
 	case errors.Is(err, store.ErrContentTypeNotFound):
 		writeError(w, http.StatusNotFound, "content type not found")
@@ -173,7 +173,7 @@ func (h *handlers) handleGetContentType(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusInternalServerError, "could not read content type")
 		return
 	}
-	_, fields, err := store.LoadContentTypeFields(r.Context(), h.db, name)
+	_, fields, err := store.LoadContentTypeFields(r.Context(), h.store, name)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "could not read content type")
 		return
@@ -240,7 +240,7 @@ func (h *handlers) handleEditContentType(w http.ResponseWriter, r *http.Request)
 
 	// Read-only pre-flight: 404 for an unknown type, 400 for anything the plan
 	// rejects — with NOTHING written, by construction.
-	typeID, stored, err := store.LoadContentTypeFields(r.Context(), h.db, name)
+	typeID, stored, err := store.LoadContentTypeFields(r.Context(), h.store, name)
 	switch {
 	case errors.Is(err, store.ErrContentTypeNotFound):
 		writeError(w, http.StatusNotFound, "content type not found")
@@ -255,7 +255,7 @@ func (h *handlers) handleEditContentType(w http.ResponseWriter, r *http.Request)
 	}
 
 	h.schemaMu.Lock()
-	plan, err := store.EditContentType(r.Context(), store.FromDB(h.db), name, edits, confirm)
+	plan, err := store.EditContentType(r.Context(), h.store, name, edits, confirm)
 	h.schemaMu.Unlock()
 
 	var loss store.DataLossError
@@ -287,7 +287,7 @@ func (h *handlers) handleEditContentType(w http.ResponseWriter, r *http.Request)
 
 	// Read the result back from the registry rather than echoing the request:
 	// the response then reflects what the database actually holds, ids included.
-	_, fields, err := store.LoadContentTypeFields(r.Context(), h.db, name)
+	_, fields, err := store.LoadContentTypeFields(r.Context(), h.store, name)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "could not read content type")
 		return

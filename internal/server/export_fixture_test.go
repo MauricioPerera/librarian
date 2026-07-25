@@ -77,7 +77,7 @@ func TestExportFixture(t *testing.T) {
 		t.Fatalf("remove prior fixture: %v", err)
 	}
 
-	sdb, err := store.Open(path)
+	sdb, err := store.Open(compat.SQLite, path)
 	if err != nil {
 		t.Fatalf("open sqlite: %v", err)
 	}
@@ -85,11 +85,11 @@ func TestExportFixture(t *testing.T) {
 	if err := store.EnsureSchema(ctx, sdb); err != nil {
 		t.Fatalf("ensure schema: %v", err)
 	}
-	if err := store.SeedCatalogs(ctx, sdb.DB); err != nil {
+	if err := store.SeedCatalogs(ctx, sdb); err != nil {
 		t.Fatalf("seed catalogs: %v", err)
 	}
 
-	mux, err := server.NewMux(server.Deps{DB: sdb.DB, JWTSecret: testSecret})
+	mux, err := server.NewMux(server.Deps{Store: sdb, JWTSecret: testSecret})
 	if err != nil {
 		t.Fatalf("new mux: %v", err)
 	}
@@ -361,7 +361,7 @@ func TestExportVerifyPG(t *testing.T) {
 	sqlitePath := filepath.Join(exportDir, fixtureDBName)
 
 	// Source values from the SQLite fixture (re-queried, not hardcoded).
-	sdb, err := store.Open(sqlitePath)
+	sdb, err := store.Open(compat.SQLite, sqlitePath)
 	if err != nil {
 		t.Fatalf("open sqlite fixture: %v", err)
 	}

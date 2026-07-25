@@ -52,7 +52,7 @@ func TestDumpSchemaIncludesDynamicTypes(t *testing.T) {
 	out := filepath.Join(dir, "schema.json")
 	ctx := context.Background()
 
-	db, err := store.Open(dbPath)
+	db, err := store.Open(compat.SQLite, dbPath)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -122,7 +122,7 @@ func TestDumpSchemaOnPreContract13Database(t *testing.T) {
 	out := filepath.Join(dir, "schema.json")
 	ctx := context.Background()
 
-	db, err := store.Open(dbPath)
+	db, err := store.Open(compat.SQLite, dbPath)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

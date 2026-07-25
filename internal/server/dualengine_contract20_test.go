@@ -111,7 +111,7 @@ func TestDualEngineServer(t *testing.T) {
 // battery also proves the real startup path creates the CONTRACT-20 views.
 func openSQLiteEngine(t *testing.T) (*compat.Store, func()) {
 	t.Helper()
-	st, err := store.Open(filepath.Join(t.TempDir(), "dual20.db"))
+	st, err := store.Open(compat.SQLite, filepath.Join(t.TempDir(), "dual20.db"))
 	if err != nil {
 		t.Fatalf("sqlite open: %v", err)
 	}
@@ -119,7 +119,7 @@ func openSQLiteEngine(t *testing.T) (*compat.Store, func()) {
 	if err := store.EnsureSchema(ctx, st); err != nil {
 		t.Fatalf("sqlite ensure schema: %v", err)
 	}
-	if err := store.SeedCatalogs(ctx, st.DB); err != nil {
+	if err := store.SeedCatalogs(ctx, st); err != nil {
 		t.Fatalf("sqlite seed: %v", err)
 	}
 	return st, func() { _ = st.Close() }
@@ -127,9 +127,9 @@ func openSQLiteEngine(t *testing.T) (*compat.Store, func()) {
 
 // openPostgresEngine builds the PostgreSQL side in a FRESH, uniquely named
 // schema so a run can never collide with leftovers, and drops it afterwards.
-// Same approach as CONTRACT-19: compat's own ApplySchema over schema.Build(),
-// because internal/store's metadata/seed statements are still SQLite-only
-// (migrating them is CONTRACT-21 and is deliberately not anticipated).
+// CONTRACT-21 UPDATE: it now goes through the SAME PRODUCTION PATH as the
+// SQLite side (store.Open → store.EnsureSchema → store.SeedCatalogs), which was
+// impossible while internal/store's metadata/seed statements were SQLite-only.
 func openPostgresEngine(t *testing.T, dsn string) (*compat.Store, func()) {
 	t.Helper()
 	ctx := context.Background()
@@ -144,7 +144,7 @@ func openPostgresEngine(t *testing.T, dsn string) (*compat.Store, func()) {
 		t.Fatalf("create schema: %v", err)
 	}
 
-	scoped, err := compat.OpenPostgres(schema.PostgresVersion, withSearchPath(dsn, schemaName))
+	scoped, err := store.Open(compat.Postgres, withSearchPath(dsn, schemaName))
 	if err != nil {
 		t.Fatalf("postgres open (scoped): %v", err)
 	}
@@ -156,10 +156,12 @@ func openPostgresEngine(t *testing.T, dsn string) (*compat.Store, func()) {
 		t.Fatalf("current_schema() = %q, want %q — the scoped connection is not isolated", current, schemaName)
 	}
 
-	if err := scoped.ApplySchema(ctx, schema.Build()); err != nil {
-		t.Fatalf("postgres apply schema: %v", err)
+	if err := store.EnsureSchema(ctx, scoped); err != nil {
+		t.Fatalf("postgres ensure schema: %v", err)
 	}
-	seedPostgresCatalogs(t, scoped)
+	if err := store.SeedCatalogs(ctx, scoped); err != nil {
+		t.Fatalf("postgres seed: %v", err)
+	}
 
 	return scoped, func() {
 		_ = scoped.Close()
@@ -179,23 +181,6 @@ func withSearchPath(dsn, schemaName string) string {
 		separator = "&"
 	}
 	return dsn + separator + "search_path=" + schemaName + ",public"
-}
-
-// seedPostgresCatalogs inserts the fixed catalogs on the PostgreSQL side.
-func seedPostgresCatalogs(t *testing.T, st *compat.Store) {
-	t.Helper()
-	ctx := context.Background()
-	insert := func(table string, names []string) {
-		statement := `INSERT INTO "` + table + `" ("name") VALUES (` + compat.Placeholder(compat.Postgres, 1) + `)`
-		for _, name := range names {
-			if _, err := st.DB.ExecContext(ctx, statement, name); err != nil {
-				t.Fatalf("seed %s %q: %v", table, name, err)
-			}
-		}
-	}
-	insert("roles", schema.Roles)
-	insert("permissions", schema.Permissions)
-	insert("taxonomies", schema.Taxonomies)
 }
 
 // createDynamicType creates the dynamic content type's REAL table and its

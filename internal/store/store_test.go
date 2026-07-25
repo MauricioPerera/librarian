@@ -16,7 +16,7 @@ import (
 // reconstructs the canonical schema exactly (Inspection.Exact == true).
 func TestRoundTripExact(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "roundtrip.db")
-	db, err := store.Open(dbPath)
+	db, err := store.Open(compat.SQLite, dbPath)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -44,7 +44,7 @@ func TestEnsureSchemaIdempotent(t *testing.T) {
 	ctx := context.Background()
 
 	// First boot: creates the schema.
-	db1, err := store.Open(dbPath)
+	db1, err := store.Open(compat.SQLite, dbPath)
 	if err != nil {
 		t.Fatalf("open #1: %v", err)
 	}
@@ -56,7 +56,7 @@ func TestEnsureSchemaIdempotent(t *testing.T) {
 	}
 
 	// Second boot on the same file: must be a no-op, not a recreate error.
-	db2, err := store.Open(dbPath)
+	db2, err := store.Open(compat.SQLite, dbPath)
 	if err != nil {
 		t.Fatalf("open #2: %v", err)
 	}
@@ -79,7 +79,7 @@ func TestEnsureSchemaAddsOnlyMissingTable(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "partial.db")
 	ctx := context.Background()
 
-	db, err := store.Open(dbPath)
+	db, err := store.Open(compat.SQLite, dbPath)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -137,7 +137,7 @@ func TestSeedCatalogsIdempotent(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "seed.db")
 	ctx := context.Background()
 
-	db, err := store.Open(dbPath)
+	db, err := store.Open(compat.SQLite, dbPath)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -146,7 +146,7 @@ func TestSeedCatalogsIdempotent(t *testing.T) {
 		t.Fatalf("ensure: %v", err)
 	}
 
-	if err := store.SeedCatalogs(ctx, db.DB); err != nil {
+	if err := store.SeedCatalogs(ctx, db); err != nil {
 		t.Fatalf("seed #1: %v", err)
 	}
 	rolesAfter1 := count(t, db.DB, "SELECT count(*) FROM roles")
@@ -165,7 +165,7 @@ func TestSeedCatalogsIdempotent(t *testing.T) {
 	}
 
 	// Second seed on the same file: must be a no-op (no duplicate rows, no error).
-	if err := store.SeedCatalogs(ctx, db.DB); err != nil {
+	if err := store.SeedCatalogs(ctx, db); err != nil {
 		t.Fatalf("seed #2 (idempotent) failed: %v", err)
 	}
 	rolesAfter2 := count(t, db.DB, "SELECT count(*) FROM roles")
@@ -200,7 +200,7 @@ func count(t *testing.T, db *sql.DB, query string) int {
 // simulates exactly that database, and the views must come back.
 func TestEnsureSchemaRecreatesViews(t *testing.T) {
 	ctx := context.Background()
-	db, err := store.Open(filepath.Join(t.TempDir(), "views.db"))
+	db, err := store.Open(compat.SQLite, filepath.Join(t.TempDir(), "views.db"))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}

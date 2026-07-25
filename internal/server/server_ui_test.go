@@ -23,6 +23,7 @@ import (
 	"github.com/MauricioPerera/librarian/internal/auth"
 	"github.com/MauricioPerera/librarian/internal/server"
 	"github.com/MauricioPerera/librarian/internal/store"
+	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
 
 // openUITLS mirrors openAuthMux but returns an HTTPS test server, required for
@@ -30,7 +31,7 @@ import (
 func openUITLS(t *testing.T) (*sql.DB, *httptest.Server, func()) {
 	t.Helper()
 	dbPath := filepath.Join(t.TempDir(), "serverui.db")
-	sdb, err := store.Open(dbPath)
+	sdb, err := store.Open(compat.SQLite, dbPath)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
@@ -38,10 +39,10 @@ func openUITLS(t *testing.T) (*sql.DB, *httptest.Server, func()) {
 	if err := store.EnsureSchema(ctx, sdb); err != nil {
 		t.Fatalf("ensure: %v", err)
 	}
-	if err := store.SeedCatalogs(ctx, sdb.DB); err != nil {
+	if err := store.SeedCatalogs(ctx, sdb); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	mux, err := server.NewMux(server.Deps{DB: sdb.DB, JWTSecret: testSecret})
+	mux, err := server.NewMux(server.Deps{Store: sdb, JWTSecret: testSecret})
 	if err != nil {
 		t.Fatalf("NewMux: %v", err)
 	}

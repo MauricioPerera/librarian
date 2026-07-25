@@ -29,6 +29,7 @@ import (
 	"github.com/MauricioPerera/librarian/internal/schema"
 	"github.com/MauricioPerera/librarian/internal/server"
 	"github.com/MauricioPerera/librarian/internal/store"
+	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
 
 func main() {
@@ -47,7 +48,11 @@ func run() error {
 		return err
 	}
 
-	db, err := store.Open(cfg.DBPath)
+	// CONTRACT-21 T2: the engine and the DSN come from ONE decision
+	// (config.ResolveEngine), and store.Open pairs the connection with the target
+	// of that same engine. Nothing downstream chooses an engine again — NewMux
+	// takes the store, not a bare pool.
+	db, err := store.Open(cfg.Engine, cfg.DSN)
 	if err != nil {
 		return err
 	}
@@ -57,16 +62,16 @@ func run() error {
 	if err := store.EnsureSchema(ctx, db); err != nil {
 		return err
 	}
-	if err := store.SeedCatalogs(ctx, db.DB); err != nil {
+	if err := store.SeedCatalogs(ctx, db); err != nil {
 		return err
 	}
 
-	mux, err := server.NewMux(server.Deps{DB: db.DB, JWTSecret: cfg.JWTSecret})
+	mux, err := server.NewMux(server.Deps{Store: db, JWTSecret: cfg.JWTSecret})
 	if err != nil {
 		return err
 	}
 
-	log.Printf("librarian: schema ready on %s, listening on %s", cfg.DBPath, cfg.Addr)
+	log.Printf("librarian: schema ready on %s (%s), listening on %s", redactDSN(cfg.DSN), cfg.Engine, cfg.Addr)
 	srv := &http.Server{Addr: cfg.Addr, Handler: mux}
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
@@ -104,29 +109,47 @@ func run() error {
 //     the command working against a pre-CONTRACT-13 database.
 //   - Any other failure (unreadable file, corrupt definition row) propagates as
 //     a non-zero exit. There is no path that prints a partial schema.
+//
+// CONTRACT-21 T2 makes this mode ENGINE-AWARE, which it has to be for the same
+// reason the server is: the dump reads the database, so it needs a connection,
+// and a connection needs an engine. The engine comes from the SAME
+// config.ResolveEngine the server uses (so `--dump-schema` and the running
+// instance can never disagree about what this deployment is), with --db
+// overriding only the DSN. The "does the file exist?" guard is SQLite-specific
+// by nature — a PostgreSQL DSN names no file, and PostgreSQL does not
+// helpfully create a database out of a mistyped name the way SQLite creates a
+// file — so it applies to SQLite only; on PostgreSQL the equivalent mistake
+// surfaces as a connection error, loudly, which is the property that guard
+// exists to preserve.
 func dumpSchema(args []string, dumpPath string) error {
-	dbPath := dbPathFlag(args)
-	if dbPath == "" {
-		dbPath = os.Getenv("LIBRARIAN_DB")
+	engine, dsn, err := config.ResolveEngine()
+	if err != nil {
+		return err
 	}
-	if dbPath == "" {
-		dbPath = "librarian.db"
+	if override := dbPathFlag(args); override != "" {
+		dsn = override
+		if engine == compat.SQLite && config.LooksLikePostgresDSN(dsn) {
+			return fmt.Errorf(
+				"--db is a PostgreSQL connection URL but the engine is sqlite: set %s=postgres", config.EngineVar)
+		}
 	}
-	if _, err := os.Stat(dbPath); err != nil {
-		return fmt.Errorf(
-			"--dump-schema must read the database to include the dynamic content types (a dump without them would export an incomplete schema): cannot access %q: %w — pass --db <path> or set LIBRARIAN_DB",
-			dbPath, err)
+	if engine == compat.SQLite {
+		if _, err := os.Stat(dsn); err != nil {
+			return fmt.Errorf(
+				"--dump-schema must read the database to include the dynamic content types (a dump without them would export an incomplete schema): cannot access %q: %w — pass --db <path> or set LIBRARIAN_DB",
+				dsn, err)
+		}
 	}
 
-	db, err := store.Open(dbPath)
+	db, err := store.Open(engine, dsn)
 	if err != nil {
-		return fmt.Errorf("open database %q: %w", dbPath, err)
+		return fmt.Errorf("open database %q: %w", redactDSN(dsn), err)
 	}
 	defer db.Close()
 
 	defs, err := store.LoadDefinitions(context.Background(), db)
 	if err != nil {
-		return fmt.Errorf("read dynamic content type definitions from %q: %w", dbPath, err)
+		return fmt.Errorf("read dynamic content type definitions from %q: %w", redactDSN(dsn), err)
 	}
 	data, err := schema.JSONWith(defs)
 	if err != nil {
@@ -140,6 +163,37 @@ func dumpSchema(args []string, dumpPath string) error {
 		return fmt.Errorf("write schema: %w", err)
 	}
 	return nil
+}
+
+// redactDSN replaces the password of a PostgreSQL URL with `***` so it can be
+// logged or embedded in an error.
+//
+// CONTRACT-21 T2 introduces this because the DSN stopped being a harmless file
+// path: a PostgreSQL URL carries the credentials, and the startup line printed
+// it verbatim. A password in the service log (or in an error a client might
+// see) is a leak that no later contract can take back.
+//
+// It edits the userinfo section textually rather than through net/url, on
+// purpose: url.Parse fails on some perfectly usable DSNs, and a redactor that
+// falls back to "print it raw" when parsing fails is worse than no redactor. A
+// string that does not look like a URL with credentials is returned unchanged —
+// a SQLite path has nothing to hide.
+func redactDSN(dsn string) string {
+	scheme := strings.Index(dsn, "://")
+	if scheme < 0 {
+		return dsn
+	}
+	rest := dsn[scheme+3:]
+	at := strings.Index(rest, "@")
+	if at < 0 {
+		return dsn
+	}
+	userinfo := rest[:at]
+	colon := strings.Index(userinfo, ":")
+	if colon < 0 {
+		return dsn
+	}
+	return dsn[:scheme+3] + userinfo[:colon] + ":***" + rest[at:]
 }
 
 // dbPathFlag inspects args for --db <path> / --db=<path> and returns the value
