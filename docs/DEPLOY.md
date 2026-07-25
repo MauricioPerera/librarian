@@ -11,9 +11,19 @@ contrato).
 |---|---|
 | Servicio | `librarian.service` (systemd), escucha en `127.0.0.1:8500` |
 | Binario | `/opt/librarian/librarian` |
-| Base de datos | `/opt/librarian/data/librarian.db` |
+| Motor | `LIBRARIAN_ENGINE` en el `.env`: `sqlite` (por defecto) o `postgres` |
+| Base de datos | `LIBRARIAN_DB`: ruta de archivo si el motor es SQLite, DSN si es PostgreSQL |
 | Configuración | `/opt/librarian/.env` (incluye `LIBRARIAN_JWT_SECRET`, modo `0600`) |
 | Público | `https://librarian.ardf.dev` (nginx → `127.0.0.1:8500`) |
+
+**Antes de tocar nada, mirá contra qué motor corre la instancia.** El grueso de este runbook es el
+mismo para los dos; lo que cambia está en
+[Si la instancia corre sobre PostgreSQL](#si-la-instancia-corre-sobre-postgresql), y es sobre todo
+el respaldo, que es de lo que depende el rollback.
+
+```bash
+grep -E '^LIBRARIAN_(ENGINE|DB)=' /opt/librarian/.env
+```
 
 ## Elegí el procedimiento correcto
 
@@ -25,6 +35,91 @@ contrato).
 
 Ante la duda, usá el procedimiento MÁS estricto de los que apliquen. El costo de B sobre A son
 unos minutos; el costo de equivocarse es producción caída.
+
+---
+
+## Si la instancia corre sobre PostgreSQL
+
+Los procedimientos A, B y C valen igual. Lo que cambia es **el respaldo, el destino de los datos y
+el rollback** — o sea, precisamente aquello de lo que depende poder deshacer un error.
+
+### Configuración
+
+```
+LIBRARIAN_ENGINE=postgres
+LIBRARIAN_DB=postgres://usuario:password@host:5432/librarian?sslmode=disable
+```
+
+**Las dos van juntas y se contrastan entre sí.** El binario se niega a arrancar si se contradicen,
+con un mensaje que dice qué esperaba. El caso que esa guarda existe para impedir es un DSN de
+PostgreSQL con el motor en `sqlite`: sin ella, SQLite **crearía un archivo local vacío** y el
+servicio quedaría sirviendo desde ahí, respondiendo sano y sin datos.
+
+El DSN lleva la contraseña, así que vive en el `.env` con modo `0600` y **nunca** se pega en un
+reporte sin enmascarar. El servicio la enmascara solo en su log de arranque.
+
+### `pgvector` es un prerrequisito duro
+
+`articles.embedding` es `vector(1536)`, que en PostgreSQL requiere la extensión `pgvector`. Sin
+ella, la creación del esquema falla en el primer arranque. Instalala en la base **antes** de
+arrancar el servicio por primera vez:
+
+```bash
+psql "$LIBRARIAN_DB" -c "CREATE EXTENSION IF NOT EXISTS vector;"
+psql "$LIBRARIAN_DB" -tAc "select extversion from pg_extension where extname='vector'"
+```
+
+Si el PostgreSQL es administrado y no ofrece `pgvector`, **la instancia no se puede levantar** tal
+cual. Averigualo antes de planificar el despliegue, no el día del corte.
+
+### Instalación en limpio
+
+El esquema lo crea la aplicación en el primer arranque: no hay script de creación que correr ni
+migración desde otra base. Alcanza con una base vacía y la extensión instalada.
+
+La primera identidad se crea **fuera de banda**, igual que en SQLite: el producto no tiene registro
+público. Después de eso, la gestión de usuarios, roles y permisos es por la aplicación.
+
+### Respaldo: el paso del que depende el rollback
+
+Donde el procedimiento dice "copiar el archivo de base de datos", acá va un volcado:
+
+```bash
+# En formato custom (-Fc): comprimido y restaurable con pg_restore
+PGPASSWORD='...' pg_dump -U <usuario> -h <host> -d <base> -Fc \
+  -f /opt/librarian/backups/librarian-pre-<tag>-$(date +%Y%m%d%H%M%S).dump
+ls -la /opt/librarian/backups/
+```
+
+**El respaldo se toma con el servicio ARRIBA**, como en el resto del runbook: `pg_dump` es
+consistente y no requiere detener nada.
+
+### Probar contra una copia real (procedimiento B)
+
+El equivalente de "bajar el archivo y correr el binario contra la copia" es restaurar el volcado en
+una base aparte y apuntar ahí:
+
+```bash
+psql "<dsn-admin>" -c "CREATE DATABASE librarian_ensayo;"
+psql "<dsn-ensayo>" -c "CREATE EXTENSION IF NOT EXISTS vector;"
+PGPASSWORD='...' pg_restore -U <usuario> -h <host> -d librarian_ensayo <volcado>.dump
+
+LIBRARIAN_ENGINE=postgres LIBRARIAN_DB="<dsn-ensayo>" \
+  LIBRARIAN_JWT_SECRET=ensayo LIBRARIAN_ADDR=127.0.0.1:8099 ./librarian
+```
+
+**Dos arranques**, igual que en SQLite, y por la misma razón: hubo un bug real que solo aparecía en
+el reinicio siguiente. Borrá la base de ensayo al terminar.
+
+### La caché de metadata también aplica acá
+
+Todo lo de [La invalidación de metadata NO es opcional](#la-invalidación-de-metadata-no-es-opcional)
+vale igual: `__compat_schema` es una tabla de la propia base, no un detalle de SQLite, y la función
+de inspección la prefiere por sobre el catálogo físico en los dos motores.
+
+Una diferencia a favor: PostgreSQL **sí** tiene `ALTER TABLE ... RENAME`, así que una migración
+manual es más directa que en SQLite. Eso no cambia nada de la regla — si tocás el catálogo a mano,
+la invalidación va igual.
 
 ---
 
@@ -63,7 +158,8 @@ GOOS=linux GOARCH=amd64 go build -o /tmp/librarian-linux-amd64 ./cmd/librarian
 ```
 
 Descargar por SFTP `/opt/librarian/data/librarian.db` a una copia local, y correr el binario
-nuevo contra ESA COPIA — **dos veces**:
+nuevo contra ESA COPIA — **dos veces**. (Sobre PostgreSQL la copia se hace restaurando un volcado
+en una base aparte: ver [Probar contra una copia real](#probar-contra-una-copia-real-procedimiento-b).)
 
 ```bash
 # Primer arranque: ejercita el camino incremental (crea lo que falta)
@@ -76,7 +172,9 @@ Ambos tienen que arrancar limpio. El segundo importa tanto como el primero: hubo
 Confirmá además que los datos preexistentes siguen ahí (logueá con un usuario real, listá
 contenido existente).
 
-Recién entonces: backup, subir, reiniciar.
+Recién entonces: backup, subir, reiniciar. El backup es lo que hace posible el rollback, así que
+usá el que corresponde al motor — sobre PostgreSQL, el `pg_dump` de
+[Respaldo](#respaldo-el-paso-del-que-depende-el-rollback).
 
 ```bash
 cp /opt/librarian/data/librarian.db /opt/librarian/data/librarian.db.bak-pre-<tag>-$(date +%Y%m%d%H%M%S)
@@ -267,8 +365,14 @@ El recuento de credenciales activas tiene que quedar igual que antes de empezar.
 
 ## Rollback
 
-El backup del paso 4 es el rollback. Si el servicio no arranca y la causa no es obvia en
-`journalctl`:
+El backup del paso 4 es el rollback.
+
+**Antes de restaurar, leé el error real** (`journalctl -u librarian.service -n 20`). En el
+incidente de CONTRACT-17 el mensaje decía exactamente cuál era el problema (`table "cpt_eventos"
+already exists`) y el arreglo fue de una línea — restaurar el backup habría deshecho una
+migración correcta por un paso faltante trivial. Restaurar es lo último, no lo primero.
+
+### Sobre SQLite
 
 ```bash
 systemctl stop librarian.service
@@ -277,7 +381,29 @@ cp /opt/librarian/data/librarian.db.bak-pre-<tag>-<timestamp> /opt/librarian/dat
 systemctl start librarian.service
 ```
 
-Antes de restaurar, **leé el error real** (`journalctl -u librarian.service -n 20`). En el
-incidente de CONTRACT-17 el mensaje decía exactamente cuál era el problema (`table "cpt_eventos"
-already exists`) y el arreglo fue de una línea — restaurar el backup habría deshecho una
-migración correcta por un paso faltante trivial.
+### Sobre PostgreSQL
+
+Restaurar **no** es volcar el dump encima de la base existente: `pg_restore` no vacía lo que
+encuentra, así que superponer deja un estado mezclado, peor que el que querías deshacer. Se
+reemplaza la base entera:
+
+```bash
+systemctl stop librarian.service
+
+# 1. Apartá la base rota en vez de borrarla — todavía es la evidencia de qué pasó
+psql "<dsn-admin>" -c 'ALTER DATABASE librarian RENAME TO librarian_rota_<timestamp>;'
+
+# 2. Base nueva, con la extensión, y restaurá
+psql "<dsn-admin>" -c 'CREATE DATABASE librarian;'
+psql "$LIBRARIAN_DB" -c 'CREATE EXTENSION IF NOT EXISTS vector;'
+PGPASSWORD='...' pg_restore -U <usuario> -h <host> -d librarian <volcado>.dump
+
+systemctl start librarian.service
+```
+
+El `RENAME` en vez del `DROP` es deliberado: una vez que borrás la base rota, perdiste la única
+copia del estado que causó el incidente, y la causa se investiga después de que el servicio vuelve.
+Borrala cuando el incidente esté cerrado, no antes.
+
+Requiere que no haya conexiones abiertas contra la base al renombrarla; detener el servicio suele
+alcanzar, y si no, cerrá las sesiones sobrantes antes de insistir.
