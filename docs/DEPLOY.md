@@ -169,17 +169,38 @@ cd D:/Repo/librarian
 GOOS=linux GOARCH=amd64 go build -o /tmp/librarian-linux-amd64 ./cmd/librarian
 ```
 
-Subir por SFTP a `/opt/librarian/librarian.new`, y después:
+**Antes de subir, preguntale al sistema a dónde va** en vez de escribir la ruta de memoria. El
+`ExecStart` del service es la única fuente de verdad de dónde vive el binario, y es un comando:
 
 ```bash
-mv /opt/librarian/librarian.new /opt/librarian/librarian   # reemplazo atómico
-systemctl restart librarian.service
-systemctl is-active librarian.service                       # debe decir "active"
-curl -s http://127.0.0.1:8500/health                        # {"status":"ok"}  (el proceso vive)
-curl -s http://127.0.0.1:8500/ready                         # {"status":"ready"} (la base responde)
+# En el VPS. Imprime la ruta REAL del binario que systemd ejecuta.
+DEST=$(systemctl show -p ExecStart --value librarian.service | sed -E 's/.*path=([^ ;]+).*/\1/')
+echo "$DEST"   # /opt/librarian/librarian
 ```
 
-Después, la [verificación post-deploy](#verificación-post-deploy) — que NO es solo lecturas.
+Esto no es ceremonia: un deploy de este proyecto ya se subió a `/root/librarian` de memoria. El
+servicio reinició con el binario VIEJO, `/health` y `/ready` dieron 200 **porque el binario viejo
+estaba sano**, y el despliegue se dio por bueno sin haber desplegado nada.
+
+Anotá también el tamaño de lo que compilaste, que es lo que vas a contrastar en el paso siguiente:
+
+```bash
+# En tu máquina, después de compilar.
+stat -c '%s' /tmp/librarian-linux-amd64
+```
+
+Subir por SFTP a `$DEST.new`, y después:
+
+```bash
+cp -a "$DEST" "$DEST.bak-$(date +%Y%m%d-%H%M%S)"   # el rollback del binario, gratis
+mv "$DEST.new" "$DEST"                              # reemplazo atómico
+chmod +x "$DEST"
+systemctl restart librarian.service
+systemctl is-active librarian.service               # debe decir "active"
+```
+
+Después, la [verificación post-deploy](#verificación-post-deploy), que **empieza por comprobar que
+lo que está corriendo es lo que subiste** y no es solo lecturas.
 
 ---
 
@@ -297,7 +318,37 @@ systemctl start librarian.service
 modo solo-lectura efectiva (la tabla de permisos vacía) sin que ninguna verificación lo
 detectara, porque todas eran `GET` y las lecturas no requieren permiso.
 
-### 1. El servicio está vivo **y además puede servir**
+### 1. Lo que está corriendo es lo que subiste
+
+**Este paso va PRIMERO, antes de mirar la salud.** Un servicio sano sirviendo el binario viejo se
+ve exactamente igual que uno sirviendo el nuevo: los dos contestan `200` en `/health` y en
+`/ready`. Una vez que viste el verde ya no vas a buscar, así que la pregunta "¿desplegué?" hay que
+hacerla cuando todavía dudás.
+
+Pasó de verdad, en el deploy de `CONTRACT-30`: el binario se subió a una ruta equivocada, el
+servicio arrancó de nuevo con el anterior, y las dos comprobaciones de salud dieron verde. No
+mintieron — contestaron con exactitud la pregunta que se les hizo, que era *"¿el servicio
+responde?"* y no *"¿el servicio responde con lo que acabás de subir?"*. Se descubrió por
+casualidad, mirando el `ExecStart` por otro motivo.
+
+```bash
+# En el VPS. El tamaño y la fecha tienen que ser los del binario que compilaste.
+DEST=$(systemctl show -p ExecStart --value librarian.service | sed -E 's/.*path=([^ ;]+).*/\1/')
+ls -la "$DEST"
+
+# Y que el PROCESO VIVO sea ese archivo, no una copia que quedó de antes.
+readlink -f /proc/$(systemctl show -p MainPID --value librarian.service)/exe
+```
+
+El tamaño tiene que coincidir con el `stat -c '%s'` que anotaste al compilar. Si no coincide, el
+deploy no ocurrió: **volvé al procedimiento, no sigas verificando**. Todo lo que midas a partir de
+acá estará midiendo la versión anterior.
+
+Mejor todavía cuando el cambio lo permite: verificá con **una respuesta que la versión vieja no
+sepa dar** (una ruta nueva, un campo nuevo en una respuesta, un control nuevo en una página). Es la
+única comprobación que no se puede pasar por accidente.
+
+### 2. El servicio está vivo **y además puede servir**
 
 Son **dos comprobaciones distintas y hay que hacer las dos** (CONTRACT-24). `/health` dice
 solamente que el proceso está vivo; `/ready` es la que mira la base. Con la base detenida,
@@ -330,7 +381,7 @@ Síntoma asociado, por si aparece durante una incidencia: con la base caída, el
 Si hay un balanceador o un monitor delante, `/ready` es la ruta que tiene que consultar para
 decidir si mandarle tráfico a la instancia; `/health` sirve para reiniciar el proceso colgado.
 
-### 2. Conseguir una identidad para verificar
+### 3. Conseguir una identidad para verificar
 
 La verificación necesita autenticarse. **No uses la contraseña de una persona para esto**: acuñá
 una credencial efímera, de alcance mínimo, y revocala como parte del mismo procedimiento. Es más
@@ -355,14 +406,42 @@ K=$(cat /tmp/deploy-check.key)
 El prefijo `lbk_` y el hash SHA-256 hex son el formato que espera `auth.VerifyAPIKey`; se envía
 como `Authorization: Bearer <secreto>`, igual que un JWT.
 
-**La revocación va en este mismo procedimiento, no en una lista de pendientes** (paso 5). Una
+**La revocación va en este mismo procedimiento, no en una lista de pendientes** (paso 6). Una
 credencial de prueba que sobrevive a su prueba es una puerta abierta que nadie recuerda haber
 dejado.
 
-Si necesitás verificar la UI y no solo la API, ahí sí hace falta una sesión con contraseña: la
-API key autentica la API, no el login del navegador.
+**Si el cambio es de UI, la API key no alcanza**: autentica la API, no el login del navegador. Y
+no hace falta la contraseña de nadie — acuñá una IDENTIDAD efímera, que es la misma idea un nivel
+más arriba, y borrala en el paso 6 junto con la key. Se usó así para verificar `CONTRACT-30`:
 
-### 3. Lecturas (necesarias pero NO suficientes)
+```bash
+# 1. En tu máquina: generar el hash bcrypt de una contraseña descartable.
+#    (cualquier utilidad bcrypt sirve; el costo 12 es el que usa el proyecto)
+
+# 2. En el VPS: insertar la identidad y darle el rol administrator.
+#    docker exec necesita -i o el heredoc se descarta EN SILENCIO con exit 0.
+docker exec -i <contenedor-db> psql -U postgres -d librarian -v ON_ERROR_STOP=1 <<'SQL'
+INSERT INTO users (id, email, password_hash, status)
+VALUES ('00000000-0000-4000-8000-0000000000ff', 'verif@sandbox.local', '<hash>', 'active');
+INSERT INTO user_roles (user_id, role_id)
+SELECT '00000000-0000-4000-8000-0000000000ff', id FROM roles WHERE name='administrator';
+SQL
+
+# 3. Iniciar sesión guardando la cookie, y navegar con ella.
+curl -s -c /tmp/v.jar -o /dev/null -w "login=%{http_code}\n" \
+  --data-urlencode "email=verif@sandbox.local" --data-urlencode "password=<descartable>" \
+  https://librarian.ardf.dev/login          # 303
+curl -s -b /tmp/v.jar https://librarian.ardf.dev/admin/content/<tipo>/new | grep -o '<select[^>]*>'
+```
+
+**Lo que crees para verificar, borralo por la RUTA REAL del producto, nunca por SQL.** Un tipo de
+contenido borrado a mano deja `__compat_schema` desincronizada y el próximo reinicio no arranca
+(ver [La invalidación de metadata NO es opcional](#la-invalidación-de-metadata-no-es-opcional)). La
+ruta del panel es `POST /admin/content-types/{nombre}/delete` con `confirm_name` y `confirm_rows`
+—el `DELETE` de la API JSON es otra ruta, y usarla contra el panel devuelve `405`—; si no te
+acordás de los campos, pedí la página de borrado y leelos del formulario en vez de adivinarlos.
+
+### 4. Lecturas (necesarias pero NO suficientes)
 
 ```bash
 for r in /articles /products /terms /content-types; do
@@ -371,7 +450,7 @@ for r in /articles /products /terms /content-types; do
 done
 ```
 
-### 4. UNA ESCRITURA REAL — el paso que no se puede saltear
+### 5. UNA ESCRITURA REAL — el paso que no se puede saltear
 
 Tiene que atravesar la capa de autorización y ejercitar **lo que este deploy cambió**, no
 cualquier escritura genérica.
@@ -413,7 +492,7 @@ print('sobrantes:', [r[0] for r in c.execute(\"SELECT name FROM sqlite_master WH
 "
 ```
 
-### 5. Cerrar la credencial efímera
+### 6. Cerrar la credencial efímera
 
 ```bash
 python3 -c "
