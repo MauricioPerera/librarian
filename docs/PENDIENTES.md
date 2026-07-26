@@ -18,6 +18,9 @@ vez. El estado va en el índice para no tener que leerlas para saberlo.
 | 6 | [La migración sin ventana de corte nunca se ejercitó](#6-la-migración-sin-ventana-de-corte-nunca-se-ejercitó-media) | **RESUELTO** (ensayo 2026-07-25) |
 | 7 | [`/health` no mira la base, y una caída se ve como 401](#7-health-no-mira-la-base-y-una-caída-se-ve-como-401-alta) | **RESUELTO** (CONTRACT-24) |
 | 8 | [Un fallo de base da 500 en las rutas de datos y 503 en el resto](#8-un-fallo-de-base-da-500-en-las-rutas-de-datos-y-503-en-el-resto-baja) | **RESUELTO** (CONTRACT-25) |
+| 9 | [El selector de relación ofrece 100 filas y no tiene buscador](#9-el-selector-de-relación-ofrece-100-filas-y-no-tiene-buscador-baja) | ABIERTO |
+| 10 | [Abrir un formulario con relaciones cuesta N+1 consultas](#10-abrir-un-formulario-con-relaciones-cuesta-n1-consultas-baja) | ABIERTO |
+| 11 | [El listado genérico no muestra las columnas de relación](#11-el-listado-genérico-no-muestra-las-columnas-de-relación-baja) | ABIERTO |
 
 ## 1. No hay forma de otorgar permisos a un rol desde el producto (ALTA)
 
@@ -348,3 +351,66 @@ Queda como observación menor, no como hueco: las rutas de datos **no tienen
 límite de tiempo propio**, así que una base *lenta pero viva* podría demorarlas
 sin techo. Eso no se midió porque no se reprodujo; anotarlo como problema sin
 evidencia sería repetir el error de arriba.
+
+## 9. El selector de relación ofrece 100 filas y no tiene buscador (BAJA)
+
+**Qué pasa:** el `<select>` que CONTRACT-30 agregó al formulario de contenido
+ofrece las 100 filas más recientes del tipo destino — el MISMO tope que usa el
+listado genérico, para que lo elegible y lo visible coincidan. Si el destino
+tiene más, las demás no se pueden elegir desde el panel: la única vía es la API
+JSON, mandando el id.
+
+**Por qué es BAJA y no MEDIA:** el formulario **lo dice**. Cuando recorta,
+aparece un aviso con el número: *"Se están ofreciendo solo las 100 filas más
+recientes de «X». Si la fila que buscás no está en la lista, no la vas a poder
+elegir desde acá."* Un recorte silencioso sí sería un hueco serio —el admin no
+puede elegir lo que no ve, y no tendría cómo saber que no lo ve—; uno declarado
+es una limitación conocida.
+
+**Lo que SÍ está cubierto, y conviene no perderlo de vista al arreglar esto:** si
+la relación vigente de la fila que estás editando cae fuera del corte, se busca
+aparte y se antepone al `<select>`, ya seleccionada. Sin eso el control caería en
+la opción vacía y el siguiente guardado borraría una relación que nadie tocó —
+que es exactamente el defecto que CONTRACT-30 vino a cerrar, reconstruido a
+partir de su propio arreglo. Lo fija el test
+`TestPanelSaysWhenTheSelectorIsTruncated`, y se verificó rompiéndolo a propósito:
+al quitar el rescate, se pone rojo nombrando exactamente eso.
+
+**Qué haría falta:** un control con búsqueda (escribir para filtrar contra el
+servidor) en vez de una lista completa. Es un problema de UI distinto del que
+resolvió CONTRACT-30 y por eso quedó fuera de su alcance.
+
+## 10. Abrir un formulario con relaciones cuesta N+1 consultas (BAJA)
+
+**Qué pasa:** dibujar el formulario de un tipo con relaciones cuesta, **por cada
+relación declarada**, un `FetchContentType` (para resolver el destino desde el
+registro, que es lo que evita tratar un nombre como identificador) más un
+`listContentRows` de sus opciones. Y una consulta extra si el valor vigente cae
+fuera del tope del hueco 9. Un tipo con varias relaciones multiplica consultas
+cada vez que alguien abre el alta o la edición.
+
+**Por qué es BAJA:** son lecturas por rutina, acotadas por el mismo tope de 100,
+y ocurren al dibujar un formulario — no en un camino caliente ni en un bucle. No
+se midió que duela; se registra para que no se redescubra creyendo que es un bug.
+
+**Qué haría falta:** resolver las definiciones de destino de una sola vez, o
+cachearlas por petición. Cualquier arreglo tiene que respetar la razón por la que
+hoy se releen del registro: el nombre de un tipo nunca se trata como identificador
+sin resolverlo antes.
+
+## 11. El listado genérico no muestra las columnas de relación (BAJA)
+
+**Qué pasa:** `/admin/content/{tipo}` arma sus columnas recorriendo `def.Fields`,
+así que una relación declarada no aparece en la tabla. Se ve al abrir la fila,
+donde el `<select>` de CONTRACT-30 la muestra ya seleccionada, pero no en el
+listado: dos filas que apuntan a destinos distintos se ven idénticas.
+
+**Por qué es BAJA:** el dato no se pierde ni se corrompe, y hay una vía en el
+producto para verlo (abrir la fila). Es incompletitud de la vista, no un fallo.
+
+**Qué haría falta:** una columna más por relación. La decisión real no es
+técnica sino de presentación —mostrar el id no le sirve a nadie, así que habría
+que resolver la MISMA etiqueta legible que ya calcula el selector
+(`referenceOptionLabel`: primer campo declarado + 8 caracteres del id)—, y
+hacerlo para todas las filas del listado son N lecturas más. Es el hueco 10 otra
+vez, en otra pantalla: conviene resolver los dos juntos.
