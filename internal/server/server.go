@@ -125,11 +125,17 @@ func (h *handlers) registerRoutes(mux *http.ServeMux) {
 	// CONTRACT-18 adds the PUT: editing the FIELDS of an already-applied type,
 	// gated by the SAME content_types.manage permission (no new permission — it
 	// is the same class of action as creating one: it rebuilds a real table).
-	// There is still no DELETE: dropping a type was never in scope.
+	//
+	// CONTRACT-26 adds the DELETE, closing the lifecycle. SAME permission again
+	// (no new permission), and the same argument: it is the same class of action,
+	// taken to its end — it drops the real table and every row in it. Its guard
+	// is the strictest of the three (confirm_name + confirm_rows), see
+	// contenttypes.go.
 	mux.Handle("POST /content-types", h.requirePermission("content_types.manage")(http.HandlerFunc(h.handleCreateContentType)))
 	mux.Handle("GET /content-types", h.requireAuth(http.HandlerFunc(h.handleListContentTypes)))
 	mux.Handle("GET /content-types/{name}", h.requireAuth(http.HandlerFunc(h.handleGetContentType)))
 	mux.Handle("PUT /content-types/{name}", h.requirePermission("content_types.manage")(http.HandlerFunc(h.handleEditContentType)))
+	mux.Handle("DELETE /content-types/{name}", h.requirePermission("content_types.manage")(http.HandlerFunc(h.handleDeleteContentType)))
 
 	// CONTRACT-14: the GENERIC JSON CRUD over any dynamic content type, driven
 	// entirely by its persisted definition — no Go file per type. It lives under

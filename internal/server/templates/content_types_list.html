@@ -20,6 +20,7 @@
       <td class="cell-actions">
         <a class="btn btn-ghost" href="/admin/content/{{.Name}}">Ver contenido</a>
         <a class="btn btn-ghost" href="/admin/content-types/{{.Name}}/edit">Editar campos</a>
+        <a class="btn btn-ghost" href="/admin/content-types/{{.Name}}/delete">Borrar</a>
       </td>
     </tr>
     {{end}}
@@ -29,5 +30,5 @@
 {{else}}
 <p class="empty">No hay tipos de contenido dinámicos todavía. <a href="/admin/content-types/new">Creá el primero</a>.</p>
 {{end}}
-<p class="muted">Los campos de un tipo se pueden editar: agregar uno nuevo (queda vacío en el contenido que ya existe) o renombrar uno existente (conserva sus datos). Quitar un campo BORRA sus datos y pide confirmación. El tipo de un campo no se puede cambiar.</p>
+<p class="muted">Los campos de un tipo se pueden editar: agregar uno nuevo (queda vacío en el contenido que ya existe) o renombrar uno existente (conserva sus datos). Quitar un campo BORRA sus datos y pide confirmación. El tipo de un campo no se puede cambiar. «Borrar» elimina el tipo entero —definición, campos y su tabla con todas sus filas— y te muestra cuántas filas se van a destruir antes de pedirte la confirmación.</p>
 {{end}}

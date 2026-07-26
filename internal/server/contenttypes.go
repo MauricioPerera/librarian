@@ -9,12 +9,17 @@ package server
 //	GET    /content-types          list definitions (valid identity only)
 //	GET    /content-types/{name}   one definition with its fields (valid identity only)
 //	PUT    /content-types/{name}   EDIT the fields of an applied type (content_types.manage)
+//	DELETE /content-types/{name}   DELETE the type, its fields and its table (content_types.manage)
 //
 // CONTRACT-18 adds the PUT. The old comment here said editing had "no clean
 // path" because compat had no ALTER TABLE — that reasoning is unchanged, and
 // the PUT does NOT add one: it composes the operations compat already expresses
-// (create, copy, drop) into ONE transaction (store.EditContentType). There is
-// still NO DELETE: dropping a type was never in scope.
+// (create, copy, drop) into ONE transaction (store.EditContentType).
+//
+// CONTRACT-26 adds the DELETE, which closes the lifecycle (create → edit →
+// delete). It is the most destructive route of the product — it takes the table
+// and every row in it — so its confirmation is stricter than the PUT's, not
+// looser: see contentTypeDeleteRequest below.
 //
 // THE EDIT PAYLOAD (the API-shape decision of CONTRACT-18, argued in the
 // report). A field's identity is content_type_fields.id, NOT its name — a
@@ -37,8 +42,10 @@ package server
 // without passing it first.
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 
@@ -312,4 +319,109 @@ func emptyIfNil(v []string) []string {
 		return []string{}
 	}
 	return v
+}
+
+// contentTypeDeleteRequest is the DELETE body — the guard of CONTRACT-26.
+//
+// WHY IT IS NOT `{"confirm": true}`. A boolean is sent just as easily by mistake
+// as on purpose, and this operation destroys a table and every row in it.
+// CONTRACT-18 already refused a boolean for the PARTIAL loss of removing fields
+// and demanded the LIST OF NAMES being destroyed; this is the TOTAL loss, so the
+// criterion is extended rather than relaxed. The caller must state:
+//
+//		{"confirm_name": "eventos", "confirm_rows": 3}
+//
+//	  - confirm_name must equal the type being deleted, so a client that had a
+//	    DIFFERENT type on screen cannot succeed by accident;
+//	  - confirm_rows must equal the number of rows that will be destroyed — a
+//	    value nobody can produce without having asked the server for it, which is
+//	    exactly the property "a confirmation that cannot be sent without having
+//	    read it" requires. It is also a freshness token: if content was loaded
+//	    between reading the count and confirming, the numbers no longer match and
+//	    the deletion is refused instead of silently taking rows nobody saw.
+//
+// ConfirmRows is a POINTER so that "I confirm zero rows" is distinguishable from
+// "I sent no count". Without that distinction an empty body would delete any
+// type that happened to be empty.
+//
+// HOW A CALLER LEARNS THE COUNT: the refusal itself carries it. A DELETE with no
+// (or a wrong) confirmation answers 400 with `rows` and with the exact
+// `confirm_name`/`confirm_rows` to resend — the same echo-what-to-confirm shape
+// the PUT uses for `removes_data_of`/`confirm_remove`. No existing route changed
+// its response to carry the count.
+type contentTypeDeleteRequest struct {
+	ConfirmName string `json:"confirm_name"`
+	ConfirmRows *int64 `json:"confirm_rows"`
+}
+
+// handleDeleteContentType deletes a dynamic content type — definition, fields
+// and real table with all its rows — in one transaction
+// (content_types.manage, the SAME permission creation and editing use; no new
+// permission).
+//
+// Ordering mirrors handleEditContentType: everything decidable without writing
+// is decided first (body, 404), then the mutex that already serializes
+// schema-mutating requests is taken, and the store re-runs the confirmation
+// check inside its own transaction as a fail-closed guard for non-HTTP callers.
+func (h *handlers) handleDeleteContentType(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+
+	// An ABSENT body is a legitimate request here: it is how a client asks
+	// "what would this destroy?" and gets the 400 that tells it. It must not be
+	// confused with a malformed one, so the body is read first and only decoded
+	// when there is something to decode.
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	var req contentTypeDeleteRequest
+	if len(bytes.TrimSpace(raw)) > 0 {
+		if err := json.Unmarshal(raw, &req); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+	}
+	confirm := store.DeleteConfirmation{Name: strings.TrimSpace(req.ConfirmName)}
+	if req.ConfirmRows != nil {
+		confirm.Rows, confirm.RowsStated = *req.ConfirmRows, true
+	}
+
+	h.schemaMu.Lock()
+	deleted, err := store.DeleteContentType(r.Context(), h.store, name, confirm)
+	h.schemaMu.Unlock()
+
+	var refusal store.DeleteConfirmationError
+	switch {
+	case errors.Is(err, store.ErrContentTypeNotFound):
+		writeError(w, http.StatusNotFound, "content type not found")
+		return
+	case errors.As(err, &refusal):
+		// The refusal that SHOWS what would be destroyed — including the row
+		// count — and hands back the exact confirmation to resend. Nothing was
+		// written: the whole check happens before, and inside, one transaction.
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error":             refusal.Error(),
+			"name":              refusal.TypeName,
+			"table":             refusal.TableName,
+			"rows":              refusal.Rows,
+			"table_was_missing": refusal.TableMissing,
+			"confirm_name":      refusal.TypeName,
+			"confirm_rows":      refusal.Rows,
+			"nothing_was_done":  true,
+		})
+		return
+	case err != nil:
+		h.writeOperationFailure(w, r, err, "could not delete content type")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"name":              deleted.TypeName,
+		"table":             deleted.TableName,
+		"deleted":           true,
+		"rows_deleted":      deleted.Rows,
+		"fields_deleted":    emptyIfNil(deleted.Fields),
+		"table_was_missing": deleted.TableMissing,
+	})
 }

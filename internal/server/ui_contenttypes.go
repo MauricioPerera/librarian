@@ -31,6 +31,7 @@ package server
 import (
 	"errors"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/MauricioPerera/librarian/internal/schema"
@@ -55,6 +56,11 @@ var (
 	// position" into a RENAME instead of a drop-plus-add.
 	adminContentTypesEditTmpl        = mustParseFS("templates/layout.html", "templates/content_types_edit.html", "templates/content_type_edit_field_row.html")
 	adminContentTypeEditFieldRowTmpl = mustParseFS("templates/content_type_edit_field_row.html")
+	// CONTRACT-26: the delete confirmation page. It is its own template because
+	// it shows something no other page shows and no other page needs: HOW MANY
+	// ROWS the action destroys, and the two hidden inputs that carry that number
+	// (and the name) into the confirming submit.
+	adminContentTypesDeleteTmpl = mustParseFS("templates/layout.html", "templates/content_types_delete.html")
 )
 
 // fieldTypeOption is one <option> of the per-row field-type selector. The
@@ -104,6 +110,11 @@ func (h *handlers) registerAdminContentTypeRoutes(mux *http.ServeMux) {
 	mux.Handle("GET /admin/content-types/{name}/edit", h.requireSession(http.HandlerFunc(h.handleAdminContentTypeEditForm)))
 	mux.Handle("GET /admin/content-types/edit/field", h.requireSession(http.HandlerFunc(h.handleAdminContentTypeEditFieldRow)))
 	mux.Handle("POST /admin/content-types/{name}", h.requireSessionPermission("content_types.manage")(http.HandlerFunc(h.handleAdminContentTypeEdit)))
+	// CONTRACT-26 T3 — deleting a type, in the SAME two steps the field editor
+	// uses: nothing is destroyed until a second, explicit submit that carries
+	// exactly what the first step SHOWED (the name and the row count).
+	mux.Handle("GET /admin/content-types/{name}/delete", h.requireSession(http.HandlerFunc(h.handleAdminContentTypeDeleteForm)))
+	mux.Handle("POST /admin/content-types/{name}/delete", h.requireSessionPermission("content_types.manage")(http.HandlerFunc(h.handleAdminContentTypeDelete)))
 }
 
 // handleAdminContentTypesList renders every persisted definition with its
@@ -289,6 +300,115 @@ func (h *handlers) handleAdminContentTypeEdit(w http.ResponseWriter, r *http.Req
 		return
 	}
 	http.Redirect(w, r, "/admin/content-types", http.StatusSeeOther)
+}
+
+// adminContentTypeDeletePage is the view model of the delete confirmation page.
+//
+// Rows is the reason this page exists at all. The contract's requirement is that
+// whoever confirms SEES how many rows the action destroys BEFORE confirming — a
+// type with zero rows and one with ten thousand are not the same decision — and
+// today there is no other way to find that out from the panel. The number is
+// both displayed and carried in a hidden input, so the submit that follows
+// confirms exactly what was on screen.
+type adminContentTypeDeletePage struct {
+	pageData
+	Name         string
+	Table        string
+	Fields       []string
+	Rows         int64
+	TableMissing bool
+	Error        string
+}
+
+// handleAdminContentTypeDeleteForm is STEP ONE: it shows what the deletion would
+// destroy. It writes nothing — it is a plan, not an action — and it is the only
+// place the row count comes from, which is what makes the second step
+// impossible to reach without having seen it.
+func (h *handlers) handleAdminContentTypeDeleteForm(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	plan, err := store.PlanContentTypeDeletion(r.Context(), h.store, name)
+	switch {
+	case errors.Is(err, store.ErrContentTypeNotFound):
+		h.renderNotFound(w, r)
+		return
+	case err != nil:
+		h.httpOperationFailure(w, r, err)
+		return
+	}
+	h.renderContentTypeDelete(w, r, http.StatusOK, plan, "")
+}
+
+// handleAdminContentTypeDelete is STEP TWO (content_types.manage). It only
+// proceeds when the submitted form carries the exact name and the exact row
+// count the page showed; anything else comes back as the SAME page with the
+// LIVE figures and an explanation, having destroyed nothing.
+//
+// The store re-checks the confirmation inside its own transaction anyway, so —
+// exactly as with the field editor — the UI is not the only thing standing
+// between an admin and irreversible loss.
+func (h *handlers) handleAdminContentTypeDelete(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if err := r.ParseForm(); err != nil {
+		h.httpOperationFailure(w, r, err)
+		return
+	}
+	confirm := store.DeleteConfirmation{Name: strings.TrimSpace(r.PostFormValue("confirm_name"))}
+	if raw := strings.TrimSpace(r.PostFormValue("confirm_rows")); raw != "" {
+		rows, err := strconv.ParseInt(raw, 10, 64)
+		if err == nil {
+			confirm.Rows, confirm.RowsStated = rows, true
+		}
+	}
+
+	h.schemaMu.Lock()
+	_, err := store.DeleteContentType(r.Context(), h.store, name, confirm)
+	h.schemaMu.Unlock()
+
+	var refusal store.DeleteConfirmationError
+	switch {
+	case errors.Is(err, store.ErrContentTypeNotFound):
+		h.renderNotFound(w, r)
+		return
+	case errors.As(err, &refusal):
+		h.rerenderContentTypeDelete(w, r, name, refusal.Error())
+		return
+	case err != nil:
+		h.rerenderContentTypeDelete(w, r, name, "No se pudo borrar el tipo de contenido: "+err.Error())
+		return
+	}
+	http.Redirect(w, r, "/admin/content-types", http.StatusSeeOther)
+}
+
+// rerenderContentTypeDelete re-reads the LIVE plan and shows the page again with
+// the error. Re-reading matters: the commonest reason to land here is that the
+// row count moved, and echoing the stale number back would ask the admin to
+// confirm a figure that is already wrong again.
+func (h *handlers) rerenderContentTypeDelete(w http.ResponseWriter, r *http.Request, name, msg string) {
+	plan, err := store.PlanContentTypeDeletion(r.Context(), h.store, name)
+	switch {
+	case errors.Is(err, store.ErrContentTypeNotFound):
+		h.renderNotFound(w, r)
+		return
+	case err != nil:
+		h.httpOperationFailure(w, r, err)
+		return
+	}
+	h.renderContentTypeDelete(w, r, http.StatusBadRequest, plan, msg)
+}
+
+// renderContentTypeDelete writes the confirmation page with the given status.
+func (h *handlers) renderContentTypeDelete(w http.ResponseWriter, r *http.Request, status int, plan store.ContentTypeDeletion, msg string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
+	_ = adminContentTypesDeleteTmpl.ExecuteTemplate(w, "layout", adminContentTypeDeletePage{
+		pageData:     h.page(r, "Borrar tipo de contenido — librarian"),
+		Name:         plan.TypeName,
+		Table:        plan.TableName,
+		Fields:       plan.Fields,
+		Rows:         plan.Rows,
+		TableMissing: plan.TableMissing,
+		Error:        msg,
+	})
 }
 
 // unconfirmed returns the removals the submitted form did not confirm.

@@ -75,7 +75,15 @@ exportabilidad dual-motor que motiva todo el proyecto.
 - **Tipos de campo avanzados** (JSON, `vector(N)`, dominios, columnas generadas) en la UI de
   creación — reservados a los tipos de contenido definidos por código, donde un desarrollador
   entiende las implicancias (ej. `vector(N)` requiere `pgvector` en el destino de export).
-- **Borrar un CPT dinámico completo** (la tabla) — no se discutió, queda fuera de alcance salvo
+- ~~**Borrar un CPT dinámico completo** (la tabla)~~ — **YA NO: implementado por CONTRACT-26**
+  (`docs/reports/CONTRACT-26-REPORT.md`), que es el "contrato futuro" que el texto original
+  contemplaba. Se decidió explícitamente, y la razón original ("no se discutió") nunca fue una
+  objeción técnica: la pieza que faltaba era `DROP TABLE`, que `compat` v0.2.0 trajo. Se borra por
+  `DELETE /content-types/{nombre}` y por `/admin/content-types/{nombre}/delete`, con la definición,
+  sus campos y la tabla real dentro de UNA transacción, y con una confirmación que exige el nombre
+  exacto Y el número exacto de filas a destruir. El texto original se conserva:
+
+  **Borrar un CPT dinámico completo** (la tabla) — no se discutió, queda fuera de alcance salvo
   que se decida explícitamente en un contrato futuro.
 - **Cualquier capacidad ya excluida en `DEFINITION.md`/`DEFINITION-UI.md`** — sigue excluida;
   esta fase no las reabre.
