@@ -15,7 +15,7 @@ vez. El estado va en el índice para no tener que leerlas para saberlo.
 | 3 | [Colisión de nombre entre un CPT y una tabla de código](#3-colisión-de-nombre-entre-un-cpt-dinámico-y-una-tabla-de-código-futura-baja) | **RESUELTO** (CONTRACT-17) |
 | 4 | [Crear la primera identidad desde el producto](#4-no-hay-forma-de-crear-la-primera-identidad-desde-el-producto-media) | **RESUELTO** (CONTRACT-22) |
 | 5 | [`pgvector` obligatorio aunque no se usen vectores](#5-pgvector-es-obligatorio-aunque-no-se-usen-vectores-media) | **RESUELTO** (CONTRACT-23) |
-| 6 | [La migración sin ventana de corte nunca se ejercitó](#6-la-migración-sin-ventana-de-corte-nunca-se-ejercitó-media) | Abierto (MEDIA) |
+| 6 | [La migración sin ventana de corte nunca se ejercitó](#6-la-migración-sin-ventana-de-corte-nunca-se-ejercitó-media) | **RESUELTO** (ensayo 2026-07-25) |
 
 ## 1. No hay forma de otorgar permisos a un rol desde el producto (ALTA)
 
@@ -207,9 +207,24 @@ eso para el export y para el contrato de equivalencia.
 
 ## 6. La migración sin ventana de corte nunca se ejercitó (MEDIA)
 
-**Estado:** abierto.
+**Estado:** RESUELTO por un ensayo operativo (2026-07-25), documentado en
+`docs/OPERATIONS.md` → "Migración con el servicio arriba". Se ejecutó un
+`compat cutover` real contra una instancia de `librarian` con escrituras
+concurrentes: auditoría exacta en 10 features, captura instalada, snapshot,
+drenaje de 41 cambios y digests idénticos. Verificado además que la ÚLTIMA
+escritura previa al quiesce llegó al destino, y que `librarian` arranca contra
+ese destino y sirve —login con la credencial de la fuente y escritura nueva 201.
 
-**Qué pasa:** la promesa del sistema es migrar a PostgreSQL "sin apagar la
+**El hallazgo, que cambia cómo se planifica:** `cutover` NO significa "nunca
+dejar de escribir". El drenaje termina cuando la captura ve N sondeos
+consecutivos sin cambios, así que **si la aplicación sigue escribiendo esa
+condición no se cumple nunca** — medido: con una escritura cada 0.4 s, a los 10
+minutos el journal tenía 1234 entradas y seguía creciendo. La ventana sin
+servicio existe igual; lo que cambia es que pasa de "toda la copia" a "lo que
+tarde en drenar lo escrito mientras copiaba", que es una ganancia real y grande.
+El texto de abajo se conserva como registro de cómo se identificó el hueco.
+
+**Qué pasaba:** la promesa del sistema es migrar a PostgreSQL "sin apagar la
 aplicación". Hoy están verificadas las dos mitades por separado: la aplicación
 **corre** sobre PostgreSQL (CONTRACT-21, con transcripción HTTP real), y los
 datos **se trasladan** con equivalencia verificada por digest (`compat copy`,

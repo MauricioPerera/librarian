@@ -24,13 +24,13 @@ del esquema es Go (`schema.Build()`); el JSON del esquema se **genera** con
 Lo que este runbook garantiza es que el esquema y los datos se trasladan sin
 pérdida y sin reescritura, verificado por digest.
 
-`compat copy` —el camino de este runbook— es una migración por **snapshot**: se
-exporta un estado y se importa. Las escrituras que ocurran durante la copia no
-viajan. Para migrar sin ventana de corte existe `compat cutover` (captura de
-cambios, drenaje y corte), que **nunca se ejercitó contra `librarian`**: está
-probado en la suite e2e del propio paquete, no con este esquema ni con estos
-datos. Si algún día hace falta, es trabajo nuevo con su propio ensayo contra una
-copia.
+`compat copy` —el camino principal de este runbook— es una migración por
+**snapshot**: se exporta un estado y se importa. Las escrituras que ocurran
+durante la copia **no viajan**, así que exige detener el servicio mientras dura.
+
+Para no detenerlo durante toda la copia existe `compat cutover`, y **ya está
+ejercitado contra `librarian`**: ver
+[Migración con el servicio arriba](#migración-con-el-servicio-arriba-compat-cutover).
 
 ## Fundamento
 
@@ -350,6 +350,82 @@ falla acá es del lado de cómo `librarian` arma su esquema/config, no de
   `JSONType` → `TEXT` para preservar el payload byte-a-byte) y se canonicaliza
   al exportar; por eso la verificación compara el `metadata` parseado como JSON,
   no el texto crudo.
+
+## Migración con el servicio arriba (`compat cutover`)
+
+Ejercitado contra `librarian` el 2026-07-25, con una instancia real y escrituras
+concurrentes. Lo que sigue es lo que se ejecutó y lo que se aprendió.
+
+### Lo primero, porque cambia cómo se planifica
+
+**`cutover` NO significa "nunca dejar de escribir".** Significa que la ventana
+sin servicio es el **drenaje**, no la copia.
+
+El drenaje termina cuando la captura ve `drain_polls` sondeos consecutivos sin
+cambios nuevos. Si la aplicación sigue escribiendo, **esa condición no se cumple
+nunca**. Medido: con una escritura cada 0.4 s y sondeo cada 0.5 s, el cutover
+completó auditoría, captura y snapshot, y quedó drenando indefinidamente — a los
+10 minutos el journal tenía 1234 entradas y seguía creciendo. No es un fallo del
+paquete: es lo que la fase significa.
+
+Entonces la secuencia real es:
+
+```
+1. Arrancar el cutover          ← servicio ARRIBA, escribiendo normalmente
+2. Auditoría, captura, snapshot ← servicio ARRIBA (es la parte larga)
+──────── acá empieza la caída, y es corta ────────
+3. Detener las escrituras
+4. El drenaje converge, verifica digests y devuelve "ready"
+5. Apuntar el servicio al destino y arrancarlo
+──────── acá termina ────────
+```
+
+La ganancia frente a `compat copy` es real y es grande: la ventana pasa de "toda
+la copia" a "lo que tarde en drenar lo escrito mientras copiaba".
+
+### El procedimiento
+
+La configuración es la misma de `compat copy` más un bloque `options`:
+
+```json
+"options": { "poll_interval_ms": 500, "drain_polls": 3, "batch_limit": 500 }
+```
+
+```bash
+compat cutover --dry-run cutover.json   # solo lectura: audita y muestra el plan
+compat cutover cutover.json             # el real
+```
+
+El `--dry-run` no instala nada ni escribe: audita, cuenta filas por tabla y dice
+si el destino ya tiene tablas. Corrélo siempre antes.
+
+Salida de un cutover exitoso:
+
+```
+compat cutover: audit: exact coverage for 10 required features
+compat cutover: capture: change capture installed on source
+compat cutover: snapshot: imported into destination
+compat cutover: catch-up: drained after 41 changes
+{"status":"ready","source_digest":"6c955ae6…","destination_digest":"6c955ae6…","changes_applied":41}
+```
+
+`status: ready` con los dos digests iguales es la certificación. **El destino
+todavía no está en uso**: apuntar el servicio es el paso 5, y es tuyo.
+
+### Verificación, además del digest
+
+Lo mismo que para `compat copy` (identidad de las filas, recuento de tablas,
+columna vectorial con datos), y una específica de este camino: **que la ÚLTIMA
+escritura anterior al quiesce esté en el destino**. Es lo que distingue un
+drenaje completo de uno que cortó antes de tiempo.
+
+En el ensayo: 47 artículos en los dos lados, y el artículo `durante-42` —el
+último que la aplicación escribió antes de detenerse— presente en el destino.
+
+La prueba que cierra el asunto es arrancar `librarian` contra el destino y
+**servir desde ahí**: en el ensayo, autenticación con la misma credencial de la
+fuente, el contenido migrado visible, y una escritura nueva devolviendo `201`.
+
 ## Batería dual-motor de `internal/auth` (CONTRACT-19)
 
 Independiente del flujo de exportación de arriba: verifica que las funciones
