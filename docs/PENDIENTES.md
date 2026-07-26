@@ -16,6 +16,7 @@ vez. El estado va en el índice para no tener que leerlas para saberlo.
 | 4 | [Crear la primera identidad desde el producto](#4-no-hay-forma-de-crear-la-primera-identidad-desde-el-producto-media) | **RESUELTO** (CONTRACT-22) |
 | 5 | [`pgvector` obligatorio aunque no se usen vectores](#5-pgvector-es-obligatorio-aunque-no-se-usen-vectores-media) | **RESUELTO** (CONTRACT-23) |
 | 6 | [La migración sin ventana de corte nunca se ejercitó](#6-la-migración-sin-ventana-de-corte-nunca-se-ejercitó-media) | **RESUELTO** (ensayo 2026-07-25) |
+| 7 | [`/health` no mira la base, y una caída se ve como 401](#7-health-no-mira-la-base-y-una-caída-se-ve-como-401-alta) | Abierto (ALTA) |
 
 ## 1. No hay forma de otorgar permisos a un rol desde el producto (ALTA)
 
@@ -244,3 +245,39 @@ cutover no está ejercitado, en vez de dejarlo insinuado.
 **Qué haría falta:** un ensayo de `compat cutover` contra una copia de la base
 real, con escrituras concurrentes durante la copia, verificando que se drenan.
 Es trabajo con su propio contrato, no un paso de un deploy.
+
+
+## 7. `/health` no mira la base, y una caída se ve como 401 (ALTA)
+
+**Estado:** abierto.
+
+**Qué pasa:** `/health` responde `{"status":"ok"}` aunque la base esté caída —
+comprueba que el proceso vive, no que el sistema pueda servir. Y peor: con la
+base detenida, el login y las lecturas devuelven **401**, no un 5xx. Una caída
+de infraestructura se presenta como *credenciales incorrectas*.
+
+**Por qué importa ahora y antes no:** con SQLite embebido la base no podía estar
+"caída" por separado; era un archivo en el mismo proceso. Desde que el motor
+puede ser PostgreSQL (CONTRACT-21) hay un segundo proceso que puede fallar solo,
+y esa distinción entre *vivo* y *listo para servir* pasa a ser real.
+
+**Cómo se descubrió (2026-07-26, al desplegar la instancia en limpio sobre
+PostgreSQL):** en la verificación post-deploy se detuvo el contenedor de la base
+a propósito para probar la resiliencia. Medido con la base en `exited`:
+
+```
+/health            -> {"status":"ok"}
+POST /auth/login   -> 401
+GET  /content-types -> 401
+```
+
+**Las dos consecuencias, y la segunda es la grave:** un monitor externo o un
+balanceador ven la instancia sana mientras no puede atender nada; y quien
+diagnostique el incidente va a perseguir un problema de credenciales mientras la
+causa es que la base no está.
+
+**Qué haría falta:** separar *vivo* de *listo* — que la comprobación de salud
+consulte la base (un `ping` barato basta) o que exista una segunda ruta que sí lo
+haga, y que un fallo de conexión a la base se traduzca en 5xx y no en 401. Ojo al
+diseñarlo: la ruta de salud no debe quedar cara ni convertirse en una vía de
+carga contra la base, y no debe filtrar detalles de la conexión.
