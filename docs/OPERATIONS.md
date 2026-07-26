@@ -184,17 +184,32 @@ quien migraba una instancia real tenía que deducir su forma leyendo el código 
 un test o un reporte de contrato archivado. Acá están, y son todo lo que hace
 falta escribir a mano:
 
-`audit.json` — el contrato entre motores:
+`audit.json` — el contrato entre motores. **Desde `compat` v0.6.0 no se escriben
+las features a mano**: se le pasa el esquema y las infiere, igual que hace `copy`.
+La lista escrita a mano era una segunda fuente de verdad que se desincronizaba
+del esquema en cuanto alguien agregaba una capacidad.
 
 ```json
 {
   "source":      {"engine": "sqlite",   "version": {"major": 3}},
   "destination": {"engine": "postgres", "version": {"major": 17}},
-  "required_features": ["canonical_full_text", "uuid", "json", "primary_keys",
-    "canonical_check_constraints", "canonical_foreign_keys", "tables",
-    "canonical_vectors"]
+  "schema_ref": "schema.json"
 }
 ```
+
+`schema_ref` se resuelve **relativo al propio `audit.json`**, no al directorio
+desde donde lo invocás, y apunta al archivo que produce el paso 2 — el mismo que
+consume `migration.json`. Declarar features a mano sigue funcionando (los
+`audit.json` anteriores no se rompen) y se pueden combinar: las declaradas se
+conservan y se suman las inferidas que falten.
+
+**Por qué no conviene la lista a mano, con evidencia de este mismo documento:**
+la versión anterior de esta sección traía ocho features escritas a mano. Contra
+el esquema real de una instalación en limpio, `schema_ref` infiere **diez** —
+sumaba `canonical_routines` y `canonical_views`, que el esquema usa y la lista a
+mano omitía. Una lista escrita a mano no está mal el día que se escribe: se
+queda vieja después, en silencio, y el audit pasa igual porque solo comprueba lo
+que le pediste que comprobara.
 
 `migration.json` — el mismo contrato, más de dónde a dónde. **Modo `0600`: lleva
 el DSN con la contraseña.**
@@ -261,32 +276,36 @@ Las features son las que `InferFeatures` deriva del esquema, así que la lista
 CRECE con el esquema: desde CONTRACT-05 aparece también `canonical_vectors`
 (`status: exact`).
 
-**`required_features: []` hace que este paso no compruebe NADA — y salga 0.**
-Medido siguiendo este mismo documento en una instalación en limpio:
+**Un audit que no exige nada ya no puede parecer un audit que pasó.** Hasta
+`compat` v0.5.1, un contrato con `required_features: []` —que es lo que este
+documento indicaba— devolvía una lista vacía de hallazgos y salía 0:
 
 ```
+# v0.5.1 y anteriores
 $ compat audit audit.json
 []
 audit_exit=0
 ```
 
-Una lista vacía es un contrato que no exige nada, así que no hay nada que
-auditar y el resultado es una lista vacía de hallazgos con código de salida
-exitoso: **indistinguible de un audit que pasó**. Es el único paso del
-procedimiento que puede mentirte por omisión, y este documento decía que la
-dejaras vacía a la vez que mostraba siete hallazgos como salida esperada. Las
-dos cosas no podían ser ciertas.
+Nada que exigir, nada que auditar, exit exitoso: **indistinguible de un audit que
+pasó**, justo en el paso que existe para verificar ANTES de escribir en el
+destino. Encontrado siguiendo este mismo documento en una instalación en limpio,
+y corregido en `compat` v0.6.0, que **rechaza** ese contrato:
 
-**Regla: si el paso 3 imprime `[]`, el paso 3 no se hizo.** Tiene que imprimir
-una línea por feature, todas `exact`. Si tu esquema usa capacidades que no están
-en la lista de arriba, agregalas; la lista crece con el esquema y por eso el
-`compat copy` del paso 4 las infiere por su cuenta — pero **`copy` infiriendo no
-sustituye al audit**, porque para cuando `copy` corre ya estás escribiendo en el
-destino.
+```
+# v0.6.0
+$ compat audit audit.json
+{"status":"error","code":"ERR_CONFIG","message":"contract requires no features: …"}
+audit_exit=1
+```
 
-`compat copy` sí infiere las features solo, así que el `contract` que va DENTRO
-de `migration.json` puede llevar la lista vacía sin perder nada. El que no puede
-es `audit.json`.
+Por eso el `audit.json` de arriba lleva `schema_ref` en vez de una lista: es la
+salida recomendada, y la que no se desincroniza.
+
+`compat copy` también infiere las features por su cuenta, así que el `contract`
+que va DENTRO de `migration.json` puede ir sin lista. Pero **`copy` infiriendo no
+sustituye al audit**: para cuando `copy` corre ya estás escribiendo en el destino,
+y el audit existe para enterarte antes.
 
 **`canonical_vectors: exact` no significa que el destino pueda recibirlo.**
 Significa que la capacidad se traduce sin pérdida entre motores. Que el destino
