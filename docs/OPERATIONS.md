@@ -32,6 +32,27 @@ Para no detenerlo durante toda la copia existe `compat cutover`, y **ya está
 ejercitado contra `librarian`**: ver
 [Migración con el servicio arriba](#migración-con-el-servicio-arriba-compat-cutover).
 
+### El recorrido completo, ejecutado de punta a punta
+
+El 2026-07-26 se hizo una **instalación en limpio siguiendo únicamente el README
+y este documento**, para encontrar lo que quien ya conoce el sistema no ve. Salió
+bien, y las tres cosas que salieron mal eran de la documentación —están
+corregidas más abajo, cada una donde se tropezó—, no del producto:
+
+```
+compilar → --bootstrap → arrancar sobre SQLite → poblar por HTTP real
+  → --dump-schema → compat audit → compat copy → arrancar sobre PostgreSQL
+
+copy:  source_digest == destination_digest, equivalent:true
+sobre el destino: login con la MISMA contraseña, artículos y contenido dinámico
+                  presentes, y una relación entre tipos dinámicos INTACTA
+                  (borrar la fila referenciada sigue dando 400: la FK es real)
+```
+
+Lo último no se había probado nunca por este camino: que una **relación entre
+tipos dinámicos** (CONTRACT-27) sobreviva la migración *como clave foránea real
+en el destino*, y no solo como el uuid guardado en una columna.
+
 ## Fundamento
 
 `compat copy` **exige** el esquema explícito en su JSON de config (`schema_ref`
@@ -48,14 +69,21 @@ lo importa en el destino, re-exporta el snapshot del destino y compara digests:
 - Go 1.26+ (el módulo `librarian`).
 - El CLI `compat` instalado una sola vez:
 
+  **La versión no se escribe de memoria: se lee del `go.mod`**, que es la única
+  fuente de verdad de con qué versión se probó este proyecto.
+
   ```powershell
-  go install github.com/MauricioPerera/sqlite-postgres-compat/cmd/compat@v0.4.0
+  # La versión sale del go.mod, no de este documento.
+  $v = (Select-String -Path go.mod -Pattern 'sqlite-postgres-compat (v\S+)').Matches.Groups[1].Value
+  go install "github.com/MauricioPerera/sqlite-postgres-compat/cmd/compat@$v"
   # queda en $env:USERPROFILE\go\bin\compat.exe  (en el PATH de Go)
   ```
 
-  > Usá la MISMA versión que declara el `go.mod` de librarian. Si un tag recién
-  > publicado falla con un 500 de `sum.golang.org`, es propagación del checksum:
-  > reintentá una vez antes de diagnosticar.
+  > Este documento fijaba `@v0.4.0` mientras el `go.mod` ya pedía `v0.5.1`, y en
+  > la misma línea decía "usá la misma versión que el go.mod": se contradecía a
+  > sí mismo. Por eso ahora el comando **deriva** la versión en vez de afirmarla.
+  > Si un tag recién publicado falla con un 500 de `sum.golang.org`, es
+  > propagación del checksum: reintentá una vez antes de diagnosticar.
 
   > No uses `go run` para medir exit codes de `compat`: en Windows `go run`
   > colapsa cualquier exit≠0 a 1, invalidando la verificación. Corre el
@@ -149,6 +177,40 @@ PG destination cleaned (librarian tables dropped if present).
 > del destino si el PG está vacío. La limpieza del destino (DROP … CASCADE) es
 > solo para repetibilidad; en un cutover real el destino estaría vacío.
 
+#### La forma de los dos archivos, para el caso real
+
+Este documento nombraba los campos pero **no mostraba los archivos**, así que
+quien migraba una instancia real tenía que deducir su forma leyendo el código de
+un test o un reporte de contrato archivado. Acá están, y son todo lo que hace
+falta escribir a mano:
+
+`audit.json` — el contrato entre motores:
+
+```json
+{
+  "source":      {"engine": "sqlite",   "version": {"major": 3}},
+  "destination": {"engine": "postgres", "version": {"major": 17}},
+  "required_features": ["canonical_full_text", "uuid", "json", "primary_keys",
+    "canonical_check_constraints", "canonical_foreign_keys", "tables",
+    "canonical_vectors"]
+}
+```
+
+`migration.json` — el mismo contrato, más de dónde a dónde. **Modo `0600`: lleva
+el DSN con la contraseña.**
+
+```json
+{
+  "source_dsn": "librarian.db",
+  "destination_dsn": "postgres://usuario:password@host:5432/base?sslmode=disable",
+  "contract": { "…lo mismo que audit.json…" },
+  "schema_ref": "schema.json"
+}
+```
+
+`schema_ref` es relativo al directorio del propio `migration.json`, y apunta al
+archivo que produce el paso 2.
+
 ### 2. Generar el JSON del esquema desde el binario de librarian
 
 ```powershell
@@ -197,9 +259,34 @@ Salida esperada (stdout, una línea JSON con un `Finding` por feature, todas
 
 Las features son las que `InferFeatures` deriva del esquema, así que la lista
 CRECE con el esquema: desde CONTRACT-05 aparece también `canonical_vectors`
-(`status: exact`). No trates esta lista como fija ni la declares a mano en el
-contrato — `required_features` va vacío y `compat copy` las infiere solo; una
-lista mantenida a mano es una segunda fuente de verdad que se desincroniza.
+(`status: exact`).
+
+**`required_features: []` hace que este paso no compruebe NADA — y salga 0.**
+Medido siguiendo este mismo documento en una instalación en limpio:
+
+```
+$ compat audit audit.json
+[]
+audit_exit=0
+```
+
+Una lista vacía es un contrato que no exige nada, así que no hay nada que
+auditar y el resultado es una lista vacía de hallazgos con código de salida
+exitoso: **indistinguible de un audit que pasó**. Es el único paso del
+procedimiento que puede mentirte por omisión, y este documento decía que la
+dejaras vacía a la vez que mostraba siete hallazgos como salida esperada. Las
+dos cosas no podían ser ciertas.
+
+**Regla: si el paso 3 imprime `[]`, el paso 3 no se hizo.** Tiene que imprimir
+una línea por feature, todas `exact`. Si tu esquema usa capacidades que no están
+en la lista de arriba, agregalas; la lista crece con el esquema y por eso el
+`compat copy` del paso 4 las infiere por su cuenta — pero **`copy` infiriendo no
+sustituye al audit**, porque para cuando `copy` corre ya estás escribiendo en el
+destino.
+
+`compat copy` sí infiere las features solo, así que el `contract` que va DENTRO
+de `migration.json` puede llevar la lista vacía sin perder nada. El que no puede
+es `audit.json`.
 
 **`canonical_vectors: exact` no significa que el destino pueda recibirlo.**
 Significa que la capacidad se traduce sin pérdida entre motores. Que el destino
