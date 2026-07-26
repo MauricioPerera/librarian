@@ -13,7 +13,7 @@ vez. El estado va en el índice para no tener que leerlas para saberlo.
 | 1 | [Otorgar permisos a un rol desde el producto](#1-no-hay-forma-de-otorgar-permisos-a-un-rol-desde-el-producto-alta) | **RESUELTO** (CONTRACT-16) |
 | 2 | [Editar campos de un tipo dinámico](#2-editar-campos-de-un-tipo-de-contenido-dinámico-media) | **RESUELTO** (CONTRACT-18) |
 | 3 | [Colisión de nombre entre un CPT y una tabla de código](#3-colisión-de-nombre-entre-un-cpt-dinámico-y-una-tabla-de-código-futura-baja) | **RESUELTO** (CONTRACT-17) |
-| 4 | [Crear la primera identidad desde el producto](#4-no-hay-forma-de-crear-la-primera-identidad-desde-el-producto-media) | Abierto (MEDIA) |
+| 4 | [Crear la primera identidad desde el producto](#4-no-hay-forma-de-crear-la-primera-identidad-desde-el-producto-media) | **RESUELTO** (CONTRACT-22) |
 | 5 | [`pgvector` obligatorio aunque no se usen vectores](#5-pgvector-es-obligatorio-aunque-no-se-usen-vectores-media) | Abierto (MEDIA) |
 | 6 | [La migración sin ventana de corte nunca se ejercitó](#6-la-migración-sin-ventana-de-corte-nunca-se-ejercitó-media) | Abierto (MEDIA) |
 
@@ -122,7 +122,31 @@ existentes antes de agregar una tabla de código nueva.
 
 ## 4. No hay forma de crear la primera identidad desde el producto (MEDIA)
 
-**Estado:** abierto.
+**Estado:** RESUELTO por CONTRACT-22 (`specs/CONTRACT-22-bootstrap-inicial.md`,
+reporte en `docs/reports/CONTRACT-22-REPORT.md`). El binario tiene un modo
+`librarian --bootstrap --email <dirección>` que crea la primera identidad **y**
+le otorga al rol `administrator` todos los permisos del catálogo, en **una sola
+transacción**, sobre los dos motores. La contraseña se lee de la **entrada
+estándar** (nunca es argumento: quedaría en el historial del shell y visible en
+la lista de procesos de toda la máquina). No agrega superficie al servicio en
+marcha.
+
+Al verificarlo apareció que el hueco era **más grande que su título**: no era
+solo que faltara la primera identidad, sino que `EnsureSchema` + `SeedCatalogs`
+dejan `role_permissions` VACÍA, así que un usuario con rol `administrator` recién
+creado no tenía **ningún** permiso — y la UI que otorga permisos (CONTRACT-16, el
+arreglo del hueco 1) está gateada por `roles.manage`, que tampoco tenía. Bloqueo
+circular: **una instalación en limpio no se podía administrar por ninguna vía del
+producto**. Por eso el bootstrap hace las dos cosas juntas o ninguna.
+
+Es imposible de usar dos veces, y la garantía es **de la base**: la tabla
+`bootstrap` tiene una única clave representable (PRIMARY KEY sobre `id` + CHECK
+que lo fija a `'bootstrap'`), así que un segundo intento —incluso simultáneo,
+desde otro proceso— viola la clave y se revierte entero. Una instalación que ya
+tiene usuarios (**el estado de producción hoy**) es RECHAZADA, no reparada: una
+vía que acuña administradores sobre un sistema que ya tiene identidades es un
+agujero de autenticación, no una herramienta de reparación. Se conserva el texto
+de abajo como registro de cómo se descubrió el hueco.
 
 **Qué pasa:** `librarian` no tiene registro público —decisión correcta para un
 backend de administración— pero tampoco tiene ninguna otra vía de alta inicial.

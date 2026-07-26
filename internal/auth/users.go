@@ -99,23 +99,52 @@ var dummyHash = func() []byte {
 // and CallRoutine would open a transaction per call. So it composes raw SQL with
 // compat.Placeholder inside the transaction it owns. The id, previously read
 // back with `RETURNING id`, is generated here and bound as one more value.
+//
+// CONTRACT-22 split the BODY of this function out into createUserTx, which runs
+// on a transaction the CALLER owns, leaving this one as the thin wrapper that
+// owns a transaction of its own. Nothing observable changed for existing callers
+// — same statements, same order, same single commit. The split exists because
+// the bootstrap (auth/bootstrap.go) must create the user AND grant the role's
+// permissions in ONE transaction: doing it with two self-committing calls would
+// make "user with a role but a role with no permissions" a reachable crash
+// state, and that state is the historical production incident itself.
 func CreateUser(ctx context.Context, store *compat.Store, email, password string, roleNames []string) (*User, error) {
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
-	if err != nil {
-		return nil, fmt.Errorf("hash password: %w", err)
-	}
-	id, err := dual.NewUUID()
-	if err != nil {
-		return nil, fmt.Errorf("generate user id: %w", err)
-	}
-	engine := store.Target.Engine
-	timestamp := now()
-
 	tx, err := store.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
+
+	user, err := createUserTx(ctx, tx, store.Target.Engine, email, password, roleNames)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit user: %w", err)
+	}
+	return user, nil
+}
+
+// createUserTx is CreateUser's body, running inside the caller's transaction. It
+// generates the user id itself, which is the ordinary case.
+func createUserTx(ctx context.Context, tx dual.TxQuerier, engine compat.Engine, email, password string, roleNames []string) (*User, error) {
+	id, err := dual.NewUUID()
+	if err != nil {
+		return nil, fmt.Errorf("generate user id: %w", err)
+	}
+	return createUserWithIDTx(ctx, tx, engine, id, email, password, roleNames)
+}
+
+// createUserWithIDTx is the same insert with the id SUPPLIED by the caller. The
+// bootstrap needs it: it records the administrator's id in the marker row it
+// claims BEFORE creating the user, so the marker can name its owner even though
+// the user row does not exist yet at that point of the transaction.
+func createUserWithIDTx(ctx context.Context, tx dual.TxQuerier, engine compat.Engine, id, email, password string, roleNames []string) (*User, error) {
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		return nil, fmt.Errorf("hash password: %w", err)
+	}
+	timestamp := now()
 
 	insertUser := `INSERT INTO "users" ("id", "email", "password_hash", "status", "created_at", "updated_at")` +
 		` VALUES (` + dual.Bind(engine, 1) + `, ` + dual.Bind(engine, 2) + `, ` + dual.Bind(engine, 3) +
@@ -130,10 +159,6 @@ func CreateUser(ctx context.Context, store *compat.Store, email, password string
 	}
 	if err := insertUserRoles(ctx, tx, engine, id, roleIDs); err != nil {
 		return nil, err
-	}
-
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("commit user: %w", err)
 	}
 	return &User{ID: id, Email: email, Roles: roleNames}, nil
 }

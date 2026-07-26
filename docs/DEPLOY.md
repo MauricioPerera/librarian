@@ -77,8 +77,7 @@ cual. Averigualo antes de planificar el despliegue, no el día del corte.
 El esquema lo crea la aplicación en el primer arranque: no hay script de creación que correr ni
 migración desde otra base. Alcanza con una base vacía y la extensión instalada.
 
-La primera identidad se crea **fuera de banda**, igual que en SQLite: el producto no tiene registro
-público. Después de eso, la gestión de usuarios, roles y permisos es por la aplicación.
+La primera identidad la crea el binario, igual que en SQLite. Ver **Bootstrap inicial** abajo.
 
 ### Respaldo: el paso del que depende el rollback
 
@@ -122,6 +121,45 @@ manual es más directa que en SQLite. Eso no cambia nada de la regla — si toc�
 la invalidación va igual.
 
 ---
+
+## Bootstrap inicial (CONTRACT-22)
+
+Una instalación en limpio **nace inadministrable** si no se hace este paso: el arranque crea las
+tablas y siembra los catálogos de roles y permisos, pero `role_permissions` queda VACÍA, así que un
+usuario con rol `administrator` no tiene ningún permiso y todas las escrituras responden `403`
+—incluida la UI que otorga permisos, que está gateada por `roles.manage`—. Es el incidente del
+hueco 1 de `docs/PENDIENTES.md`: producción estuvo semanas en modo solo-lectura efectiva sin que
+nadie lo notara, porque todas las verificaciones eran lecturas.
+
+El bootstrap crea la primera identidad **y** le otorga al rol `administrator` todos los permisos del
+catálogo, en una sola transacción. Se corre **una vez, con el servicio abajo**, contra la misma base
+que va a servir (usa la misma resolución de motor: `LIBRARIAN_ENGINE` + `LIBRARIAN_DB`). No necesita
+`LIBRARIAN_JWT_SECRET`: no sirve tráfico.
+
+```bash
+# La contraseña va por ENTRADA ESTÁNDAR, nunca como argumento: un argumento queda
+# en el historial del shell y es visible en la lista de procesos de toda la máquina.
+librarian --bootstrap --email admin@example.com < /run/secrets/admin-password
+
+# Alternativas equivalentes:
+pass show librarian/admin | librarian --bootstrap --email admin@example.com
+```
+
+Imprime qué quedó hecho: la identidad creada y los permisos que quedaron en el rol. Después de eso
+el panel se entra por `/login` y la gestión de usuarios, roles y permisos es por la aplicación.
+
+Detalles que importan operativamente:
+
+- **Se puede usar una sola vez.** La garantía es de la base (una única clave representable en la
+  tabla `bootstrap`), no del orden de las comprobaciones: dos ejecuciones simultáneas no pasan las
+  dos. Un segundo intento sale con código distinto de cero y un mensaje que dice quién reclamó la
+  instalación y cuándo.
+- **Un intento fallido no consume el uso**: la transacción se revierte entera y se puede repetir.
+- **Sobre una instalación que ya tiene usuarios, se niega y no cambia nada.** Es deliberado: acuñar
+  administradores sobre un sistema que ya tiene identidades sería un agujero de autenticación. Para
+  ese caso el camino es la UI de roles (`/admin/roles/{rol}/edit`).
+- `editor`, `author` y `contributor` quedan **sin permisos a propósito**; se los otorga el
+  administrador desde la UI.
 
 ## A. Deploy simple
 

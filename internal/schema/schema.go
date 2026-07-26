@@ -464,6 +464,56 @@ func contentTypeFieldsTable() compat.Table {
 	}
 }
 
+// BootstrapTable is the one-row table that records that the initial bootstrap
+// (CONTRACT-22) has been performed on this installation.
+//
+// BootstrapMarkerID is the ONLY value its `id` column may hold. Together with
+// the PRIMARY KEY on that column, the CHECK makes "at most one bootstrap, ever"
+// a guarantee OF THE DATABASE: there is exactly one representable key, so a
+// second INSERT — from a second run of the command, or from a run racing the
+// first inside another process — violates the primary key. Nothing depends on
+// the order in which the command performs its checks, and nothing depends on
+// the operator remembering anything.
+//
+// A dedicated marker was chosen over the two alternatives that suggest
+// themselves, and the choice matters:
+//
+//   - "refuse when a user already exists" is a fine POLICY (the command applies
+//     it too, for a legible message) but it is not a GUARANTEE: two concurrent
+//     transactions can both observe zero users. It is also reversible — deleting
+//     the administrator would silently reopen the door.
+//   - "refuse when role_permissions is non-empty" is worse: that is exactly the
+//     state PRODUCTION was in for weeks (hueco 1) and it says nothing about
+//     whether an identity was ever created.
+//
+// The table deliberately carries NO foreign key to `users`. An FK with ON DELETE
+// CASCADE would delete this row along with the administrator, which is precisely
+// "a path for creating administrators that survives its first use". The row is a
+// permanent, standalone record of an irreversible event.
+const (
+	BootstrapTable    = "bootstrap"
+	BootstrapMarkerID = "bootstrap"
+)
+
+// bootstrapTable builds the marker table described above. admin_user_id and
+// admin_email are recorded so a refusal can say WHO holds the installation and
+// WHEN it was claimed, rather than a bare "already done".
+func bootstrapTable() compat.Table {
+	return compat.Table{
+		Name: BootstrapTable,
+		Columns: []compat.Column{
+			textColumn("id", false),
+			uuidColumn("admin_user_id", false),
+			textColumn("admin_email", false),
+			timestampColumn("created_at", false),
+		},
+		Constraints: []compat.Constraint{
+			primaryKey("id"),
+			checkIn("id", []string{BootstrapMarkerID}),
+		},
+	}
+}
+
 // Build returns the CODE half of the canonical librarian schema (T1 core tables
 // + the code-defined content types + the dynamic-type registry). Tables are
 // ordered so that referenced tables (users, roles, permissions) are created
@@ -519,6 +569,12 @@ func Build() compat.Schema {
 			// a dynamic type can never be called "content_types".
 			contentTypesTable(),
 			contentTypeFieldsTable(),
+			// CONTRACT-22 T1: the one-row bootstrap marker. It references nothing
+			// and nothing references it, so its position in the list is free; it
+			// goes last so the order of every pre-existing table is untouched.
+			// Being part of Build() it is automatically reserved by ReservedNames()
+			// — no dynamic content type can be called "bootstrap".
+			bootstrapTable(),
 		},
 		// CONTRACT-19 T1: the views that replace internal/auth's hand-written
 		// JOINs and the routines (read + single-write) it executes. They are

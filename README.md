@@ -74,8 +74,20 @@ LIBRARIAN_JWT_SECRET=$(openssl rand -hex 32) ./librarian
 
 El servicio escucha en `:8080` por defecto (`LIBRARIAN_ADDR`) y la comprobación de salud está en
 `/health`. El panel se entra por `/login`; una vez con sesión, `/` es el inicio y las vistas de
-administración cuelgan de `/admin/...`. **La primera identidad se crea fuera de banda**: el
-producto no tiene registro público.
+administración cuelgan de `/admin/...`.
+
+**Una instalación en limpio necesita un paso de bootstrap antes de poder administrarse.** El
+arranque crea las tablas y siembra los catálogos, pero no conecta roles con permisos, así que sin
+este paso ni siquiera un usuario con rol `administrator` puede escribir nada:
+
+```bash
+# La contraseña se lee de la ENTRADA ESTÁNDAR, nunca como argumento
+./librarian --bootstrap --email admin@example.com < /run/secrets/admin-password
+```
+
+Crea la primera identidad y le otorga al rol `administrator` todos los permisos del catálogo, en una
+sola operación atómica, usable **una única vez**. Detalle en
+[`docs/DEPLOY.md`](docs/DEPLOY.md#bootstrap-inicial-contract-22).
 
 `./librarian --dump-schema --db <ruta>` emite el esquema canónico en JSON, incluidas las tablas de
 los tipos dinámicos. Es lo que consume la exportación a PostgreSQL.

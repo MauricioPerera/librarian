@@ -69,14 +69,34 @@ var ErrUnknownPermission = errors.New("unknown permission")
 // possible conflict is a duplicate in the CALLER's list, which dedupe makes
 // impossible by construction rather than merely tolerated.) All ids are bound as
 // parameters; nothing is interpolated.
+//
+// CONTRACT-22 split the BODY out into setRolePermissionsTx for the same reason
+// CreateUser was split: the bootstrap has to create the administrator AND grant
+// that role its permissions inside ONE transaction. Two self-committing calls
+// would leave "user with a role, role with no permissions" reachable between
+// them — the exact production state hueco 1 documents. Nothing observable
+// changed for the CONTRACT-16 caller.
 func SetRolePermissions(ctx context.Context, store *compat.Store, roleName string, permissionNames []string) error {
-	engine := store.Target.Engine
 	tx, err := store.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback()
 
+	if err := setRolePermissionsTx(ctx, tx, store.Target.Engine, roleName, permissionNames); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit role permissions: %w", err)
+	}
+	return nil
+}
+
+// setRolePermissionsTx is SetRolePermissions' body, running inside the caller's
+// transaction: resolve the role, resolve every permission name, delete the
+// current set, insert the new one. It does NOT commit — the owner of the
+// transaction does.
+func setRolePermissionsTx(ctx context.Context, tx dual.TxQuerier, engine compat.Engine, roleName string, permissionNames []string) error {
 	var roleID string
 	lookupRole := `SELECT "id" FROM "roles" WHERE "name" = ` + dual.Bind(engine, 1)
 	if err := tx.QueryRowContext(ctx, lookupRole, roleName).Scan(&roleID); err != nil {
@@ -103,9 +123,6 @@ func SetRolePermissions(ctx context.Context, store *compat.Store, roleName strin
 		if _, err := tx.ExecContext(ctx, grant, roleID, pid); err != nil {
 			return fmt.Errorf("grant permission: %w", err)
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit role permissions: %w", err)
 	}
 	return nil
 }
