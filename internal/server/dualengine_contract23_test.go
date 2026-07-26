@@ -21,7 +21,6 @@ package server
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"os"
 	"strings"
@@ -29,6 +28,7 @@ import (
 	"time"
 
 	"github.com/MauricioPerera/librarian/internal/auth"
+	"github.com/MauricioPerera/librarian/internal/pgtestdb"
 	"github.com/MauricioPerera/librarian/internal/schema"
 	"github.com/MauricioPerera/librarian/internal/store"
 	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
@@ -51,40 +51,19 @@ func noVectorDSN(t *testing.T) string {
 	return dsn
 }
 
-// openScopedPostgres opens a connection pinned to a fresh, uniquely named schema
-// and returns it with a dropper. It does NOT apply any schema: what each test
-// does next is the thing under test.
+// openScopedPostgres opens a connection to a fresh, private database and returns
+// it with a dropper. It does NOT apply any schema: what each test does next is
+// the thing under test.
+//
+// CONTRACT-29 UPDATE: this used to be a schema per run reached with
+// `search_path=<schema>,public`. It is now a DATABASE per run
+// (internal/pgtestdb). The distinction this battery lives on survives intact:
+// pgtestdb installs pgvector only when the SERVER offers it, so against
+// LIBRARIAN_PG_NO_VECTOR_DSN the `vector` type stays unresolvable — which
+// requireNoPgvector asserts immediately afterwards.
 func openScopedPostgres(t *testing.T, dsn, prefix string) (*compat.Store, func()) {
 	t.Helper()
-	ctx := context.Background()
-	schemaName := fmt.Sprintf("%s_%d", prefix, time.Now().UnixNano())
-
-	admin, err := compat.OpenPostgres(schema.PostgresVersion, dsn)
-	if err != nil {
-		t.Fatalf("postgres open (admin): %v", err)
-	}
-	if _, err := admin.DB.ExecContext(ctx, `CREATE SCHEMA "`+schemaName+`"`); err != nil {
-		_ = admin.Close()
-		t.Fatalf("create schema: %v", err)
-	}
-	scoped, err := store.Open(compat.Postgres, withSearchPath(dsn, schemaName))
-	if err != nil {
-		t.Fatalf("postgres open (scoped): %v", err)
-	}
-	var current string
-	if err := scoped.DB.QueryRowContext(ctx, `SELECT current_schema()`).Scan(&current); err != nil {
-		t.Fatalf("current_schema: %v", err)
-	}
-	if current != schemaName {
-		t.Fatalf("current_schema() = %q, want %q", current, schemaName)
-	}
-	return scoped, func() {
-		_ = scoped.Close()
-		if _, err := admin.DB.ExecContext(context.Background(), `DROP SCHEMA "`+schemaName+`" CASCADE`); err != nil {
-			t.Logf("drop schema %s: %v", schemaName, err)
-		}
-		_ = admin.Close()
-	}
+	return pgtestdb.Provision(t, dsn, prefix)
 }
 
 // requireNoPgvector proves the target is the RIGHT target. Without this the

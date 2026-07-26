@@ -42,6 +42,7 @@ import (
 
 	"github.com/MauricioPerera/librarian/internal/auth"
 	"github.com/MauricioPerera/librarian/internal/dual"
+	"github.com/MauricioPerera/librarian/internal/pgtestdb"
 	"github.com/MauricioPerera/librarian/internal/schema"
 	"github.com/MauricioPerera/librarian/internal/store"
 	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
@@ -125,62 +126,30 @@ func openSQLiteEngine(t *testing.T) (*compat.Store, func()) {
 	return st, func() { _ = st.Close() }
 }
 
-// openPostgresEngine builds the PostgreSQL side in a FRESH, uniquely named
-// schema so a run can never collide with leftovers, and drops it afterwards.
+// openPostgresEngine builds the PostgreSQL side in a FRESH, PRIVATE DATABASE so
+// a run can never collide with leftovers, and drops it afterwards.
 // CONTRACT-21 UPDATE: it now goes through the SAME PRODUCTION PATH as the
 // SQLite side (store.Open → store.EnsureSchema → store.SeedCatalogs), which was
 // impossible while internal/store's metadata/seed statements were SQLite-only.
+// CONTRACT-29 UPDATE: the isolation is a database per run (internal/pgtestdb),
+// not a schema reached with a `,public` fallback, so it no longer depends on
+// `public` being clean. What the battery observes is unchanged.
 func openPostgresEngine(t *testing.T, dsn string) (*compat.Store, func()) {
 	t.Helper()
 	ctx := context.Background()
-	schemaName := fmt.Sprintf("librarian_c20_%d", time.Now().UnixNano())
 
-	admin, err := compat.OpenPostgres(schema.PostgresVersion, dsn)
-	if err != nil {
-		t.Fatalf("postgres open (admin): %v", err)
-	}
-	if _, err := admin.DB.ExecContext(ctx, `CREATE SCHEMA "`+schemaName+`"`); err != nil {
-		_ = admin.Close()
-		t.Fatalf("create schema: %v", err)
-	}
-
-	scoped, err := store.Open(compat.Postgres, withSearchPath(dsn, schemaName))
-	if err != nil {
-		t.Fatalf("postgres open (scoped): %v", err)
-	}
-	var current string
-	if err := scoped.DB.QueryRowContext(ctx, `SELECT current_schema()`).Scan(&current); err != nil {
-		t.Fatalf("current_schema: %v", err)
-	}
-	if current != schemaName {
-		t.Fatalf("current_schema() = %q, want %q — the scoped connection is not isolated", current, schemaName)
-	}
+	scoped, release := pgtestdb.Provision(t, dsn, "c20server")
 
 	if err := store.EnsureSchema(ctx, scoped); err != nil {
+		release()
 		t.Fatalf("postgres ensure schema: %v", err)
 	}
 	if err := store.SeedCatalogs(ctx, scoped); err != nil {
+		release()
 		t.Fatalf("postgres seed: %v", err)
 	}
 
-	return scoped, func() {
-		_ = scoped.Close()
-		if _, err := admin.DB.ExecContext(context.Background(), `DROP SCHEMA "`+schemaName+`" CASCADE`); err != nil {
-			t.Logf("drop schema %s: %v", schemaName, err)
-		}
-		_ = admin.Close()
-	}
-}
-
-// withSearchPath pins every connection of the pool to one schema. `public` stays
-// as a SECOND entry only so the pgvector `vector` TYPE resolves; the run's own
-// schema stays first and current_schema() is asserted right after connecting.
-func withSearchPath(dsn, schemaName string) string {
-	separator := "?"
-	if strings.Contains(dsn, "?") {
-		separator = "&"
-	}
-	return dsn + separator + "search_path=" + schemaName + ",public"
+	return scoped, release
 }
 
 // createDynamicType creates the dynamic content type's REAL table and its
