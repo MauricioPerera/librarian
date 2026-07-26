@@ -319,21 +319,31 @@ func bindReference(r schema.ReferenceDefinition, raw json.RawMessage) (any, erro
 //
 // WHY IT EXISTS WHEN THE FOREIGN KEY ALREADY ENFORCES THIS. The FK is the real
 // guarantee and it is not being replaced: it is what makes the constraint hold
-// against every writer, including one that is not this process. But when the FK
-// is the thing that rejects the write, what comes back is a driver error —
-// SQLSTATE 23503 on PostgreSQL, `FOREIGN KEY constraint failed` on SQLite — which
-// this package would report as a 500, because it is indistinguishable from any
-// other failed statement without classifying by engine-specific driver codes.
-// compat exposes IsUniqueViolation but has no foreign-key equivalent (verified in
-// v0.4.0), and this contract does not touch compat. So the CHECKED, portable
-// answer is to ask the question before writing.
+// against every writer, including one that is not this process. What this check
+// adds is the MESSAGE. It knows which relation was bad and which id it named, so
+// it can answer *"reference \"autor\" points at \"autores\", and no \"autores\"
+// row has the id X"* — a sentence a person can act on.
 //
-// THE RESIDUAL WINDOW, stated rather than hidden: the referenced row could be
-// deleted between this check and the INSERT. It is narrow and it is not silent —
-// the foreign key still refuses the write, the row is not created, and the caller
-// gets a 500 instead of a 400 for that one interleaving. Nothing is corrupted;
-// only the status code degrades. Closing it would require the FK classifier
-// compat does not offer.
+// CONTRACT-28 UPDATE — THE RESIDUAL WINDOW IS NOW CAUGHT, AND THIS CHECK STAYS.
+// The window itself is unchanged and cannot be removed: the referenced row can
+// still be deleted between this SELECT and the INSERT that follows. What changed
+// is what happens in it. compat v0.5.0 added Store.IsForeignKeyViolation, so the
+// driver's rejection is no longer indistinguishable from any other failed
+// statement, and the write sites classify it into the SAME 400 this check would
+// have produced (see foreignKeyRaceOnWrite). The two are a division of labour,
+// not a duplication:
+//
+//   - THIS CHECK is the normal path and owns the good message, because it is the
+//     only one of the two that knows WHICH reference failed and WHICH id missed.
+//   - THE CLASSIFIER is the net under the race. All it knows is "a foreign key
+//     rejected this write" — by compat's explicit documentation it cannot even
+//     say which DIRECTION of the violation happened — so its message is
+//     necessarily generic. That is the price of catching an interleaving, and it
+//     is only ever paid in the interleaving.
+//
+// Deleting this check to keep only the classifier would therefore trade every
+// ordinary bad-reference message for the generic one. Deleting the classifier
+// would put the 500 back. Both stay.
 func (h *handlers) checkReferenceTargets(ctx context.Context, def schema.ContentTypeDefinition, values []any) error {
 	offset := len(def.Fields)
 	for i, r := range def.References {
@@ -360,6 +370,76 @@ func (h *handlers) checkReferenceTargets(ctx context.Context, def schema.Content
 		}
 	}
 	return nil
+}
+
+// foreignKeyRaceOnWrite and foreignKeyRaceOnDelete are CONTRACT-28: the net that
+// turns the residual race window of the two pre-checks into the status code the
+// pre-check would have produced, instead of a 500.
+//
+// THE DIRECTION COMES FROM THE CALL SITE, NEVER FROM THE ERROR. compat's
+// IsForeignKeyViolation is documented as unable to tell the two directions apart
+// — both engines report the identical code for "this row points at a parent that
+// does not exist" and for "a child still points at the row you are deleting" —
+// and the only way to separate them from the error itself would be to read the
+// message text, which is exactly what classifying by structured code exists to
+// avoid. It does not need to: the statement that failed is known here. An INSERT
+// or an UPDATE of a content row can only fail this way because a reference it
+// carries names a row that is gone; a DELETE of a content row can only fail this
+// way because something still references the row. So there are two functions,
+// one per statement, and neither inspects the message.
+//
+// The message is deliberately GENERIC, and that is not a regression: at this
+// point the specific row is genuinely unknown. The pre-check ran and passed, so
+// whatever it would have named was still there when it looked. Anything more
+// precise would be an invention.
+//
+// A nil error, or an error that is not a foreign-key rejection, returns nil — the
+// caller then falls through to its ordinary failure handling, so an unrelated
+// database failure keeps its 500 (and, through writeOperationFailure, its 503
+// when the pool is down).
+//
+// SCOPE, stated because it is a real consequence: a content table's author_id is
+// also a foreign key (to users). An INSERT whose author was deleted between the
+// login and the write is likewise a reference to something that no longer
+// exists, so it lands on the same 400 with the same sentence. That is the honest
+// answer for it too — the request named a user that is gone — and no code path
+// here reads the error to guess otherwise.
+func (h *handlers) foreignKeyRaceOnWrite(def schema.ContentTypeDefinition, err error) error {
+	if err == nil || !h.store.IsForeignKeyViolation(err) {
+		return nil
+	}
+	return errBadField{fmt.Sprintf(
+		"a reference of this %q row points at a row that no longer exists: it was deleted after the reference was checked and before the write. Nothing was stored — re-read the target and retry",
+		def.Name)}
+}
+
+// KNOWN GAP, ON SQLITE ONLY, for foreignKeyRaceOnDelete. It catches the race on
+// PostgreSQL (SQLSTATE 23503) but NOT on SQLite, and the cause is structural
+// rather than a bug here: CONTRACT-27 declares every relation ON DELETE RESTRICT
+// (schema.foreignKeyRestrict argues why), and SQLite implements the parent-side
+// refusal of a RESTRICT through its internal foreign-key trigger program, so it
+// reports SQLITE_CONSTRAINT_TRIGGER (1811) instead of SQLITE_CONSTRAINT_FOREIGNKEY
+// (787). compat v0.5.0's IsForeignKeyViolation accepts only 787, deliberately and
+// with 1811 named in its documentation as a different rejection that must not be
+// folded in — so the predicate is false and this one interleaving keeps its 500
+// on SQLite. Measured with identical DDL: NO ACTION → 787 (classified), RESTRICT
+// → 1811 (not classified); the child-side INSERT is 787 either way, which is why
+// the create and update races DO close on both engines.
+//
+// It is left open rather than worked around, because every workaround available
+// inside librarian is forbidden by this contract: reading the error text,
+// re-implementing an engine-specific code table here, or reversing CONTRACT-27's
+// RESTRICT decision. The dual-engine battery asserts the current behaviour
+// exactly, so widening the predicate in compat makes that test fail and this
+// paragraph get deleted instead of rotting. Nothing is corrupted meanwhile — the
+// foreign key still refuses the delete and the row survives.
+func (h *handlers) foreignKeyRaceOnDelete(def schema.ContentTypeDefinition, err error) error {
+	if err == nil || !h.store.IsForeignKeyViolation(err) {
+		return nil
+	}
+	return errBadField{fmt.Sprintf(
+		"this %q row cannot be deleted: something started referencing it after the check and before the delete. This project never emits ON DELETE CASCADE, so nothing was destroyed — re-read who references it, clear or delete those rows first",
+		def.Name)}
 }
 
 // bindValue validates ONE body value against its declared FieldType and returns
@@ -512,8 +592,15 @@ func (h *handlers) handleCreateContent(w http.ResponseWriter, r *http.Request) {
 		writeBindError(w, err)
 		return
 	}
+	h.openReferenceRaceWindow(r.Context(), "create")
 	newID, err := h.insertContentRow(r.Context(), def, id.UserID, values)
 	if err != nil {
+		// CONTRACT-28: the check above passed, so a foreign-key rejection HERE can
+		// only mean the target vanished in between. Same 400, generic message.
+		if raced := h.foreignKeyRaceOnWrite(def, err); raced != nil {
+			writeBindError(w, raced)
+			return
+		}
 		h.writeOperationFailure(w, r, err, "could not create content")
 		return
 	}
@@ -545,8 +632,15 @@ func (h *handlers) handleUpdateContent(w http.ResponseWriter, r *http.Request) {
 		writeBindError(w, err)
 		return
 	}
+	h.openReferenceRaceWindow(r.Context(), "update")
 	n, err := h.updateContentRow(r.Context(), def, r.PathValue("id"), values)
 	if err != nil {
+		// CONTRACT-28: same net as the create path — an UPDATE that moves a
+		// reference onto a row deleted in between is a 400, not a 500.
+		if raced := h.foreignKeyRaceOnWrite(def, err); raced != nil {
+			writeBindError(w, raced)
+			return
+		}
 		h.writeOperationFailure(w, r, err, "could not update content")
 		return
 	}
@@ -571,16 +665,25 @@ func (h *handlers) handleDeleteContent(w http.ResponseWriter, r *http.Request) {
 	}
 	// CONTRACT-27: deleting a REFERENCED row is refused by the foreign key, which
 	// is the point — a reference is never cascaded away. Asking first is what
-	// turns that into a 400 naming who points at the row instead of a 500 built
-	// out of a driver message. Same argument, same limitation, as
-	// checkReferenceTargets: compat has no foreign-key-violation classifier, and
-	// this contract does not touch compat.
+	// turns that into a 400 NAMING who points at the row and how many, instead of
+	// a 500 built out of a driver message.
+	//
+	// CONTRACT-28: and if a referring row appears after the count, the foreign key
+	// still refuses the DELETE — that rejection is now classified into the same
+	// 400 rather than a 500. Mirror image of the create path, and the same
+	// division of labour: the count owns the actionable message, the classifier is
+	// the net under the interleaving. See foreignKeyRaceOnDelete.
 	if err := h.checkNoIncomingReferences(r.Context(), def, r.PathValue("id")); err != nil {
 		writeBindError(w, err)
 		return
 	}
+	h.openReferenceRaceWindow(r.Context(), "delete")
 	n, err := h.deleteContentRow(r.Context(), def, r.PathValue("id"))
 	if err != nil {
+		if raced := h.foreignKeyRaceOnDelete(def, err); raced != nil {
+			writeBindError(w, raced)
+			return
+		}
 		h.writeOperationFailure(w, r, err, "could not delete content")
 		return
 	}
@@ -614,8 +717,15 @@ func writeBindError(w http.ResponseWriter, err error) {
 //
 // The residual window is the mirror of checkReferenceTargets': a referring row
 // created between the count and the DELETE still hits the real foreign key, so
-// the deletion is refused either way and nothing is lost — only the status code
-// degrades to a 500 for that interleaving.
+// the deletion is refused either way and nothing is lost.
+//
+// CONTRACT-28 UPDATE: that interleaving no longer degrades to a 500 either. The
+// DELETE site classifies the driver's rejection with compat v0.5.0's
+// Store.IsForeignKeyViolation and answers the same 400 — with a generic message,
+// because at that point the count has already passed and the referrer that
+// appeared afterwards has not been identified. This function is what still
+// produces the sentence naming WHO references the row and HOW MANY, which is why
+// it remains the normal path rather than being replaced by the classifier.
 func (h *handlers) checkNoIncomingReferences(ctx context.Context, def schema.ContentTypeDefinition, id string) error {
 	if id == "" || !uuidPattern.MatchString(id) {
 		// A malformed id matches no row, so the DELETE is a 404 and there is

@@ -5,6 +5,7 @@
 package server
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -184,6 +185,32 @@ type handlers struct {
 	// freely pollable endpoint cannot be turned into a load path against the
 	// database. See readiness.go.
 	ready readiness
+	// referenceRaceHook is the ONE synchronization point CONTRACT-28 adds, and it
+	// exists for a reason no test double could serve: the contract's whole claim
+	// is that the REAL driver error of a REAL foreign key is classified into the
+	// right status, so the race it guards against has to be provoked against a
+	// real engine rather than simulated by an error that never came from one.
+	// The window is, by construction, the gap between a reference PRE-CHECK and
+	// the statement it guards (see content.go); nothing outside the process can
+	// aim at a gap that narrow, so the battery needs the process to hold it open
+	// exactly once.
+	//
+	// It is NIL in production — NewMux never sets it, no configuration can, and
+	// nothing but a test in this package can reach the field. When nil the cost
+	// is one comparison per content write, and when non-nil it changes no
+	// decision: it only runs, is not consulted for any outcome, and cannot make a
+	// write succeed or fail on its own. `op` is "create", "update" or "delete",
+	// so a battery can open the window for one direction without disturbing the
+	// nested requests it uses to close it.
+	referenceRaceHook func(ctx context.Context, op string)
+}
+
+// openReferenceRaceWindow runs the CONTRACT-28 synchronization point, if a test
+// installed one. See the field's documentation for why it exists.
+func (h *handlers) openReferenceRaceWindow(ctx context.Context, op string) {
+	if h.referenceRaceHook != nil {
+		h.referenceRaceHook(ctx, op)
+	}
 }
 
 // handleHealth answers 200 {"status":"ok"}.
