@@ -78,7 +78,7 @@ func (h *handlers) registerAdminTermRoutes(mux *http.ServeMux) {
 func (h *handlers) handleAdminTermsList(w http.ResponseWriter, r *http.Request) {
 	terms, err := h.listTerms(r.Context())
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.httpOperationFailure(w, r, err)
 		return
 	}
 	names := termNames(terms)
@@ -98,7 +98,7 @@ func (h *handlers) handleAdminTermsList(w http.ResponseWriter, r *http.Request) 
 func (h *handlers) handleAdminTermNewForm(w http.ResponseWriter, r *http.Request) {
 	parents, err := h.parentOptions(r.Context(), "", "")
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.httpOperationFailure(w, r, err)
 		return
 	}
 	renderTermForm(w, adminTermNewTmpl, http.StatusOK, adminTermFormPage{
@@ -119,7 +119,7 @@ func (h *handlers) handleAdminTermCreate(w http.ResponseWriter, r *http.Request)
 	if _, err := h.insertTerm(r.Context(), req); err != nil {
 		status, emsg := termWriteError(err)
 		if status == http.StatusInternalServerError {
-			http.Error(w, "internal error", http.StatusInternalServerError)
+			h.httpOperationFailure(w, r, err)
 			return
 		}
 		h.rerenderTermForm(w, r, adminTermNewTmpl, "Nueva categoría/tag — librarian", termView{Taxonomy: req.Taxonomy, Name: req.Name, Slug: req.Slug, ParentID: ptrString(req.ParentID)}, emsg)
@@ -133,7 +133,7 @@ func (h *handlers) handleAdminTermCreate(w http.ResponseWriter, r *http.Request)
 func (h *handlers) handleAdminTermEditForm(w http.ResponseWriter, r *http.Request) {
 	t, found, err := h.fetchTerm(r.Context(), r.PathValue("id"))
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.httpOperationFailure(w, r, err)
 		return
 	}
 	if !found {
@@ -143,7 +143,7 @@ func (h *handlers) handleAdminTermEditForm(w http.ResponseWriter, r *http.Reques
 	// A term cannot be its own parent, so it is excluded from the parent options.
 	parents, err := h.parentOptions(r.Context(), t.ID, ptrString(t.ParentID))
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.httpOperationFailure(w, r, err)
 		return
 	}
 	renderTermForm(w, adminTermEditTmpl, http.StatusOK, adminTermFormPage{
@@ -171,7 +171,7 @@ func (h *handlers) handleAdminTermUpdate(w http.ResponseWriter, r *http.Request)
 		}
 		status, emsg := termWriteError(err)
 		if status == http.StatusInternalServerError {
-			http.Error(w, "internal error", http.StatusInternalServerError)
+			h.httpOperationFailure(w, r, err)
 			return
 		}
 		h.rerenderTermForm(w, r, adminTermEditTmpl, "Editar categoría/tag — librarian", termView{ID: id, Taxonomy: req.Taxonomy, Name: req.Name, Slug: req.Slug, ParentID: ptrString(req.ParentID)}, emsg)
@@ -187,7 +187,7 @@ func (h *handlers) handleAdminTermUpdate(w http.ResponseWriter, r *http.Request)
 func (h *handlers) handleAdminTermDelete(w http.ResponseWriter, r *http.Request) {
 	n, err := h.deleteTermByID(r.Context(), r.PathValue("id"))
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.httpOperationFailure(w, r, err)
 		return
 	}
 	if n == 0 {
@@ -227,7 +227,7 @@ func parseTermForm(r *http.Request) (termBody, string, bool) {
 func (h *handlers) rerenderTermForm(w http.ResponseWriter, r *http.Request, tmpl *template.Template, title string, tv termView, errMsg string) {
 	parents, err := h.parentOptions(r.Context(), tv.ID, tv.ParentID)
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.httpOperationFailure(w, r, err)
 		return
 	}
 	status := http.StatusBadRequest

@@ -138,7 +138,7 @@ func (h *handlers) resolveTypeUI(w http.ResponseWriter, r *http.Request) (schema
 		h.renderNotFound(w, r)
 		return schema.ContentTypeDefinition{}, false
 	case err != nil:
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.httpOperationFailure(w, r, err)
 		return schema.ContentTypeDefinition{}, false
 	}
 	return def, true
@@ -154,7 +154,7 @@ func (h *handlers) handleAdminContentList(w http.ResponseWriter, r *http.Request
 	}
 	rows, err := h.listContentRows(r.Context(), def, 100, 0)
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.httpOperationFailure(w, r, err)
 		return
 	}
 	columns := make([]string, 0, len(def.Fields))
@@ -243,7 +243,7 @@ func (h *handlers) handleAdminContentEditForm(w http.ResponseWriter, r *http.Req
 	}
 	row, found, err := h.fetchContentRow(r.Context(), def, r.PathValue("id"))
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.httpOperationFailure(w, r, err)
 		return
 	}
 	if !found {
@@ -281,7 +281,7 @@ func (h *handlers) handleAdminContentUpdate(w http.ResponseWriter, r *http.Reque
 	}
 	n, err := h.updateContentRow(r.Context(), def, rowID, values)
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.httpOperationFailure(w, r, err)
 		return
 	}
 	if n == 0 {
@@ -302,7 +302,7 @@ func (h *handlers) handleAdminContentDelete(w http.ResponseWriter, r *http.Reque
 	}
 	n, err := h.deleteContentRow(r.Context(), def, r.PathValue("id"))
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.httpOperationFailure(w, r, err)
 		return
 	}
 	if n == 0 {

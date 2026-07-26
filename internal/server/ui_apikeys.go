@@ -113,7 +113,7 @@ func (h *handlers) registerAdminAPIKeyRoutes(mux *http.ServeMux) {
 func (h *handlers) handleAdminAPIKeysList(w http.ResponseWriter, r *http.Request) {
 	keys, err := auth.ListAPIKeys(r.Context(), h.store)
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.httpOperationFailure(w, r, err)
 		return
 	}
 	views := make([]apiKeyView, 0, len(keys))
@@ -162,7 +162,7 @@ func (h *handlers) handleAdminAPIKeyCreate(w http.ResponseWriter, r *http.Reques
 	}
 	roleID, ok, err := h.roleIDForName(r.Context(), role)
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.httpOperationFailure(w, r, err)
 		return
 	}
 	if !ok {
@@ -174,7 +174,7 @@ func (h *handlers) handleAdminAPIKeyCreate(w http.ResponseWriter, r *http.Reques
 	}
 	secret, err := auth.MintAPIKey(r.Context(), h.store, label, roleID)
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.httpOperationFailure(w, r, err)
 		return
 	}
 	// Render the secret directly — the ONE and ONLY response in this contract
@@ -197,12 +197,12 @@ func (h *handlers) handleAdminAPIKeyCreate(w http.ResponseWriter, r *http.Reques
 func (h *handlers) handleAdminAPIKeyRevoke(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if err := auth.RevokeAPIKeyByID(r.Context(), h.store, id); err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.httpOperationFailure(w, r, err)
 		return
 	}
 	rec, found, err := auth.GetAPIKey(r.Context(), h.store, id)
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.httpOperationFailure(w, r, err)
 		return
 	}
 	if !found {

@@ -82,7 +82,7 @@ func (h *handlers) handleAdminRoleEditForm(w http.ResponseWriter, r *http.Reques
 	name := r.PathValue("name")
 	current, found, err := auth.RolePermissions(r.Context(), h.store, name)
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.httpOperationFailure(w, r, err)
 		return
 	}
 	if !found {
@@ -120,7 +120,7 @@ func (h *handlers) handleAdminRolePermissions(w http.ResponseWriter, r *http.Req
 	// (1) Unknown role → 404, before anything else.
 	_, found, err := auth.RolePermissions(r.Context(), h.store, name)
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.httpOperationFailure(w, r, err)
 		return
 	}
 	if !found {
@@ -143,7 +143,7 @@ func (h *handlers) handleAdminRolePermissions(w http.ResponseWriter, r *http.Req
 	id, _ := identityFromContext(r.Context())
 	keeps, err := h.actorKeepsRolesManage(r.Context(), id, name, selected)
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.httpOperationFailure(w, r, err)
 		return
 	}
 	if !keeps {
@@ -161,7 +161,7 @@ func (h *handlers) handleAdminRolePermissions(w http.ResponseWriter, r *http.Req
 			"Permiso desconocido. No se cambió nada.")
 		return
 	case err != nil:
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.httpOperationFailure(w, r, err)
 		return
 	}
 	http.Redirect(w, r, "/admin/roles/"+name+"/edit", http.StatusSeeOther)

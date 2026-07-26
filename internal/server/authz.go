@@ -176,7 +176,11 @@ func (h *handlers) requirePermission(permission string) func(http.Handler) http.
 				// A DB failure resolving permissions is an internal error, not a
 				// 401/403 — the caller IS authenticated, we just could not load
 				// their grants.
-				writeError(w, http.StatusInternalServerError, "internal error")
+				// CONTRACT-25: which 5xx it is goes through the single
+				// classifier (datafailure.go). Unreachable database => 503,
+				// like the login and /ready; anything else => the same 500
+				// "internal error" as before.
+				h.writeOperationFailure(w, r2, err, "internal error")
 				return
 			}
 			if !containsString(perms, permission) {

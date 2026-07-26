@@ -114,7 +114,7 @@ func (h *handlers) handleCreateProduct(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not create product")
+		h.writeOperationFailure(w, r, err, "could not create product")
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{
@@ -134,7 +134,7 @@ func (h *handlers) handleListProducts(w http.ResponseWriter, r *http.Request) {
 	offset := queryIntDefault(r, "offset", 0)
 	out, err := h.listProducts(r.Context(), limit, offset)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not list products")
+		h.writeOperationFailure(w, r, err, "could not list products")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"products": out})
@@ -145,7 +145,7 @@ func (h *handlers) handleListProducts(w http.ResponseWriter, r *http.Request) {
 func (h *handlers) handleGetProduct(w http.ResponseWriter, r *http.Request) {
 	p, ok, err := h.fetchProduct(r.Context(), r.PathValue("id"))
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not read product")
+		h.writeOperationFailure(w, r, err, "could not read product")
 		return
 	}
 	if !ok {
@@ -165,7 +165,7 @@ func (h *handlers) handleUpdateProduct(w http.ResponseWriter, r *http.Request) {
 	}
 	present, err := h.productExists(r.Context(), id)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not update product")
+		h.writeOperationFailure(w, r, err, "could not update product")
 		return
 	}
 	if !present {
@@ -178,12 +178,12 @@ func (h *handlers) handleUpdateProduct(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not update product")
+		h.writeOperationFailure(w, r, err, "could not update product")
 		return
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not update product")
+		h.writeOperationFailure(w, r, err, "could not update product")
 		return
 	}
 	if n == 0 {
@@ -205,7 +205,7 @@ func (h *handlers) handleDeleteProduct(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	n, err := h.deleteProductByID(r.Context(), id)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not delete product")
+		h.writeOperationFailure(w, r, err, "could not delete product")
 		return
 	}
 	if n == 0 {

@@ -134,7 +134,7 @@ func (h *handlers) handleCreateContentType(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusBadRequest, "a content type with this name already exists")
 		return
 	case err != nil:
-		writeError(w, http.StatusInternalServerError, "could not create content type")
+		h.writeOperationFailure(w, r, err, "could not create content type")
 		return
 	}
 	writeJSON(w, http.StatusCreated, viewOf(def))
@@ -146,7 +146,7 @@ func (h *handlers) handleCreateContentType(w http.ResponseWriter, r *http.Reques
 func (h *handlers) handleListContentTypes(w http.ResponseWriter, r *http.Request) {
 	defs, err := store.LoadDefinitions(r.Context(), h.store)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not list content types")
+		h.writeOperationFailure(w, r, err, "could not list content types")
 		return
 	}
 	out := make([]contentTypeView, 0, len(defs))
@@ -170,12 +170,12 @@ func (h *handlers) handleGetContentType(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusNotFound, "content type not found")
 		return
 	case err != nil:
-		writeError(w, http.StatusInternalServerError, "could not read content type")
+		h.writeOperationFailure(w, r, err, "could not read content type")
 		return
 	}
 	_, fields, err := store.LoadContentTypeFields(r.Context(), h.store, name)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not read content type")
+		h.writeOperationFailure(w, r, err, "could not read content type")
 		return
 	}
 	writeJSON(w, http.StatusOK, viewWithIDs(def.Name, fields))
@@ -246,7 +246,7 @@ func (h *handlers) handleEditContentType(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusNotFound, "content type not found")
 		return
 	case err != nil:
-		writeError(w, http.StatusInternalServerError, "could not read content type")
+		h.writeOperationFailure(w, r, err, "could not read content type")
 		return
 	}
 	if _, err := store.PlanContentTypeEdit(name, typeID, stored, edits); err != nil {
@@ -281,7 +281,7 @@ func (h *handlers) handleEditContentType(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	case err != nil:
-		writeError(w, http.StatusInternalServerError, "could not edit content type")
+		h.writeOperationFailure(w, r, err, "could not edit content type")
 		return
 	}
 
@@ -289,7 +289,7 @@ func (h *handlers) handleEditContentType(w http.ResponseWriter, r *http.Request)
 	// the response then reflects what the database actually holds, ids included.
 	_, fields, err := store.LoadContentTypeFields(r.Context(), h.store, name)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not read content type")
+		h.writeOperationFailure(w, r, err, "could not read content type")
 		return
 	}
 	view := viewWithIDs(name, fields)

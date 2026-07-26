@@ -111,7 +111,7 @@ func (h *handlers) registerAdminContentTypeRoutes(mux *http.ServeMux) {
 func (h *handlers) handleAdminContentTypesList(w http.ResponseWriter, r *http.Request) {
 	defs, err := store.LoadDefinitions(r.Context(), h.store)
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.httpOperationFailure(w, r, err)
 		return
 	}
 	views := make([]contentTypeView, 0, len(defs))
@@ -222,7 +222,7 @@ func (h *handlers) handleAdminContentTypeEditForm(w http.ResponseWriter, r *http
 		h.renderNotFound(w, r)
 		return
 	case err != nil:
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.httpOperationFailure(w, r, err)
 		return
 	}
 	rows := make([]contentTypeEditFieldRow, 0, len(fields)+1)
@@ -262,7 +262,7 @@ func (h *handlers) handleAdminContentTypeEdit(w http.ResponseWriter, r *http.Req
 		h.renderNotFound(w, r)
 		return
 	case err != nil:
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.httpOperationFailure(w, r, err)
 		return
 	}
 	edits, rows, confirmed, ok := parseContentTypeEditForm(r, stored)

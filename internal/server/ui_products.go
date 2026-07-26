@@ -88,7 +88,7 @@ func (h *handlers) registerAdminProductRoutes(mux *http.ServeMux) {
 func (h *handlers) handleAdminProductsList(w http.ResponseWriter, r *http.Request) {
 	rows, err := h.listProducts(r.Context(), 100, 0)
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.httpOperationFailure(w, r, err)
 		return
 	}
 	views := make([]productView, 0, len(rows))
@@ -111,7 +111,7 @@ func (h *handlers) handleAdminProductNewForm(w http.ResponseWriter, r *http.Requ
 	if canManage {
 		var err error
 		if groups, err = h.termGroupsFor(r.Context(), "product_terms", "product_id", ""); err != nil {
-			http.Error(w, "internal error", http.StatusInternalServerError)
+			h.httpOperationFailure(w, r, err)
 			return
 		}
 	}
@@ -152,7 +152,7 @@ func (h *handlers) handleAdminProductCreate(w http.ResponseWriter, r *http.Reque
 	if err != nil {
 		status, emsg := productWriteError(err)
 		if status == http.StatusInternalServerError {
-			http.Error(w, "internal error", http.StatusInternalServerError)
+			h.httpOperationFailure(w, r, err)
 			return
 		}
 		var groups []termGroup
@@ -171,7 +171,7 @@ func (h *handlers) handleAdminProductCreate(w http.ResponseWriter, r *http.Reque
 	// Term assignment processed only for terms.manage holders (see ui_terms.go).
 	if canManage {
 		if err := h.setContentTerms(r.Context(), "products", "product_terms", "product_id", newID, r.PostForm["terms"]); err != nil {
-			http.Error(w, "internal error", http.StatusInternalServerError)
+			h.httpOperationFailure(w, r, err)
 			return
 		}
 	}
@@ -184,7 +184,7 @@ func (h *handlers) handleAdminProductEditForm(w http.ResponseWriter, r *http.Req
 	id, _ := identityFromContext(r.Context())
 	p, found, err := h.fetchProduct(r.Context(), r.PathValue("id"))
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.httpOperationFailure(w, r, err)
 		return
 	}
 	if !found {
@@ -195,7 +195,7 @@ func (h *handlers) handleAdminProductEditForm(w http.ResponseWriter, r *http.Req
 	var groups []termGroup
 	if canManage {
 		if groups, err = h.termGroupsFor(r.Context(), "product_terms", "product_id", p.ID); err != nil {
-			http.Error(w, "internal error", http.StatusInternalServerError)
+			h.httpOperationFailure(w, r, err)
 			return
 		}
 	}
@@ -218,7 +218,7 @@ func (h *handlers) handleAdminProductUpdate(w http.ResponseWriter, r *http.Reque
 	title, body, price, sku, msg, ok := parseProductForm(r)
 	present, err := h.productExists(r.Context(), id)
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.httpOperationFailure(w, r, err)
 		return
 	}
 	if !present {
@@ -242,7 +242,7 @@ func (h *handlers) handleAdminProductUpdate(w http.ResponseWriter, r *http.Reque
 	if _, err := h.updateProductFields(r.Context(), id, title, body, price, sku); err != nil {
 		status, emsg := productWriteError(err)
 		if status == http.StatusInternalServerError {
-			http.Error(w, "internal error", http.StatusInternalServerError)
+			h.httpOperationFailure(w, r, err)
 			return
 		}
 		var groups []termGroup
@@ -261,7 +261,7 @@ func (h *handlers) handleAdminProductUpdate(w http.ResponseWriter, r *http.Reque
 	// Term assignment processed only for terms.manage holders (see ui_terms.go).
 	if canManage {
 		if err := h.setContentTerms(r.Context(), "products", "product_terms", "product_id", id, r.PostForm["terms"]); err != nil {
-			http.Error(w, "internal error", http.StatusInternalServerError)
+			h.httpOperationFailure(w, r, err)
 			return
 		}
 	}
@@ -276,7 +276,7 @@ func (h *handlers) handleAdminProductDelete(w http.ResponseWriter, r *http.Reque
 	id := r.PathValue("id")
 	n, err := h.deleteProductByID(r.Context(), id)
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.httpOperationFailure(w, r, err)
 		return
 	}
 	if n == 0 {

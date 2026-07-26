@@ -134,7 +134,7 @@ func (h *handlers) handleCreateTerm(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "a term with this slug already exists in this taxonomy")
 		return
 	case err != nil:
-		writeError(w, http.StatusInternalServerError, "could not create term")
+		h.writeOperationFailure(w, r, err, "could not create term")
 		return
 	}
 	writeJSON(w, http.StatusCreated, created)
@@ -145,7 +145,7 @@ func (h *handlers) handleCreateTerm(w http.ResponseWriter, r *http.Request) {
 func (h *handlers) handleListTerms(w http.ResponseWriter, r *http.Request) {
 	out, err := h.listTerms(r.Context())
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not list terms")
+		h.writeOperationFailure(w, r, err, "could not list terms")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"terms": out})
@@ -156,7 +156,7 @@ func (h *handlers) handleListTerms(w http.ResponseWriter, r *http.Request) {
 func (h *handlers) handleGetTerm(w http.ResponseWriter, r *http.Request) {
 	t, ok, err := h.fetchTerm(r.Context(), r.PathValue("id"))
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not read term")
+		h.writeOperationFailure(w, r, err, "could not read term")
 		return
 	}
 	if !ok {
@@ -200,7 +200,7 @@ func (h *handlers) handleUpdateTerm(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "a term with this slug already exists in this taxonomy")
 		return
 	case err != nil:
-		writeError(w, http.StatusInternalServerError, "could not update term")
+		h.writeOperationFailure(w, r, err, "could not update term")
 		return
 	}
 	writeJSON(w, http.StatusOK, updated)
@@ -214,7 +214,7 @@ func (h *handlers) handleUpdateTerm(w http.ResponseWriter, r *http.Request) {
 func (h *handlers) handleDeleteTerm(w http.ResponseWriter, r *http.Request) {
 	n, err := h.deleteTermByID(r.Context(), r.PathValue("id"))
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not delete term")
+		h.writeOperationFailure(w, r, err, "could not delete term")
 		return
 	}
 	if n == 0 {
@@ -255,12 +255,12 @@ func (h *handlers) handleSetContentTerms(w http.ResponseWriter, r *http.Request,
 		writeError(w, http.StatusBadRequest, "one or more term ids do not reference an existing term")
 		return
 	case err != nil:
-		writeError(w, http.StatusInternalServerError, "could not assign terms")
+		h.writeOperationFailure(w, r, err, "could not assign terms")
 		return
 	}
 	out, err := h.assignedTermsFor(r.Context(), junction, idCol, id)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not read assigned terms")
+		h.writeOperationFailure(w, r, err, "could not read assigned terms")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"terms": out})

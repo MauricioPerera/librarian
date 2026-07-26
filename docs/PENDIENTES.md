@@ -17,7 +17,7 @@ vez. El estado va en el índice para no tener que leerlas para saberlo.
 | 5 | [`pgvector` obligatorio aunque no se usen vectores](#5-pgvector-es-obligatorio-aunque-no-se-usen-vectores-media) | **RESUELTO** (CONTRACT-23) |
 | 6 | [La migración sin ventana de corte nunca se ejercitó](#6-la-migración-sin-ventana-de-corte-nunca-se-ejercitó-media) | **RESUELTO** (ensayo 2026-07-25) |
 | 7 | [`/health` no mira la base, y una caída se ve como 401](#7-health-no-mira-la-base-y-una-caída-se-ve-como-401-alta) | **RESUELTO** (CONTRACT-24) |
-| 8 | [Un fallo de base da 500 en las rutas de datos y 503 en el resto](#8-un-fallo-de-base-da-500-en-las-rutas-de-datos-y-503-en-el-resto-baja) | Abierto (BAJA) |
+| 8 | [Un fallo de base da 500 en las rutas de datos y 503 en el resto](#8-un-fallo-de-base-da-500-en-las-rutas-de-datos-y-503-en-el-resto-baja) | **RESUELTO** (CONTRACT-25) |
 
 ## 1. No hay forma de otorgar permisos a un rol desde el producto (ALTA)
 
@@ -300,7 +300,15 @@ carga contra la base, y no debe filtrar detalles de la conexión.
 
 ## 8. Un fallo de base da 500 en las rutas de datos y 503 en el resto (BAJA)
 
-**Estado:** abierto.
+**Estado:** RESUELTO por CONTRACT-25 (`specs/CONTRACT-25-503-en-rutas-de-datos.md`,
+reporte en `docs/reports/CONTRACT-25-REPORT.md`). Un único punto de clasificación
+(`internal/server/datafailure.go`) decide, para cada operación de datos que falla,
+si la base está accesible: si no lo está, 503 con el mismo cuerpo fijo que el
+login y `/ready`; si lo está, el 500 de siempre, con su mensaje de siempre. La
+clasificación consulta la sonda de CONTRACT-24 y **no** reconoce tipos de error
+del driver, así que no ata `librarian` a un motor. Medido con `pg-c25` realmente
+detenido (`docker stop`, estado `exited`) y, del otro lado, con un fallo interno
+genuino provocado con la base arriba.
 
 **Qué pasa:** ante un fallo de base, `CONTRACT-24` devuelve `503` en el login y
 en `/ready`, pero las rutas de datos siguen devolviendo `500`. Las dos son 5xx

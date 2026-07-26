@@ -137,7 +137,7 @@ func (h *handlers) handleCreateArticle(w http.ResponseWriter, r *http.Request) {
 	}
 	articleID, err := h.insertArticle(r.Context(), id.UserID, req.Title, req.Body, optional, extra)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not create article")
+		h.writeOperationFailure(w, r, err, "could not create article")
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{
@@ -156,7 +156,7 @@ func (h *handlers) handleListArticles(w http.ResponseWriter, r *http.Request) {
 	offset := queryIntDefault(r, "offset", 0)
 	out, err := h.listArticles(r.Context(), limit, offset)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not list articles")
+		h.writeOperationFailure(w, r, err, "could not list articles")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"articles": out})
@@ -168,7 +168,7 @@ func (h *handlers) handleListArticles(w http.ResponseWriter, r *http.Request) {
 func (h *handlers) handleGetArticle(w http.ResponseWriter, r *http.Request) {
 	a, ok, err := h.fetchArticle(r, r.PathValue("id"))
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not read article")
+		h.writeOperationFailure(w, r, err, "could not read article")
 		return
 	}
 	if !ok {
@@ -213,7 +213,7 @@ func (h *handlers) handleUpdateArticle(w http.ResponseWriter, r *http.Request) {
 	// RowsAffected == 0 ⇒ not found.
 	present, err := h.articleExists(r.Context(), id)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not update article")
+		h.writeOperationFailure(w, r, err, "could not update article")
 		return
 	}
 	if !present {
@@ -238,12 +238,12 @@ func (h *handlers) handleUpdateArticle(w http.ResponseWriter, r *http.Request) {
 		res, err = h.updateArticleTitleBody(r.Context(), id, req.Title, req.Body)
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not update article")
+		h.writeOperationFailure(w, r, err, "could not update article")
 		return
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not update article")
+		h.writeOperationFailure(w, r, err, "could not update article")
 		return
 	}
 	if n == 0 {
@@ -266,7 +266,7 @@ func (h *handlers) handlePublishArticle(w http.ResponseWriter, r *http.Request) 
 	id := r.PathValue("id")
 	pub, found, err := h.publishArticleByID(r.Context(), id)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not publish article")
+		h.writeOperationFailure(w, r, err, "could not publish article")
 		return
 	}
 	if !found {
@@ -285,7 +285,7 @@ func (h *handlers) handleDeleteArticle(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	n, err := h.deleteArticleByID(r.Context(), id)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not delete article")
+		h.writeOperationFailure(w, r, err, "could not delete article")
 		return
 	}
 	if n == 0 {

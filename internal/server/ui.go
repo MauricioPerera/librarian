@@ -370,7 +370,7 @@ func (h *handlers) requireSessionPermission(permission string) func(http.Handler
 			if err != nil {
 				// The caller IS authenticated; we just could not load grants.
 				// A plain-text 500 (not the JSON API envelope) for a human.
-				http.Error(w, "internal error", http.StatusInternalServerError)
+				h.httpOperationFailure(w, r, err)
 				return
 			}
 			// The Identity goes into the context BEFORE the permission decision,

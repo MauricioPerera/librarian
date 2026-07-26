@@ -132,7 +132,7 @@ func (h *handlers) registerAdminArticleRoutes(mux *http.ServeMux) {
 func (h *handlers) handleAdminArticlesList(w http.ResponseWriter, r *http.Request) {
 	rows, err := h.listArticles(r.Context(), 100, 0)
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.httpOperationFailure(w, r, err)
 		return
 	}
 	views := make([]articleView, 0, len(rows))
@@ -155,7 +155,7 @@ func (h *handlers) handleAdminArticleNewForm(w http.ResponseWriter, r *http.Requ
 	if canManage {
 		var err error
 		if groups, err = h.termGroupsFor(r.Context(), "article_terms", "article_id", ""); err != nil {
-			http.Error(w, "internal error", http.StatusInternalServerError)
+			h.httpOperationFailure(w, r, err)
 			return
 		}
 	}
@@ -200,13 +200,13 @@ func (h *handlers) handleAdminArticleCreate(w http.ResponseWriter, r *http.Reque
 	}
 	newID, err := h.insertArticleBasic(r.Context(), id.UserID, title, body)
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.httpOperationFailure(w, r, err)
 		return
 	}
 	// Term assignment is processed only for terms.manage holders (see ui_terms.go).
 	if canManage {
 		if err := h.setContentTerms(r.Context(), "articles", "article_terms", "article_id", newID, r.PostForm["terms"]); err != nil {
-			http.Error(w, "internal error", http.StatusInternalServerError)
+			h.httpOperationFailure(w, r, err)
 			return
 		}
 	}
@@ -219,7 +219,7 @@ func (h *handlers) handleAdminArticleEditForm(w http.ResponseWriter, r *http.Req
 	id, _ := identityFromContext(r.Context())
 	a, found, err := h.fetchArticle(r, r.PathValue("id"))
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.httpOperationFailure(w, r, err)
 		return
 	}
 	if !found {
@@ -230,7 +230,7 @@ func (h *handlers) handleAdminArticleEditForm(w http.ResponseWriter, r *http.Req
 	var groups []termGroup
 	if canManage {
 		if groups, err = h.termGroupsFor(r.Context(), "article_terms", "article_id", a.ID); err != nil {
-			http.Error(w, "internal error", http.StatusInternalServerError)
+			h.httpOperationFailure(w, r, err)
 			return
 		}
 	}
@@ -256,7 +256,7 @@ func (h *handlers) handleAdminArticleUpdate(w http.ResponseWriter, r *http.Reque
 	body := r.PostFormValue("body")
 	present, err := h.articleExists(r.Context(), id)
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.httpOperationFailure(w, r, err)
 		return
 	}
 	if !present {
@@ -280,7 +280,7 @@ func (h *handlers) handleAdminArticleUpdate(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	if _, err := h.updateArticleTitleBody(r.Context(), id, title, body); err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.httpOperationFailure(w, r, err)
 		return
 	}
 	// Term assignment processed only for terms.manage holders (see ui_terms.go):
@@ -288,7 +288,7 @@ func (h *handlers) handleAdminArticleUpdate(w http.ResponseWriter, r *http.Reque
 	// the article's existing terms.
 	if canManage {
 		if err := h.setContentTerms(r.Context(), "articles", "article_terms", "article_id", id, r.PostForm["terms"]); err != nil {
-			http.Error(w, "internal error", http.StatusInternalServerError)
+			h.httpOperationFailure(w, r, err)
 			return
 		}
 	}
@@ -303,7 +303,7 @@ func (h *handlers) handleAdminArticlePublish(w http.ResponseWriter, r *http.Requ
 	id := r.PathValue("id")
 	_, found, err := h.publishArticleByID(r.Context(), id)
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.httpOperationFailure(w, r, err)
 		return
 	}
 	if !found {
@@ -313,7 +313,7 @@ func (h *handlers) handleAdminArticlePublish(w http.ResponseWriter, r *http.Requ
 	// Re-fetch so the row reflects the persisted published_at.
 	a, ok, err := h.fetchArticle(r, id)
 	if err != nil || !ok {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.httpOperationFailure(w, r, err)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -328,7 +328,7 @@ func (h *handlers) handleAdminArticleDelete(w http.ResponseWriter, r *http.Reque
 	id := r.PathValue("id")
 	n, err := h.deleteArticleByID(r.Context(), id)
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.httpOperationFailure(w, r, err)
 		return
 	}
 	if n == 0 {

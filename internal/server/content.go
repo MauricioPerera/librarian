@@ -121,7 +121,7 @@ func (h *handlers) resolveType(w http.ResponseWriter, r *http.Request) (schema.C
 		writeError(w, http.StatusNotFound, "content type not found")
 		return schema.ContentTypeDefinition{}, false
 	case err != nil:
-		writeError(w, http.StatusInternalServerError, "could not read content type")
+		h.writeOperationFailure(w, r, err, "could not read content type")
 		return schema.ContentTypeDefinition{}, false
 	}
 	return def, true
@@ -337,7 +337,7 @@ func (h *handlers) handleListContent(w http.ResponseWriter, r *http.Request) {
 	}
 	rows, err := h.listContentRows(r.Context(), def, queryIntDefault(r, "limit", 20), queryIntDefault(r, "offset", 0))
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not list content")
+		h.writeOperationFailure(w, r, err, "could not list content")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"type": def.Name, "items": rows})
@@ -353,7 +353,7 @@ func (h *handlers) handleGetContent(w http.ResponseWriter, r *http.Request) {
 	}
 	row, found, err := h.fetchContentRow(r.Context(), def, r.PathValue("id"))
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not read content")
+		h.writeOperationFailure(w, r, err, "could not read content")
 		return
 	}
 	if !found {
@@ -392,12 +392,12 @@ func (h *handlers) handleCreateContent(w http.ResponseWriter, r *http.Request) {
 	}
 	newID, err := h.insertContentRow(r.Context(), def, id.UserID, values)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not create content")
+		h.writeOperationFailure(w, r, err, "could not create content")
 		return
 	}
 	row, found, err := h.fetchContentRow(r.Context(), def, newID)
 	if err != nil || !found {
-		writeError(w, http.StatusInternalServerError, "could not create content")
+		h.writeOperationFailure(w, r, err, "could not create content")
 		return
 	}
 	writeJSON(w, http.StatusCreated, row)
@@ -421,7 +421,7 @@ func (h *handlers) handleUpdateContent(w http.ResponseWriter, r *http.Request) {
 	}
 	n, err := h.updateContentRow(r.Context(), def, r.PathValue("id"), values)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not update content")
+		h.writeOperationFailure(w, r, err, "could not update content")
 		return
 	}
 	if n == 0 {
@@ -430,7 +430,7 @@ func (h *handlers) handleUpdateContent(w http.ResponseWriter, r *http.Request) {
 	}
 	row, found, err := h.fetchContentRow(r.Context(), def, r.PathValue("id"))
 	if err != nil || !found {
-		writeError(w, http.StatusInternalServerError, "could not update content")
+		h.writeOperationFailure(w, r, err, "could not update content")
 		return
 	}
 	writeJSON(w, http.StatusOK, row)
@@ -445,7 +445,7 @@ func (h *handlers) handleDeleteContent(w http.ResponseWriter, r *http.Request) {
 	}
 	n, err := h.deleteContentRow(r.Context(), def, r.PathValue("id"))
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not delete content")
+		h.writeOperationFailure(w, r, err, "could not delete content")
 		return
 	}
 	if n == 0 {

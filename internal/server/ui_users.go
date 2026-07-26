@@ -133,7 +133,7 @@ func (h *handlers) registerAdminUserRoutes(mux *http.ServeMux) {
 func (h *handlers) handleAdminUsersList(w http.ResponseWriter, r *http.Request) {
 	users, err := auth.ListUsers(r.Context(), h.store)
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.httpOperationFailure(w, r, err)
 		return
 	}
 	views := make([]userView, 0, len(users))
@@ -202,7 +202,7 @@ func (h *handlers) handleAdminUserCreate(w http.ResponseWriter, r *http.Request)
 func (h *handlers) handleAdminUserDetail(w http.ResponseWriter, r *http.Request) {
 	u, found, err := auth.GetUser(r.Context(), h.store, r.PathValue("id"))
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.httpOperationFailure(w, r, err)
 		return
 	}
 	if !found {
@@ -238,7 +238,7 @@ func (h *handlers) handleAdminUserStatus(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "invalid status", http.StatusBadRequest)
 		return
 	case err != nil:
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.httpOperationFailure(w, r, err)
 		return
 	}
 	w.Header().Set("HX-Redirect", "/admin/users/"+uid)
@@ -265,7 +265,7 @@ func (h *handlers) handleAdminUserRoles(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "unknown role", http.StatusBadRequest)
 		return
 	case err != nil:
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.httpOperationFailure(w, r, err)
 		return
 	}
 	w.Header().Set("HX-Redirect", "/admin/users/"+uid)
@@ -279,7 +279,7 @@ func (h *handlers) handleAdminUserRoles(w http.ResponseWriter, r *http.Request) 
 func (h *handlers) handleAdminRolesList(w http.ResponseWriter, r *http.Request) {
 	roles, err := h.rolesWithPermissions(r.Context())
 	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		h.httpOperationFailure(w, r, err)
 		return
 	}
 	id, _ := identityFromContext(r.Context())
