@@ -53,8 +53,22 @@ package server
 // unchecked. So a NULL boolean is rendered unchecked PLUS an explicit "(sin
 // valor)" marker next to it, and the edit form's help text says that saving
 // will turn it into false. Nothing is hidden from the admin.
+//
+// CONTRACT-30 — THE RELATIONS, AND THE SILENT LOSS THEY USED TO CAUSE.
+// Until this contract this file walked ONLY def.Fields. The relations declared
+// by CONTRACT-27 were never rendered, so the panel's POST/PUT body never carried
+// them, so bindValues applied its documented "absent ⇒ NULL" rule to them and
+// updateContentRow — which writes EVERY own column, not only the changed ones —
+// wiped the relation to NULL. Editing the title of a book from the panel dropped
+// its author, with a 200 and no message. None of those three pieces is wrong on
+// its own: "absent ⇒ NULL" is the right rule for the JSON API (see bindValues),
+// and a PUT that replaces every own column is the semantics articles and
+// products already have. The missing fourth piece was HERE, and it is what this
+// file now adds: the form offers the relations, so the body carries them, so
+// nothing is absent and nothing is silently reset. The JSON surface is untouched.
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -86,6 +100,33 @@ type contentFieldInput struct {
 	IsNull bool
 }
 
+// contentReferenceOption is ONE <option> of a relation selector: the id that is
+// SUBMITTED and the text a person READS. The two are deliberately different
+// things — see referenceOptionLabel — and only Value ever reaches the database.
+type contentReferenceOption struct {
+	Value    string
+	Label    string
+	Selected bool
+}
+
+// contentReferenceInput is ONE relation control. Value is the currently selected
+// id ("" ⇒ no relation), kept next to the options so the template can mark the
+// empty option as selected without searching the slice.
+//
+// Truncated says the option list is a PREFIX of the target's rows. It is part of
+// the view model rather than a template detail because the form has to SAY it:
+// an admin cannot pick a row that is not offered, and a silent cut here would be
+// the very same class of failure this contract exists to close — the panel
+// deciding something about the data without telling anyone.
+type contentReferenceInput struct {
+	Name      string
+	Target    string
+	Value     string
+	Options   []contentReferenceOption
+	Truncated bool
+	Limit     int
+}
+
 // contentRowView is one row of the generic list: the cells in field-declaration
 // order plus the id/type needed by the edit and delete controls.
 type contentRowView struct {
@@ -107,10 +148,23 @@ type adminContentListPage struct {
 // adminContentFormPage is the view model of the generic create/edit forms.
 type adminContentFormPage struct {
 	pageData
-	Type   string
-	ID     string
-	Fields []contentFieldInput
-	Error  string
+	Type       string
+	ID         string
+	Fields     []contentFieldInput
+	References []contentReferenceInput
+	Error      string
+}
+
+// contentFormBinding is everything one submitted content form yields: the values
+// to write, the controls to re-render if it is refused, and why. It is a struct
+// rather than five return values because the relation controls made the tuple
+// unreadable, and because Values must never be used without checking OK.
+type contentFormBinding struct {
+	Values     []any
+	Fields     []contentFieldInput
+	References []contentReferenceInput
+	Message    string
+	OK         bool
 }
 
 // registerAdminContentRoutes wires the generic /admin/content/{type} surface.
@@ -190,10 +244,20 @@ func (h *handlers) handleAdminContentNewForm(w http.ResponseWriter, r *http.Requ
 	if !ok {
 		return
 	}
+	// CONTRACT-30: a create form starts with every relation on "sin relación",
+	// which is also what an omitted relation stores. The selectors are built from
+	// the target's CURRENT rows, so a form opened now cannot offer a row that was
+	// deleted before it was opened.
+	references, err := h.referenceInputs(r.Context(), def, nil)
+	if err != nil {
+		h.httpOperationFailure(w, r, err)
+		return
+	}
 	renderContentForm(w, adminContentNewTmpl, http.StatusOK, adminContentFormPage{
-		pageData: h.page(r, "Nuevo "+def.Name+" — librarian"),
-		Type:     def.Name,
-		Fields:   emptyFieldInputs(def),
+		pageData:   h.page(r, "Nuevo "+def.Name+" — librarian"),
+		Type:       def.Name,
+		Fields:     emptyFieldInputs(def),
+		References: references,
 	})
 }
 
@@ -211,23 +275,41 @@ func (h *handlers) handleAdminContentCreate(w http.ResponseWriter, r *http.Reque
 		http.Redirect(w, r, "/login", http.StatusFound)
 		return
 	}
-	values, inputs, msg, ok := h.bindContentForm(def, r)
-	if !ok {
-		renderContentForm(w, adminContentNewTmpl, http.StatusBadRequest, adminContentFormPage{
-			pageData: h.page(r, "Nuevo "+def.Name+" — librarian"),
-			Type:     def.Name,
-			Fields:   inputs,
-			Error:    msg,
-		})
+	bound, err := h.bindContentForm(r.Context(), def, r)
+	if err != nil {
+		h.httpOperationFailure(w, r, err)
 		return
 	}
-	if _, err := h.insertContentRow(r.Context(), def, id.UserID, values); err != nil {
+	refused := func(msg string) {
 		renderContentForm(w, adminContentNewTmpl, http.StatusBadRequest, adminContentFormPage{
-			pageData: h.page(r, "Nuevo "+def.Name+" — librarian"),
-			Type:     def.Name,
-			Fields:   inputs,
-			Error:    "No se pudo crear el contenido.",
+			pageData:   h.page(r, "Nuevo "+def.Name+" — librarian"),
+			Type:       def.Name,
+			Fields:     bound.Fields,
+			References: bound.References,
+			Error:      msg,
 		})
+	}
+	if !bound.OK {
+		refused(bound.Message)
+		return
+	}
+	// CONTRACT-30: the SAME existence check the JSON API runs (checkReferenceTargets),
+	// reached through the form. The <select> is a convenience and never a validation:
+	// a hand-crafted POST naming a row that does not exist has to land on the same
+	// 400 with the same sentence it gets on the JSON surface, not on a driver error.
+	if err := h.checkReferenceTargets(r.Context(), def, bound.Values); err != nil {
+		refused(referenceRefusal(err, "No se pudo crear el contenido."))
+		return
+	}
+	if _, err := h.insertContentRow(r.Context(), def, id.UserID, bound.Values); err != nil {
+		// CONTRACT-28's net, applied here too: a target deleted between the check
+		// and the INSERT is a 400 with the race's own sentence, not the generic
+		// "no se pudo crear" that would hide what actually happened.
+		if raced := h.foreignKeyRaceOnWrite(def, err); raced != nil {
+			refused(referenceRefusal(raced, "No se pudo crear el contenido."))
+			return
+		}
+		refused("No se pudo crear el contenido.")
 		return
 	}
 	http.Redirect(w, r, "/admin/content/"+def.Name, http.StatusSeeOther)
@@ -250,11 +332,20 @@ func (h *handlers) handleAdminContentEditForm(w http.ResponseWriter, r *http.Req
 		h.renderNotFound(w, r)
 		return
 	}
+	// CONTRACT-30: the relation arrives PRESELECTED with what the row actually
+	// holds. Anything else would put the admin one save away from clearing a
+	// relation they never touched — which is exactly the defect this fixes.
+	references, err := h.referenceInputs(r.Context(), def, storedReferences(def, row))
+	if err != nil {
+		h.httpOperationFailure(w, r, err)
+		return
+	}
 	renderContentForm(w, adminContentEditTmpl, http.StatusOK, adminContentFormPage{
-		pageData: h.page(r, "Editar "+def.Name+" — librarian"),
-		Type:     def.Name,
-		ID:       r.PathValue("id"),
-		Fields:   fieldInputsFromRow(def, row),
+		pageData:   h.page(r, "Editar "+def.Name+" — librarian"),
+		Type:       def.Name,
+		ID:         r.PathValue("id"),
+		Fields:     fieldInputsFromRow(def, row),
+		References: references,
 	})
 }
 
@@ -268,19 +359,35 @@ func (h *handlers) handleAdminContentUpdate(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	rowID := r.PathValue("id")
-	values, inputs, msg, ok := h.bindContentForm(def, r)
-	if !ok {
-		renderContentForm(w, adminContentEditTmpl, http.StatusBadRequest, adminContentFormPage{
-			pageData: h.page(r, "Editar "+def.Name+" — librarian"),
-			Type:     def.Name,
-			ID:       rowID,
-			Fields:   inputs,
-			Error:    msg,
-		})
+	bound, err := h.bindContentForm(r.Context(), def, r)
+	if err != nil {
+		h.httpOperationFailure(w, r, err)
 		return
 	}
-	n, err := h.updateContentRow(r.Context(), def, rowID, values)
+	refused := func(msg string) {
+		renderContentForm(w, adminContentEditTmpl, http.StatusBadRequest, adminContentFormPage{
+			pageData:   h.page(r, "Editar "+def.Name+" — librarian"),
+			Type:       def.Name,
+			ID:         rowID,
+			Fields:     bound.Fields,
+			References: bound.References,
+			Error:      msg,
+		})
+	}
+	if !bound.OK {
+		refused(bound.Message)
+		return
+	}
+	if err := h.checkReferenceTargets(r.Context(), def, bound.Values); err != nil {
+		refused(referenceRefusal(err, "No se pudo actualizar el contenido."))
+		return
+	}
+	n, err := h.updateContentRow(r.Context(), def, rowID, bound.Values)
 	if err != nil {
+		if raced := h.foreignKeyRaceOnWrite(def, err); raced != nil {
+			refused(referenceRefusal(raced, "No se pudo actualizar el contenido."))
+			return
+		}
 		h.httpOperationFailure(w, r, err)
 		return
 	}
@@ -319,11 +426,21 @@ func (h *handlers) handleAdminContentDelete(w http.ResponseWriter, r *http.Reque
 // bindValues already validates, so the UI and the JSON API accept and reject
 // exactly the same things, with the same messages. It also returns the form
 // controls to re-render on failure, carrying what the admin actually typed.
-func (h *handlers) bindContentForm(def schema.ContentTypeDefinition, r *http.Request) ([]any, []contentFieldInput, string, bool) {
+//
+// CONTRACT-30: it now walks def.References as well, so the body it builds has
+// the SAME shape the JSON API sends. `nil` selections are still expressed —
+// the empty <option> submits "", which is left out of the body and therefore
+// stored as NULL, deliberately and visibly. What can no longer happen is a
+// relation being absent because nobody ever asked about it.
+func (h *handlers) bindContentForm(ctx context.Context, def schema.ContentTypeDefinition, r *http.Request) (contentFormBinding, error) {
 	if err := r.ParseForm(); err != nil {
-		return nil, emptyFieldInputs(def), "Formulario inválido.", false
+		references, refErr := h.referenceInputs(ctx, def, nil)
+		if refErr != nil {
+			return contentFormBinding{}, refErr
+		}
+		return contentFormBinding{Fields: emptyFieldInputs(def), References: references, Message: "Formulario inválido."}, nil
 	}
-	body := make(map[string]json.RawMessage, len(def.Fields))
+	body := make(map[string]json.RawMessage, len(def.Fields)+len(def.References))
 	inputs := make([]contentFieldInput, 0, len(def.Fields))
 	for _, f := range def.Fields {
 		raw := lastFormValue(r, f.Name)
@@ -342,19 +459,216 @@ func (h *handlers) bindContentForm(def schema.ContentTypeDefinition, r *http.Req
 		}
 		encoded, err := encodeFormValue(f, raw)
 		if err != nil {
-			return nil, inputs, err.Error(), false
+			references, refErr := h.referenceInputs(ctx, def, submittedReferences(def, r))
+			if refErr != nil {
+				return contentFormBinding{}, refErr
+			}
+			return contentFormBinding{Fields: inputs, References: references, Message: err.Error()}, nil
 		}
 		body[f.Name] = encoded
+	}
+	// The selected id travels as a JSON string, which is exactly what bindReference
+	// expects: the uuid shape check, the "or null" rule and the 400 message all stay
+	// where they already were, and this file adds no second validator.
+	selected := submittedReferences(def, r)
+	for _, ref := range def.References {
+		id := selected[ref.Name]
+		if id == "" {
+			continue
+		}
+		encoded, err := json.Marshal(id)
+		if err != nil { // unreachable: a Go string always marshals.
+			return contentFormBinding{}, err
+		}
+		body[ref.Name] = encoded
+	}
+	references, err := h.referenceInputs(ctx, def, selected)
+	if err != nil {
+		return contentFormBinding{}, err
 	}
 	values, err := bindValues(def, body)
 	if err != nil {
 		var bad errBadField
 		if errors.As(err, &bad) {
-			return nil, inputs, "Revisá los campos: " + bad.msg, false
+			return contentFormBinding{Fields: inputs, References: references, Message: "Revisá los campos: " + bad.msg}, nil
 		}
-		return nil, inputs, "No se pudo procesar el formulario.", false
+		return contentFormBinding{Fields: inputs, References: references, Message: "No se pudo procesar el formulario."}, nil
 	}
-	return values, inputs, "", true
+	return contentFormBinding{Values: values, Fields: inputs, References: references, OK: true}, nil
+}
+
+// submittedReferences reads the relation half of a submitted form: name → the id
+// the admin chose, "" meaning the explicit "sin relación" option. A relation
+// whose control was not rendered at all (the target has no rows yet) is simply
+// absent, which is the same thing.
+func submittedReferences(def schema.ContentTypeDefinition, r *http.Request) map[string]string {
+	out := make(map[string]string, len(def.References))
+	for _, ref := range def.References {
+		out[ref.Name] = lastFormValue(r, ref.Name)
+	}
+	return out
+}
+
+// storedReferences reads the relation half of a STORED row (rowJSON's output, so
+// a relation is a string id or nil) into the same name → id map the form uses.
+func storedReferences(def schema.ContentTypeDefinition, row map[string]any) map[string]string {
+	out := make(map[string]string, len(def.References))
+	for _, ref := range def.References {
+		if id, ok := row[ref.Name].(string); ok {
+			out[ref.Name] = id
+		}
+	}
+	return out
+}
+
+// referenceRefusal renders a reference failure for the FORM. errBadField is the
+// project's "the request is wrong" sentinel and its message is written to be read
+// by a person (checkReferenceTargets names the relation, the target type and the
+// id that missed), so it is surfaced verbatim; anything else is an internal
+// failure whose text must not reach the page.
+func referenceRefusal(err error, fallback string) string {
+	var bad errBadField
+	if errors.As(err, &bad) {
+		return bad.msg
+	}
+	return fallback
+}
+
+// referenceOptionLimit is how many target rows ONE relation selector offers.
+//
+// THE NUMBER IS A DECISION, NOT A DEFAULT. It is deliberately the same 100 the
+// generic listing uses (handleAdminContentList), so the rows an admin can CHOOSE
+// are exactly the rows the same admin can SEE on the target's first page — two
+// different cutoffs would mean a row visible in one place and unselectable in the
+// other, with no explanation for the difference. A <select> is also the wrong
+// control long before a table is: an unsearchable list of thousands of options is
+// unusable, and giving it a proper answer (a search/typeahead picker) is a
+// different piece of work than this one. Until that exists, the honest behaviour
+// is to cut at a stated number and SAY SO — see contentReferenceInput.Truncated
+// and the template's aviso. An admin who is told the list is partial can still
+// reach the row through the JSON API; an admin who is not told simply loses it.
+const referenceOptionLimit = 100
+
+// referenceInputs builds one selector per declared relation, preselected with
+// `selected[name]` (the stored id when the edit form opens, the submitted id when
+// a refused form is re-rendered, "" for a create form).
+//
+// It reads the target's rows from the REGISTRY-resolved definition through the
+// same listContentRows every other read uses — no new SQL, so no new placeholder
+// dialect to get wrong — and asks for one row MORE than it will show, which is
+// how truncation is detected without a second COUNT round trip.
+//
+// THE PRESELECTED ROW IS ADDED BACK WHEN THE CUT WOULD HIDE IT. A relation may
+// point at a row that is not in the newest `referenceOptionLimit`; if the option
+// were missing, the <select> would fall back to the empty option and the next
+// save would clear a relation nobody touched — this contract's defect, rebuilt
+// out of the fix for it. So a current value that is not among the offered rows is
+// fetched on its own and prepended, still marked selected.
+func (h *handlers) referenceInputs(ctx context.Context, def schema.ContentTypeDefinition, selected map[string]string) ([]contentReferenceInput, error) {
+	out := make([]contentReferenceInput, 0, len(def.References))
+	for _, ref := range def.References {
+		// The target is read back from the registry, exactly like the {type}
+		// segment is: the name in the definition is never trusted as an identifier.
+		target, err := store.FetchContentType(ctx, h.store, ref.Target)
+		if err != nil {
+			return nil, err
+		}
+		current := strings.TrimSpace(selected[ref.Name])
+		rows, err := h.listContentRows(ctx, target, referenceOptionLimit+1, 0)
+		if err != nil {
+			return nil, err
+		}
+		in := contentReferenceInput{Name: ref.Name, Target: ref.Target, Value: current, Limit: referenceOptionLimit}
+		if len(rows) > referenceOptionLimit {
+			rows = rows[:referenceOptionLimit]
+			in.Truncated = true
+		}
+		found := false
+		options := make([]contentReferenceOption, 0, len(rows))
+		for _, row := range rows {
+			id, _ := row[colID].(string)
+			if id == current {
+				found = true
+			}
+			options = append(options, contentReferenceOption{
+				Value:    id,
+				Label:    referenceOptionLabel(target, row),
+				Selected: id == current,
+			})
+		}
+		if current != "" && !found {
+			option, err := h.referenceOptionByID(ctx, target, current)
+			if err != nil {
+				return nil, err
+			}
+			options = append([]contentReferenceOption{option}, options...)
+		}
+		in.Options = options
+		out = append(out, in)
+	}
+	return out, nil
+}
+
+// referenceOptionByID builds the option for ONE id that the offered page did not
+// contain. A row that no longer exists (or an id typed by hand into a crafted
+// request) still becomes an option labelled with the id itself: the value has to
+// survive the re-render so the admin sees what was submitted, and rejecting it is
+// checkReferenceTargets' job, not the selector's.
+func (h *handlers) referenceOptionByID(ctx context.Context, target schema.ContentTypeDefinition, id string) (contentReferenceOption, error) {
+	option := contentReferenceOption{Value: id, Label: id, Selected: true}
+	if !uuidPattern.MatchString(id) {
+		// Not a uuid: fetching it would compare a non-uuid against a PostgreSQL
+		// `uuid` column. bindReference already refuses it with its own 400.
+		return option, nil
+	}
+	row, found, err := h.fetchContentRow(ctx, target, id)
+	if err != nil {
+		return contentReferenceOption{}, err
+	}
+	if found {
+		option.Label = referenceOptionLabel(target, row)
+	}
+	return option, nil
+}
+
+// referenceOptionLabel is THE label rule, and it is only ever cosmetic — the
+// <option>'s value is the id, always.
+//
+// THE RULE: the target type's FIRST DECLARED FIELD, followed by the first eight
+// characters of the id. The first field is the closest thing a dynamic type has
+// to a title — nothing in the definition model marks one, and inventing a
+// "display field" here would be a second source of truth the definition API
+// cannot express and the admin never agreed to (the same argument bindValues
+// makes for not inventing required-ness). Declaration order is chosen by whoever
+// created the type and is stable, so the label is deterministic and identical on
+// both engines.
+//
+// THE ID PREFIX IS NOT DECORATION. Dynamic types have no uniqueness constraint on
+// any field, so two rows can legitimately render the same text; without a
+// discriminator the admin would pick blind between identical options. Eight
+// characters is what the listing shows in its row anchors and is enough to tell
+// two rows apart by eye.
+//
+// THE TWO REQUIRED EDGE CASES, both legal and both handled here: a target type
+// with NO declared fields has nothing to read, so the label is the bare id (which
+// is all that exists to say about that row); and a NULL — or empty — value in the
+// label field renders "(sin <campo>)" rather than an empty option, so the row
+// stays selectable and the emptiness is stated rather than implied.
+func referenceOptionLabel(target schema.ContentTypeDefinition, row map[string]any) string {
+	id, _ := row[colID].(string)
+	if len(target.Fields) == 0 {
+		return id
+	}
+	field := target.Fields[0]
+	label := strings.TrimSpace(displayValue(row[field.Name]))
+	if label == "" {
+		label = "(sin " + field.Name + ")"
+	}
+	short := id
+	if len(short) > 8 {
+		short = short[:8]
+	}
+	return label + " · " + short
 }
 
 // encodeFormValue turns ONE raw form string into the JSON token bindValue
