@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 
@@ -44,36 +45,77 @@ func identityFromContext(ctx context.Context) (*Identity, bool) {
 	return id, ok
 }
 
+// errIdentityRejected is the single generic error for "this bearer token does
+// not authenticate": not a valid JWT AND not a live API key. It is one sentinel
+// for both, and it carries no detail, so a caller cannot tell which mechanism
+// refused it — the same anti-enumeration stance the credential path takes.
+var errIdentityRejected = errors.New("identity rejected")
+
 // resolveIdentity resolves a bearer token to an Identity, trying JWT first
 // and falling back to an API key — the exact same order and semantics as the
 // original inline logic in handleWhoami. It is the single reusable identity
 // resolution function: /whoami and the permission middleware both call it, so
-// there is no duplicated resolution logic. Returns ok=false when neither
-// mechanism authenticates (the caller writes 401).
+// there is no duplicated resolution logic.
+//
 // CONTRACT-19: the API-key branch calls internal/auth, which now takes the
 // *compat.Store (connection + engine) rather than a bare *sql.DB. Only the
 // parameter type changes; the resolution order and semantics are untouched.
-func resolveIdentity(ctx context.Context, store *compat.Store, secret, token string) (*Identity, bool) {
+//
+// CONTRACT-24 REPLACED the `ok bool` return with an error, and the distinction
+// it carries is the whole point. THE SAME REASONING AS handleLogin APPLIES HERE,
+// so read it there before changing this: a REJECTED token yields
+// errIdentityRejected → 401, exactly as before and indistinguishable between the
+// JWT and the API-key case; a token the API-key lookup could not even CHECK,
+// because the database did not answer, yields the underlying error → 503. The
+// second outcome does not depend on the token, so it discloses nothing about any
+// key or any account — it is a fact about this process's infrastructure, which
+// is precisely what the caller and the operator need to be told. With `ok bool`
+// the two were the same value, which is why a stopped database made every
+// authenticated read answer 401.
+func resolveIdentity(ctx context.Context, store *compat.Store, secret, token string) (*Identity, error) {
 	// Try JWT first. VerifyJWT is the canonical check (rejects non-HMAC algs,
-	// bad signature, expired).
+	// bad signature, expired). It touches no database, so it cannot fail for
+	// infrastructure reasons and a valid JWT keeps working while the database is
+	// down — the request itself will fail later, on its own terms.
 	if claims, err := auth.VerifyJWT(secret, token); err == nil {
 		return &Identity{
 			Kind:   "jwt",
 			UserID: claims.Subject,
 			Email:  claims.Email,
 			Roles:  claims.Roles,
-		}, true
+		}, nil
 	}
 	// Fall back to API key: exact-match on the SHA-256 hash inside the DB,
 	// rejected if revoked. Same path as /whoami.
-	if key, err := auth.VerifyAPIKey(ctx, store, token); err == nil {
+	key, err := auth.VerifyAPIKey(ctx, store, token)
+	switch {
+	case err == nil:
 		return &Identity{
 			Kind:   "apikey",
 			RoleID: key.RoleID,
 			Label:  key.Label,
-		}, true
+		}, nil
+	case errors.Is(err, auth.ErrAPIKeyRejected):
+		// The token is neither a valid JWT nor a live key. Genuinely 401.
+		return nil, errIdentityRejected
+	default:
+		// The lookup could not run (auth.VerifyAPIKey wraps the query error).
+		// The error is propagated so the HTTP layer can answer 503; it is NEVER
+		// rendered into a response — see infraUnavailableMessage.
+		return nil, err
 	}
-	return nil, false
+}
+
+// writeIdentityError maps a resolveIdentity failure onto the wire: the
+// unchanged 401 "unauthorized" envelope for a rejected token, 503 with the fixed
+// generic message when the database could not be consulted. It is the single
+// place that mapping is made, so /whoami and the middleware cannot drift.
+func writeIdentityError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errIdentityRejected) {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	writeInfraUnavailable(w)
 }
 
 // authenticate is the shared first stage of every protected route: it extracts
@@ -89,9 +131,12 @@ func (h *handlers) authenticate(w http.ResponseWriter, r *http.Request) (*http.R
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return nil, nil, false
 	}
-	id, ok := resolveIdentity(r.Context(), h.store, h.jwtSecret, token)
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized")
+	id, err := resolveIdentity(r.Context(), h.store, h.jwtSecret, token)
+	if err != nil {
+		// CONTRACT-24: 401 for a rejected token, 503 when the database could not
+		// be consulted. This is the point the production measurement hit — every
+		// authenticated route answered 401 with the database stopped.
+		writeIdentityError(w, err)
 		return nil, nil, false
 	}
 	return r.WithContext(context.WithValue(r.Context(), identityKey{}, id)), id, true

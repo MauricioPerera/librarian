@@ -16,7 +16,8 @@ vez. El estado va en el índice para no tener que leerlas para saberlo.
 | 4 | [Crear la primera identidad desde el producto](#4-no-hay-forma-de-crear-la-primera-identidad-desde-el-producto-media) | **RESUELTO** (CONTRACT-22) |
 | 5 | [`pgvector` obligatorio aunque no se usen vectores](#5-pgvector-es-obligatorio-aunque-no-se-usen-vectores-media) | **RESUELTO** (CONTRACT-23) |
 | 6 | [La migración sin ventana de corte nunca se ejercitó](#6-la-migración-sin-ventana-de-corte-nunca-se-ejercitó-media) | **RESUELTO** (ensayo 2026-07-25) |
-| 7 | [`/health` no mira la base, y una caída se ve como 401](#7-health-no-mira-la-base-y-una-caída-se-ve-como-401-alta) | Abierto (ALTA) |
+| 7 | [`/health` no mira la base, y una caída se ve como 401](#7-health-no-mira-la-base-y-una-caída-se-ve-como-401-alta) | **RESUELTO** (CONTRACT-24) |
+| 8 | [Las rutas de datos tardan ~21 s en fallar con la base caída](#8-las-rutas-de-datos-tardan-21-s-en-fallar-con-la-base-caída-media) | Abierto (MEDIA) |
 
 ## 1. No hay forma de otorgar permisos a un rol desde el producto (ALTA)
 
@@ -249,7 +250,21 @@ Es trabajo con su propio contrato, no un paso de un deploy.
 
 ## 7. `/health` no mira la base, y una caída se ve como 401 (ALTA)
 
-**Estado:** abierto.
+**Estado:** RESUELTO por CONTRACT-24
+(`specs/CONTRACT-24-salud-y-errores-de-infraestructura.md`, reporte en
+`docs/reports/CONTRACT-24-REPORT.md`). Se separó *vivo* de *listo para servir*:
+`/health` **conserva exactamente su significado y su cuerpo** (el proceso vive —
+hay monitoreo apuntado ahí), y la disponibilidad es una ruta NUEVA, `GET /ready`,
+que sí hace un `ping` a la base con su propio límite de 2 s y responde **503**
+`{"error":"service unavailable"}` cuando no la alcanza. Y un fallo de
+infraestructura ya no se disfraza de credencial: el login y la resolución de
+identidad por API key devuelven **503** cuando la base no contesta, en vez de
+401. Verificado con el contenedor de PostgreSQL **realmente detenido**: `/health`
+200, `/ready` 503, login 503. La anti-enumeración quedó intacta —un usuario
+inexistente y uno existente con contraseña mala siguen dando el mismo 401 con el
+mismo cuerpo— y el razonamiento de por qué distinguir la infraestructura no
+reintroduce enumeración está escrito junto a la guarda, en `handleLogin`. El
+texto de abajo se conserva como registro de cómo se descubrió el hueco.
 
 **Qué pasa:** `/health` responde `{"status":"ok"}` aunque la base esté caída —
 comprueba que el proceso vive, no que el sistema pueda servir. Y peor: con la
@@ -281,3 +296,37 @@ consulte la base (un `ping` barato basta) o que exista una segunda ruta que sí 
 haga, y que un fallo de conexión a la base se traduzca en 5xx y no en 401. Ojo al
 diseñarlo: la ruta de salud no debe quedar cara ni convertirse en una vía de
 carga contra la base, y no debe filtrar detalles de la conexión.
+
+
+## 8. Las rutas de datos tardan ~21 s en fallar con la base caída (MEDIA)
+
+**Estado:** abierto.
+
+**Qué pasa:** `CONTRACT-24` le puso un límite de tiempo propio a la sonda de
+disponibilidad, así que `/ready` responde en ~2 s. Las **rutas de datos no
+tienen ese límite**: esperan lo que el driver decida. Medido con la base
+detenida y un token válido:
+
+```
+GET /content-types  ->  500  en 21,03 s
+POST /auth/login    ->  503  en 21,06 s
+```
+
+**Por qué importa:** con la base caída, cada petición ocupa una goroutine y una
+ranura del pool durante ~21 s antes de rendirse. Bajo carga eso se acumula: el
+servicio pasa de "responde error rápido" a "no responde", que es un modo de
+fallo peor. Un cliente con reintentos lo empeora.
+
+**Cómo se descubrió (2026-07-26, verificando CONTRACT-24):** al medir el
+comportamiento con la base realmente detenida. Las primeras corridas parecían
+colgarse; eran los 21 s del driver superando el timeout del cliente.
+
+**Nota aparte, del mismo hallazgo:** las rutas de datos devuelven **500** ante
+un fallo de base, no 503. Es 5xx —o sea que cumple `CONTRACT-24`— pero 503 le
+dice a un balanceador "reintentá", y 500 le dice "esto está roto". Vale decidir
+si conviene unificarlo.
+
+**Qué haría falta:** un límite de tiempo por petición para las operaciones
+contra la base, de modo que el fallo sea rápido y explícito. Ojo al elegirlo: un
+límite corto de más convierte una base lenta pero sana en errores; hay que
+medirlo contra el comportamiento real, no elegirlo de memoria.

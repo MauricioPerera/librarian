@@ -15,6 +15,7 @@ import (
 	"crypto/sha256"
 	"embed"
 	"encoding/hex"
+	"errors"
 	"html/template"
 	"net/http"
 	"path"
@@ -92,6 +93,13 @@ var (
 // unknown email and wrong password alike — so the UI never reintroduces the
 // user-enumeration leak that auth.VerifyCredentials already closes.
 const genericLoginError = "Email o contraseña incorrectos."
+
+// unavailableLoginError is the message shown when the login could not be
+// DECIDED because the database did not answer (CONTRACT-24). It is deliberately
+// NOT genericLoginError: it must not send a human off to reset a password that
+// was never checked. It names no cause and no component — the same no-detail
+// rule the API's 503 follows.
+const unavailableLoginError = "El servicio no está disponible en este momento. Volvé a intentar en unos minutos."
 
 // pageData is the layout's view model: title and, when authenticated, the email
 // used to render the topbar's logout control. Path is the current request path
@@ -231,6 +239,20 @@ func (h *handlers) handleLoginSubmit(w http.ResponseWriter, r *http.Request) {
 
 	user, err := auth.VerifyCredentials(r.Context(), h.store, email, password)
 	if err != nil {
+		// CONTRACT-24, the browser half of the same separation the JSON login
+		// makes (see handleLogin in server.go for the full anti-enumeration
+		// reasoning — it is not repeated here, but it governs this guard too).
+		//
+		// Showing "Email o contraseña incorrectos" while the database is down is
+		// worse in the UI than in the API: it tells a human being, in words, that
+		// they typed their own password wrong, so they retype it, then reset it,
+		// and the outage stays invisible for as long as they keep believing the
+		// message. The credential message is reserved for actual credential
+		// failures; an outage says it is an outage, with a 503.
+		if !errors.Is(err, auth.ErrInvalidCredentials) {
+			renderLogin(w, infraUnavailableStatus, unavailableLoginError)
+			return
+		}
 		// Same message for unknown-user and wrong-password — anti-enumeration.
 		renderLogin(w, http.StatusUnauthorized, genericLoginError)
 		return

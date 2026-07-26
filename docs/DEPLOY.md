@@ -175,7 +175,8 @@ Subir por SFTP a `/opt/librarian/librarian.new`, y después:
 mv /opt/librarian/librarian.new /opt/librarian/librarian   # reemplazo atómico
 systemctl restart librarian.service
 systemctl is-active librarian.service                       # debe decir "active"
-curl -s http://127.0.0.1:8500/health                        # {"status":"ok"}
+curl -s http://127.0.0.1:8500/health                        # {"status":"ok"}  (el proceso vive)
+curl -s http://127.0.0.1:8500/ready                         # {"status":"ready"} (la base responde)
 ```
 
 Después, la [verificación post-deploy](#verificación-post-deploy) — que NO es solo lecturas.
@@ -296,13 +297,38 @@ systemctl start librarian.service
 modo solo-lectura efectiva (la tabla de permisos vacía) sin que ninguna verificación lo
 detectara, porque todas eran `GET` y las lecturas no requieren permiso.
 
-### 1. El servicio está vivo
+### 1. El servicio está vivo **y además puede servir**
+
+Son **dos comprobaciones distintas y hay que hacer las dos** (CONTRACT-24). `/health` dice
+solamente que el proceso está vivo; `/ready` es la que mira la base. Con la base detenida,
+`/health` sigue respondiendo `200 {"status":"ok"}` — es correcto, el proceso está vivo — así que
+un deploy verificado solo con `/health` da por bueno un servicio que no puede atender nada. Eso
+pasó de verdad: ver el hueco 7 de `docs/PENDIENTES.md`.
 
 ```bash
 systemctl is-active librarian.service
 journalctl -u librarian.service --no-pager -n 5      # sin errores de arranque
+
+# El proceso vive.
 curl -s https://librarian.ardf.dev/health            # {"status":"ok"}
+
+# El proceso puede servir: la base responde. ESTE es el que corta el deploy.
+curl -s -o /dev/null -w '%{http_code}\n' https://librarian.ardf.dev/ready   # 200
+curl -s https://librarian.ardf.dev/ready                                    # {"status":"ready"}
 ```
+
+`/ready` responde **503** `{"error":"service unavailable"}` cuando no consigue conexión con la
+base (o cuando la base tarda más de 2 s en contestar). Si da 503, **parar acá**: el deploy no
+está bien aunque el binario haya arrancado y `/health` esté verde. Mirar el motor —
+`systemctl status postgresql` o `docker ps` del contenedor de la base, según la instalación — y
+`journalctl -u librarian.service`. La respuesta de `/ready` no trae detalle a propósito (ni DSN,
+ni host, ni error del driver): el diagnóstico se hace en el servidor, no leyendo el endpoint.
+
+Síntoma asociado, por si aparece durante una incidencia: con la base caída, el login responde
+**503**, no 401. Un 401 en el login significa credenciales de verdad incorrectas y nada más.
+
+Si hay un balanceador o un monitor delante, `/ready` es la ruta que tiene que consultar para
+decidir si mandarle tráfico a la instancia; `/health` sirve para reiniciar el proceso colgado.
 
 ### 2. Conseguir una identidad para verificar
 

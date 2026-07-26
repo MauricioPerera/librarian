@@ -74,6 +74,12 @@ func NewMux(deps Deps) (*http.ServeMux, error) {
 // path does the same thing: NewMux is engine-agnostic and takes whichever store
 // the process opened.
 func (h *handlers) registerRoutes(mux *http.ServeMux) {
+	// CONTRACT-24: the availability probe. It is registered HERE and not next to
+	// /health in NewMux because, unlike handleHealth, it needs the handlers value
+	// (it pings the pool) — and because registering it here means every mux built
+	// from a handlers value, including the dual-engine batteries', gets it.
+	mux.HandleFunc(readyPath, h.handleReady)
+
 	mux.HandleFunc("POST /auth/login", h.handleLogin)
 	mux.HandleFunc("GET /whoami", h.handleWhoami)
 
@@ -168,9 +174,18 @@ type handlers struct {
 	// uniqueness of a type name — that is the schema-level UNIQUE(name) on
 	// content_types, the only guarantee that also holds across processes.
 	schemaMu sync.Mutex
+	// ready memoizes the CONTRACT-24 availability probe so an unauthenticated,
+	// freely pollable endpoint cannot be turned into a load path against the
+	// database. See readiness.go.
+	ready readiness
 }
 
 // handleHealth answers 200 {"status":"ok"}.
+//
+// CONTRACT-24 deliberately LEFT THIS ALONE. Its contract is "the process is
+// alive" and there is external monitoring asserting exactly that; making it
+// consult the database would silently redefine what every existing monitor
+// measures. Availability is the separate GET /ready (readiness.go).
 func handleHealth(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
@@ -182,8 +197,9 @@ type loginRequest struct {
 }
 
 // handleLogin verifies credentials (auth.VerifyCredentials) and, on success,
-// issues a 24h JWT. On any credential failure it returns 401 with the same
-// generic envelope and message that VerifyCredentials uses — anti-enumeration.
+// issues a 24h JWT. A CREDENTIAL failure returns 401 with the same generic
+// envelope and message for every case — anti-enumeration. An INFRASTRUCTURE
+// failure returns 503; see the guard below.
 func (h *handlers) handleLogin(w http.ResponseWriter, r *http.Request) {
 	var req loginRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -192,7 +208,37 @@ func (h *handlers) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	user, err := auth.VerifyCredentials(r.Context(), h.store, req.Email, req.Password)
 	if err != nil {
-		// Same generic message for unknown user and wrong password.
+		// CONTRACT-24. READ THIS BEFORE "FIXING" IT BACK.
+		//
+		// This guard does NOT weaken the anti-enumeration property, and the
+		// reason is that the two things being separated are of different kinds.
+		//
+		// The collapse to a single 401 exists so an attacker cannot tell "that
+		// user does not exist" from "that password is wrong" — auth.VerifyCredentials
+		// goes as far as running a bcrypt compare against a fixed dummy hash on
+		// the unknown-email branch so even the TIMING of the two is the same. All
+		// of that is intact: EVERY case ErrInvalidCredentials covers — unknown
+		// email, wrong password, and a suspended or invited account with the right
+		// password — still takes this same 401 with the same body and the same
+		// message. Nothing below can distinguish them.
+		//
+		// What the guard separates out is a database that is not answering. That
+		// answer is a FUNCTION OF THE INFRASTRUCTURE ALONE: it is identical for
+		// every email and every password, including emails that do not exist and
+		// passwords that are wrong, so observing it tells an attacker nothing
+		// about any account. There is no account-dependent signal to leak,
+		// because the branch never got far enough to look at an account.
+		//
+		// It was measured in production (docs/PENDIENTES.md, hueco 7): with the
+		// database stopped, login answered 401, so an outage presented itself as
+		// "wrong credentials" and the incident was diagnosed as a login problem.
+		// Reporting 401 there is not a security property, it is a wrong answer.
+		if !errors.Is(err, auth.ErrInvalidCredentials) {
+			writeInfraUnavailable(w)
+			return
+		}
+		// Same generic message for unknown user, wrong password, and inactive
+		// account.
 		writeError(w, http.StatusUnauthorized, "invalid credentials")
 		return
 	}
@@ -216,9 +262,11 @@ func (h *handlers) handleWhoami(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-	id, ok := resolveIdentity(r.Context(), h.store, h.jwtSecret, token)
-	if !ok {
-		writeError(w, http.StatusUnauthorized, "unauthorized")
+	id, err := resolveIdentity(r.Context(), h.store, h.jwtSecret, token)
+	if err != nil {
+		// CONTRACT-24: 401 only when the token was actually REJECTED; 503 when
+		// the API-key lookup could not reach the database. See resolveIdentity.
+		writeIdentityError(w, err)
 		return
 	}
 	switch id.Kind {
