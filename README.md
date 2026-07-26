@@ -114,4 +114,33 @@ go build ./... && go vet ./... && gofmt -l . && go test ./... -count=1
 ```
 
 Las suites que necesitan un PostgreSQL vivo están detrás de build tags (`dualengine`,
-`exportfixture`) y **saltean** si falta `COMPAT_POSTGRES_DSN`, en vez de pasar en falso.
+`exportfixture`) y **saltean** si les falta su DSN, en vez de pasar en falso.
+
+```bash
+# Compara SQLite real contra PostgreSQL real, resultado contra resultado
+COMPAT_POSTGRES_DSN='postgres://...' go test -tags dualengine -count=1 ./...
+```
+
+Cada corrida crea **su propia base de datos** y la borra al terminar, así que no le importa qué
+haya en el servidor y dos corridas en paralelo no se pisan. El usuario del DSN necesita permiso
+para `CREATE DATABASE`.
+
+### El PostgreSQL sin `pgvector`
+
+Hay un caso que **solo** se puede probar contra un PostgreSQL que NO tenga la extensión: que una
+instalación con `LIBRARIAN_VECTOR=disabled` arranque y funcione ahí, que es la razón de ser de esa
+opción. Ese servidor no se puede simular —la extensión está o no está— así que va en su propia
+variable:
+
+```bash
+# Un segundo servidor, deliberadamente sin la extensión
+docker run -d --name pg-novector -e POSTGRES_PASSWORD=... -p 5458:5432 postgres:17-alpine
+
+LIBRARIAN_PG_NO_VECTOR_DSN='postgres://...:5458/postgres?sslmode=disable' \
+COMPAT_POSTGRES_DSN='postgres://...' \
+  go test -tags dualengine -count=1 ./...
+```
+
+**Sin esa variable el caso saltea**, y saltear se lee como verde en la salida resumida. Si vas a
+tocar algo que roce la capacidad vectorial opcional, levantá el segundo servidor: es la diferencia
+entre haberlo probado y creer que lo probaste.
