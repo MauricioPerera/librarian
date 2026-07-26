@@ -4,6 +4,19 @@ Cosas que faltan y ya están identificadas con evidencia real, para que no se
 redescubran desde cero. No es un backlog de ideas: cada entrada acá se encontró
 operando el sistema de verdad.
 
+Las entradas resueltas **se conservan**, con el texto original de cómo se
+descubrió el hueco: sirve para reconocer la misma forma de problema la próxima
+vez. El estado va en el índice para no tener que leerlas para saberlo.
+
+| # | Hueco | Estado |
+|---|---|---|
+| 1 | [Otorgar permisos a un rol desde el producto](#1-no-hay-forma-de-otorgar-permisos-a-un-rol-desde-el-producto-alta) | **RESUELTO** (CONTRACT-16) |
+| 2 | [Editar campos de un tipo dinámico](#2-editar-campos-de-un-tipo-de-contenido-dinámico-media) | **RESUELTO** (CONTRACT-18) |
+| 3 | [Colisión de nombre entre un CPT y una tabla de código](#3-colisión-de-nombre-entre-un-cpt-dinámico-y-una-tabla-de-código-futura-baja) | **RESUELTO** (CONTRACT-17) |
+| 4 | [Crear la primera identidad desde el producto](#4-no-hay-forma-de-crear-la-primera-identidad-desde-el-producto-media) | Abierto (MEDIA) |
+| 5 | [`pgvector` obligatorio aunque no se usen vectores](#5-pgvector-es-obligatorio-aunque-no-se-usen-vectores-media) | Abierto (MEDIA) |
+| 6 | [La migración sin ventana de corte nunca se ejercitó](#6-la-migración-sin-ventana-de-corte-nunca-se-ejercitó-media) | Abierto (MEDIA) |
+
 ## 1. No hay forma de otorgar permisos a un rol desde el producto (ALTA)
 
 **Estado:** RESUELTO por CONTRACT-16 (`specs/CONTRACT-16-gestion-de-permisos.md`,
@@ -106,3 +119,77 @@ duplicadas y `Schema.Validate()` fallaría → **el servicio no arrancaría**.
 Es falla ruidosa, no corrupción silenciosa, pero exigiría intervención manual en
 la base. Mitigación barata si algún día molesta: chequear los nombres dinámicos
 existentes antes de agregar una tabla de código nueva.
+
+## 4. No hay forma de crear la primera identidad desde el producto (MEDIA)
+
+**Estado:** abierto.
+
+**Qué pasa:** `librarian` no tiene registro público —decisión correcta para un
+backend de administración— pero tampoco tiene ninguna otra vía de alta inicial.
+El primer usuario se crea **fuera de banda**: escribiendo contra la base o desde
+un programa que use `auth.CreateUser`. A partir de ahí sí se administra todo por
+el producto (usuarios, roles, permisos, claves de API).
+
+**Cómo se descubrió (2026-07-25, al verificar CONTRACT-21):** para ejercitar la
+aplicación recién levantada sobre PostgreSQL en limpio hubo que sembrar el
+usuario administrador con un programa aparte; no existe forma de hacerlo con el
+binario que se despliega.
+
+Es la misma forma que tenía el hueco 1 —una capacidad sin vía de escritura— pero
+menos grave, porque quien instala tiene acceso a la base por definición. Se
+vuelve molesto en cuanto la instalación en limpio deje de ser excepcional.
+
+**Qué haría falta:** un modo de arranque para el alta inicial (un subcomando, o
+una ruta que solo funcione mientras no exista ningún usuario). La guarda
+importante es que **no debe poder usarse dos veces**: una vía de creación de
+administradores que sobrevive al primer uso es un agujero de autenticación, no
+una comodidad.
+
+## 5. `pgvector` es obligatorio aunque no se usen vectores (MEDIA)
+
+**Estado:** abierto, por diseño heredado.
+
+**Qué pasa:** `articles.embedding` es una columna `vector(1536)`, y aunque es
+**nullable** —una instancia puede no guardar jamás un embedding— la columna
+existe en el esquema, así que crear las tablas en PostgreSQL exige la extensión
+`pgvector`. Sin ella el primer arranque falla.
+
+**Consecuencia real:** una instancia que solo quiere administrar contenido
+**no puede correr sobre un PostgreSQL administrado que no ofrezca `pgvector`**.
+Es un requisito de infraestructura impuesto por una capacidad opcional.
+
+**Cómo se descubrió (2026-07-25):** al migrar la base real a PostgreSQL, contra
+un `postgres:17-alpine` limpio el export falló con
+`type "vector" does not exist`. Está documentado como prerrequisito duro en
+`docs/DEPLOY.md` y `docs/OPERATIONS.md`, pero documentarlo no lo elimina.
+
+**Qué haría falta:** que la capacidad vectorial sea opcional en el esquema —que
+la columna solo se declare si la instancia la habilita— de modo que el requisito
+de infraestructura aparezca solo cuando se usa. Ojo: eso convierte el esquema
+canónico en condicional, y hoy es una constante; hay que pensar qué significa
+eso para el export y para el contrato de equivalencia.
+
+## 6. La migración sin ventana de corte nunca se ejercitó (MEDIA)
+
+**Estado:** abierto.
+
+**Qué pasa:** la promesa del sistema es migrar a PostgreSQL "sin apagar la
+aplicación". Hoy están verificadas las dos mitades por separado: la aplicación
+**corre** sobre PostgreSQL (CONTRACT-21, con transcripción HTTP real), y los
+datos **se trasladan** con equivalencia verificada por digest (`compat copy`,
+sobre la base real de producción). Lo que **no** se ejercitó nunca es
+`compat cutover` —captura de cambios, drenaje y corte— contra el esquema y los
+datos de `librarian`.
+
+**Por qué importa la distinción:** `compat copy` es una migración por snapshot;
+las escrituras que ocurran durante la copia no viajan. O sea que hoy la
+migración real exige una ventana de corte, aunque sea corta. La capacidad que la
+elimina existe en el paquete y está probada en SU suite, no con este esquema.
+
+**Cómo se descubrió (2026-07-25):** al escribir `docs/OPERATIONS.md` se
+documentó explícitamente que el runbook cubre el camino de snapshot y que el de
+cutover no está ejercitado, en vez de dejarlo insinuado.
+
+**Qué haría falta:** un ensayo de `compat cutover` contra una copia de la base
+real, con escrituras concurrentes durante la copia, verificando que se drenan.
+Es trabajo con su propio contrato, no un paso de un deploy.
