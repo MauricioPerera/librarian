@@ -259,3 +259,52 @@ misma medición.
       6 casos (3 interleavings × 2 motores)**. El sexto, la carrera del DELETE en SQLite, está medido,
       argumentado, asertado y declarado arriba.
 - [x] Los mensajes del camino normal no se degradan.
+
+---
+
+## Cierre posterior — el hueco se cerró en `compat` v0.5.1
+
+Todo lo anterior es el registro de lo que se sabía en su momento y no se reescribe. Esta sección es
+lo único que cambió después.
+
+**El hueco declarado arriba —la carrera del `DELETE` en SQLite— ya no existe.** `compat` **v0.5.1**
+amplió `Store.IsForeignKeyViolation` para aceptar también `SQLITE_CONSTRAINT_TRIGGER (1811)`, que es
+como SQLite reporta el rechazo del lado del padre de un `ON DELETE RESTRICT`. Era exactamente la
+cuarta salida que este reporte identificaba como la real: ampliar el predicado en `compat`, no
+trabajarlo alrededor desde `librarian`.
+
+**No hizo falta tocar código de producción.** `foreignKeyRaceOnDelete` ya llamaba al predicado; solo
+subió `go.mod` a `v0.5.1`. Los cambios de este lado son: subir la dependencia, borrar la aserción por
+motor que fijaba el hueco en `internal/server/dualengine_contract28_test.go` —puesta ahí a propósito
+para fallar el día que `compat` lo arreglara, y falló— y actualizar la prosa del test y de
+`internal/server/content.go` que lo describía como abierto.
+
+Los **seis** casos (3 interleavings × 2 motores) cierran ahora, y el caso del `DELETE` se compara
+línea por línea en el transcript como los otros cinco en vez de tratarse aparte:
+
+```
+COMPAT_POSTGRES_DSN='postgres://postgres:***@31.220.22.176:5456/postgres?sslmode=disable' \
+  go test -tags dualengine -run TestDualEngineForeignKeyRaceHTTP -count=1 -v ./internal/server
+
+=== RUN   TestDualEngineForeignKeyRaceHTTP
+    dualengine_contract28_test.go:85: transcript (12 lines, identical on both engines):
+        POST /content-types autores -> 201
+        POST /content-types libros  -> 201
+        RACE create: pre-check passed, target deleted in the window (1 interference) -> 400 msg=classifier-race-on-write
+        RACE create: nothing was stored=true, target really gone=true
+        RACE update: pre-check passed, target deleted in the window (1 interference) -> 400 msg=classifier-race-on-write
+        RACE update: reference stayed null=true (the UPDATE did not land)
+        RACE delete: pre-check counted zero, referrer created in the window (1 interference) -> 400 msg=classifier-race-on-delete
+        RACE delete: the delete was refused=true, row survived=true
+        NORMAL create with a missing reference -> 400 msg=precheck-missing-target names-the-id=true
+        NORMAL delete of a referenced row    -> 400 msg=precheck-incoming-references names-the-referrer=true
+        NORMAL delete of an unreferenced row -> 204
+        NORMAL create with a live reference  -> 201 round-tripped=true
+    dualengine_contract28_test.go:99: OK: 12 observations identical on SQLite and PostgreSQL 17
+--- PASS: TestDualEngineForeignKeyRaceHTTP (32.95s)
+PASS
+ok      github.com/MauricioPerera/librarian/internal/server      36.883s
+```
+
+El `T2` de los criterios de aceptación queda por tanto en **6 de 6**, y con esto el contrato cierra
+sin excepciones.

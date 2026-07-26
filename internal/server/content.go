@@ -327,7 +327,7 @@ func bindReference(r schema.ReferenceDefinition, raw json.RawMessage) (any, erro
 // CONTRACT-28 UPDATE — THE RESIDUAL WINDOW IS NOW CAUGHT, AND THIS CHECK STAYS.
 // The window itself is unchanged and cannot be removed: the referenced row can
 // still be deleted between this SELECT and the INSERT that follows. What changed
-// is what happens in it. compat v0.5.0 added Store.IsForeignKeyViolation, so the
+// is what happens in it. compat added Store.IsForeignKeyViolation, so the
 // driver's rejection is no longer indistinguishable from any other failed
 // statement, and the write sites classify it into the SAME 400 this check would
 // have produced (see foreignKeyRaceOnWrite). The two are a division of labour,
@@ -413,26 +413,24 @@ func (h *handlers) foreignKeyRaceOnWrite(def schema.ContentTypeDefinition, err e
 		def.Name)}
 }
 
-// KNOWN GAP, ON SQLITE ONLY, for foreignKeyRaceOnDelete. It catches the race on
-// PostgreSQL (SQLSTATE 23503) but NOT on SQLite, and the cause is structural
-// rather than a bug here: CONTRACT-27 declares every relation ON DELETE RESTRICT
-// (schema.foreignKeyRestrict argues why), and SQLite implements the parent-side
-// refusal of a RESTRICT through its internal foreign-key trigger program, so it
-// reports SQLITE_CONSTRAINT_TRIGGER (1811) instead of SQLITE_CONSTRAINT_FOREIGNKEY
-// (787). compat v0.5.0's IsForeignKeyViolation accepts only 787, deliberately and
-// with 1811 named in its documentation as a different rejection that must not be
-// folded in — so the predicate is false and this one interleaving keeps its 500
-// on SQLite. Measured with identical DDL: NO ACTION → 787 (classified), RESTRICT
-// → 1811 (not classified); the child-side INSERT is 787 either way, which is why
-// the create and update races DO close on both engines.
+// foreignKeyRaceOnDelete is the mirror of foreignKeyRaceOnWrite, at the DELETE
+// site: checkNoIncomingReferences counted zero referrers, one appeared before the
+// DELETE ran, and the real foreign key refused the statement. It catches that on
+// both engines.
 //
-// It is left open rather than worked around, because every workaround available
-// inside librarian is forbidden by this contract: reading the error text,
-// re-implementing an engine-specific code table here, or reversing CONTRACT-27's
-// RESTRICT decision. The dual-engine battery asserts the current behaviour
-// exactly, so widening the predicate in compat makes that test fail and this
-// paragraph get deleted instead of rotting. Nothing is corrupted meanwhile — the
-// foreign key still refuses the delete and the row survives.
+// THIS ONE WAS THE LAST TO CLOSE, and the reason is worth keeping because it is a
+// property of the schema rather than of this function. CONTRACT-27 declares every
+// relation ON DELETE RESTRICT (schema.foreignKeyRestrict argues why), and SQLite
+// implements the parent-side refusal of a RESTRICT through its internal
+// foreign-key trigger program: it reports SQLITE_CONSTRAINT_TRIGGER (1811), not
+// SQLITE_CONSTRAINT_FOREIGNKEY (787). Measured with identical DDL: NO ACTION →
+// 787, RESTRICT → 1811; the child-side INSERT is 787 either way, which is why the
+// create and update races closed first. compat v0.5.0 accepted only 787, so this
+// interleaving kept a 500 on SQLite; compat v0.5.1 widened the predicate to
+// accept 1811 as well and the gap closed upstream, with no engine-specific code
+// on this side — reading the error text or keeping a code table here was, and
+// remains, forbidden by the contract. PostgreSQL raises SQLSTATE 23503 for the
+// same refusal and was never affected.
 func (h *handlers) foreignKeyRaceOnDelete(def schema.ContentTypeDefinition, err error) error {
 	if err == nil || !h.store.IsForeignKeyViolation(err) {
 		return nil
@@ -720,7 +718,7 @@ func writeBindError(w http.ResponseWriter, err error) {
 // the deletion is refused either way and nothing is lost.
 //
 // CONTRACT-28 UPDATE: that interleaving no longer degrades to a 500 either. The
-// DELETE site classifies the driver's rejection with compat v0.5.0's
+// DELETE site classifies the driver's rejection with compat's
 // Store.IsForeignKeyViolation and answers the same 400 — with a generic message,
 // because at that point the count has already passed and the referrer that
 // appeared afterwards has not been identified. This function is what still

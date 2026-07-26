@@ -12,7 +12,7 @@ package server
 // WHAT MAKES IT A REAL TEST AND NOT A SIMULATION. Nothing here fabricates an
 // error. Every rejection asserted below is produced by the ENGINE — SQLite's
 // SQLITE_CONSTRAINT_FOREIGNKEY, PostgreSQL's SQLSTATE 23503 — on a real table
-// with a real foreign key, and is classified by compat v0.5.0's
+// with a real foreign key, and is classified by compat v0.5.1's
 // Store.IsForeignKeyViolation. There is no fake store, no injected error, no
 // stubbed driver. The only thing the test controls is WHEN the interfering write
 // happens: handlers.referenceRaceHook holds the window open for exactly one
@@ -35,12 +35,16 @@ package server
 // prove the good messages of the pre-checks are still the ones a normal client
 // sees — the classifier is the net, not the replacement.
 //
-// ONE OF THE SIX CASES DOES NOT CLOSE, and this battery asserts it as it is
-// instead of glossing over it: the DELETE race on SQLITE. The reason is a
-// genuine collision between CONTRACT-27's ON DELETE RESTRICT and the exact code
-// list compat v0.5.0 accepts — the long comment at that step has the measured
-// evidence, and the report has the argument. Everything else closes on both
-// engines.
+// ALL SIX CASES CLOSE, on both engines, and the transcript below is compared
+// line by line with no exception carved out for any of them. The sixth — the
+// DELETE race on SQLite — was open when this battery was written: CONTRACT-27
+// declares every relation ON DELETE RESTRICT, so SQLite refuses the parent-side
+// delete through its internal foreign-key trigger program and reports
+// SQLITE_CONSTRAINT_TRIGGER (1811) rather than SQLITE_CONSTRAINT_FOREIGNKEY
+// (787), which compat v0.5.0's IsForeignKeyViolation did not accept. compat
+// v0.5.1 widened the predicate to cover 1811, the gap closed upstream, and the
+// engine-specific assertion that pinned it here has been deleted. See the
+// closing section of docs/reports/CONTRACT-28-REPORT.md.
 //
 //	COMPAT_POSTGRES_DSN='postgres://user:***@host:port/db?sslmode=disable' \
 //	  go test -tags dualengine -run TestDualEngineForeignKeyRace -count=1 -v ./internal/server
@@ -224,46 +228,20 @@ func runForeignKeyRaceScenario(t *testing.T, engineLabel string, st *compat.Stor
 	status, body = e.doJSON(t, http.MethodDelete, "/content/autores/"+popular, nil)
 	disarmC28()
 
-	// THE ONE DIRECTION THAT DOES NOT CLOSE ON SQLITE, asserted rather than
-	// hidden. PostgreSQL raises SQLSTATE 23503 here and compat classifies it, so
-	// this is a 400 like the other two. SQLite does NOT: because CONTRACT-27
-	// declares every relation ON DELETE RESTRICT (schema.foreignKeyRestrict, and
-	// its comment argues at length why RESTRICT and not NO ACTION), SQLite
-	// implements the parent-side refusal through its internal FK trigger program
-	// and reports the extended result code SQLITE_CONSTRAINT_TRIGGER (1811), not
-	// SQLITE_CONSTRAINT_FOREIGNKEY (787). compat v0.5.0's IsForeignKeyViolation
-	// accepts only 787 — deliberately, and documented: it names 1811 as one of the
-	// "sibling constraint codes [that] are different rejections and must not be
-	// folded in". So the predicate answers false and the race keeps its 500 on
-	// SQLite alone. Measured, with the identical DDL, both actions:
-	//
-	//	NO ACTION: DELETE parent -> 787  IsForeignKeyViolation=true
-	//	RESTRICT : DELETE parent -> 1811 IsForeignKeyViolation=false
-	//	either   : INSERT child  -> 787  IsForeignKeyViolation=true
-	//
-	// Closing it from librarian would mean one of three things the contract
-	// forbids: reading the error text, re-implementing an engine-specific code
-	// table here, or reversing CONTRACT-27's RESTRICT decision. It is therefore
-	// left open, asserted EXACTLY as it behaves today so that the day compat
-	// widens the predicate this test fails loudly and the gap gets deleted rather
-	// than forgotten. See docs/reports/CONTRACT-28-REPORT.md.
-	wantDeleteRace := http.StatusBadRequest
-	wantDeleteMsg := "classifier-race-on-delete"
-	if engineLabel == "sqlite" {
-		wantDeleteRace = http.StatusInternalServerError
-		wantDeleteMsg = "OTHER(could not delete content)"
-	}
-	if status != wantDeleteRace || classifyC28(body) != wantDeleteMsg {
-		t.Errorf("[%s] DELETE /content/autores/{id} (raced) answered %d msg=%s, want %d msg=%s",
-			engineLabel, status, classifyC28(body), wantDeleteRace, wantDeleteMsg)
-	}
-	t.Logf("[%s] RACE delete: %d interference(s) -> status %d, message class %s",
-		engineLabel, interfered, status, classifyC28(body))
+	// The parent-side direction, now on the same footing as the other two.
+	// PostgreSQL raises SQLSTATE 23503 and SQLite — refusing CONTRACT-27's ON
+	// DELETE RESTRICT through its internal foreign-key trigger program — raises
+	// SQLITE_CONSTRAINT_TRIGGER (1811); compat v0.5.1 classifies both, so the
+	// answer is the pre-check's 400 on either engine and the transcript line is
+	// compared rather than being asserted per engine.
+	mustNot500("DELETE /content/autores/{id} (raced)", status)
+	tr.add("RACE delete: pre-check counted zero, referrer created in the window (%d interference) -> %d msg=%s",
+		interfered, status, classifyC28(body))
 
-	// What IS identical on both engines, and is the half that actually protects
-	// the data: the delete was refused and the row is still there.
-	tr.add("RACE delete: pre-check counted zero, referrer created in the window (%d interference) -> refused=%v row-survived=%v",
-		interfered, status != http.StatusNoContent,
+	// And the half that actually protects the data: the delete was refused and
+	// the row is still there.
+	tr.add("RACE delete: the delete was refused=%v, row survived=%v",
+		status != http.StatusNoContent,
 		statusOfC28(t, e, http.MethodGet, "/content/autores/"+popular) == http.StatusOK)
 
 	// --- 4. THE NORMAL PATH IS UNCHANGED --------------------------------------
