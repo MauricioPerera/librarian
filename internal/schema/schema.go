@@ -196,6 +196,52 @@ func foreignKeySetNull(column, refTable, refColumn string) compat.Constraint {
 	}
 }
 
+// foreignKeyRestrict is an FK that REFUSES to delete the referenced row while a
+// referring row exists (compat.Restrict). CONTRACT-27 uses it for every relation
+// between dynamic content types.
+//
+// THE CHOICE BETWEEN `restrict` AND `no_action`, which the contract demands be
+// argued rather than assumed. They are NOT synonyms, on either engine:
+//
+//   - PostgreSQL: NO ACTION defers its check to the END of the statement, and it
+//     is the only one of the two that a DEFERRABLE constraint can postpone to
+//     COMMIT. RESTRICT is checked immediately when the row is deleted and can
+//     never be deferred.
+//   - SQLite: the same split, documented in the same words — RESTRICT fires as
+//     soon as the parent row is deleted, NO ACTION means "do nothing now" and the
+//     violation surfaces when the FK check runs at the end of the statement (or,
+//     for a deferred constraint, at COMMIT).
+//
+// RESTRICT is chosen for three reasons that survive both engines:
+//
+//  1. It is EXPLICIT IN THE COMPILED DDL. compat emits nothing at all for
+//     NoAction (see compileForeignKey: the clause is skipped when the action is
+//     empty or no_action), because it is the engine default. An exported schema
+//     would then be indistinguishable from one where nobody thought about the
+//     question. The rule this contract makes is deliberate and has to be
+//     readable in the catalog and in `--dump-schema`.
+//  2. It fails ON THE DELETE, not at the end of the statement. The error then
+//     names the operation that caused it, which is the entire point of the T3
+//     guard's sibling case (deleting a referenced ROW).
+//  3. It cannot be silently deferred. compat has no way to declare or manipulate
+//     deferrability, so a constraint that COULD be postponed would be postponed
+//     by something outside this project's model, and the refusal would surface at
+//     COMMIT — far from the statement that caused it.
+//
+// It is NOT Cascade, and that is the contract's own decision: deleting a
+// referenced row must never destroy the rows pointing at it in silence.
+func foreignKeyRestrict(column, refTable, refColumn string) compat.Constraint {
+	return compat.Constraint{
+		Kind:    compat.ForeignKey,
+		Columns: []string{column},
+		References: &compat.Reference{
+			Table:    refTable,
+			Columns:  []string{refColumn},
+			OnDelete: compat.Restrict,
+		},
+	}
+}
+
 // table builders --------------------------------------------------------------
 
 func usersTable() compat.Table {
@@ -464,6 +510,52 @@ func contentTypeFieldsTable() compat.Table {
 	}
 }
 
+// contentTypeReferencesTable is the RELATION half of the registry (CONTRACT-27
+// T1): one row per relation declared by a dynamic content type. It is the third
+// registry table and it is purely ADDITIVE — see relations.go for why the target
+// of a reference could not be stored on content_type_fields.
+//
+//   - content_type_id: the type that DECLARES the reference. ON DELETE CASCADE,
+//     identical to content_type_fields.content_type_id and for the identical
+//     reason: this is the registry's own parent→child link, so deleting a type
+//     takes its own declarations with it in one statement. It is NOT a relation
+//     between dynamic types, which is the thing this contract forbids cascading.
+//   - target_type_id: the type the reference POINTS AT. ON DELETE RESTRICT, so
+//     "a type that is the target of a reference cannot be deleted" is a
+//     guarantee OF THE DATABASE and not only of the application check in
+//     store.ReferencesTo. The application check exists to produce a legible
+//     refusal BEFORE anything is touched; this one exists so that no path
+//     (including a hand-written DELETE) can get around it.
+//   - name: the column the reference produces on the composed table. It follows
+//     the same identifier gate as a field name and may not collide with one.
+//   - ordinal: the reference's position, so the produced column order is stable
+//     and reproducible — the same reason content_type_fields has one.
+//
+// UNIQUE(content_type_id, name) and UNIQUE(content_type_id, ordinal) mirror the
+// field table exactly. There is deliberately NO CHECK constraint here: the
+// vocabulary of this table is uuids and identifiers, not a closed set, so
+// nothing about it would ever need to be altered later — which is precisely the
+// property that made a new table the right answer.
+func contentTypeReferencesTable() compat.Table {
+	return compat.Table{
+		Name: ContentTypeReferencesTable,
+		Columns: []compat.Column{
+			idColumn(),
+			uuidColumn("content_type_id", false),
+			uuidColumn("target_type_id", false),
+			textColumn("name", false),
+			integerColumn("ordinal", false),
+		},
+		Constraints: []compat.Constraint{
+			primaryKey("id"),
+			unique("content_type_id", "name"),
+			unique("content_type_id", "ordinal"),
+			foreignKeyCascade("content_type_id", ContentTypesTable, "id"),
+			foreignKeyRestrict("target_type_id", ContentTypesTable, "id"),
+		},
+	}
+}
+
 // BootstrapTable is the one-row table that records that the initial bootstrap
 // (CONTRACT-22) has been performed on this installation.
 //
@@ -583,6 +675,15 @@ func BuildFor(caps Capabilities) compat.Schema {
 			// a dynamic type can never be called "content_types".
 			contentTypesTable(),
 			contentTypeFieldsTable(),
+			// CONTRACT-27 T1: the RELATION half of the registry. It goes after
+			// content_type_fields so the order of every pre-existing table is
+			// untouched, and after content_types because BOTH its foreign keys
+			// point there. Being part of Build() it is created by EnsureSchema on
+			// a fresh AND on an already-deployed database (it is a MISSING table,
+			// which is the only thing EnsureSchema does), and ReservedNames()
+			// needs no entry for it — a dynamic type called
+			// "content_type_references" produces "cpt_content_type_references".
+			contentTypeReferencesTable(),
 			// CONTRACT-22 T1: the one-row bootstrap marker. It references nothing
 			// and nothing references it, so its position in the list is free; it
 			// goes last so the order of every pre-existing table is untouched.

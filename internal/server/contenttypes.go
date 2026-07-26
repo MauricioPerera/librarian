@@ -56,9 +56,28 @@ import (
 // contentTypeView is the JSON representation of a dynamic content-type
 // definition. It intentionally mirrors schema.ContentTypeDefinition one-to-one
 // (name + ordered fields), so what a client posts is what a client reads back.
+// CONTRACT-27 adds References, the relations the type declares. It is
+// `omitempty`, so every response of contracts 13-26 for a type WITHOUT relations
+// is byte-identical to what it was — the addition is strictly additive, exactly
+// like contentTypeField.ID was.
 type contentTypeView struct {
-	Name   string             `json:"name"`
-	Fields []contentTypeField `json:"fields"`
+	Name       string                 `json:"name"`
+	Fields     []contentTypeField     `json:"fields"`
+	References []contentTypeReference `json:"references,omitempty"`
+}
+
+// contentTypeReference is ONE declared relation in a payload: the column name it
+// produces and the PUBLIC name of the dynamic content type it points at.
+//
+// It is a SEPARATE list from `fields` and not a sixth field type, for the reason
+// argued in internal/schema/relations.go: the stored vocabulary of
+// content_type_fields.field_type is pinned by a schema-level CHECK that
+// EnsureSchema cannot alter on an installation that already exists. The API
+// shape follows the storage shape rather than papering over it, so what a client
+// posts is what the registry holds.
+type contentTypeReference struct {
+	Name   string `json:"name"`
+	Target string `json:"target"`
 }
 
 // contentTypeField is one field in a definition payload. ID is the stored
@@ -80,7 +99,22 @@ func viewOf(d schema.ContentTypeDefinition) contentTypeView {
 	for _, f := range d.Fields {
 		fields = append(fields, contentTypeField{Name: f.Name, Type: string(f.Type)})
 	}
-	return contentTypeView{Name: d.Name, Fields: fields}
+	return contentTypeView{Name: d.Name, Fields: fields, References: referenceViews(d.References)}
+}
+
+// referenceViews converts the relations of a definition to their JSON view. It
+// returns nil (not an empty slice) for a type with no relations, so `omitempty`
+// actually omits the key and the pre-CONTRACT-27 response shape is preserved
+// byte for byte.
+func referenceViews(references []schema.ReferenceDefinition) []contentTypeReference {
+	if len(references) == 0 {
+		return nil
+	}
+	out := make([]contentTypeReference, 0, len(references))
+	for _, r := range references {
+		out = append(out, contentTypeReference{Name: r.Name, Target: r.Target})
+	}
+	return out
 }
 
 // definitionOf converts a decoded request body to the schema-level definition.
@@ -92,6 +126,12 @@ func definitionOf(v contentTypeView) schema.ContentTypeDefinition {
 		d.Fields = append(d.Fields, schema.FieldDefinition{
 			Name: strings.TrimSpace(f.Name),
 			Type: schema.FieldType(strings.TrimSpace(f.Type)),
+		})
+	}
+	for _, r := range v.References {
+		d.References = append(d.References, schema.ReferenceDefinition{
+			Name:   strings.TrimSpace(r.Name),
+			Target: strings.TrimSpace(r.Target),
 		})
 	}
 	return d
@@ -140,6 +180,12 @@ func (h *handlers) handleCreateContentType(w http.ResponseWriter, r *http.Reques
 	case errors.Is(err, store.ErrDuplicateContentType):
 		writeError(w, http.StatusBadRequest, "a content type with this name already exists")
 		return
+	case errors.Is(err, store.ErrUnknownReferenceTarget):
+		// CONTRACT-27 T2 — the ORDER refusal. It is the client's mistake (it asked
+		// for a relation to something that is not there), so it is a 400 carrying
+		// the store's own sentence, which already says what to create first.
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
 	case err != nil:
 		h.writeOperationFailure(w, r, err, "could not create content type")
 		return
@@ -185,16 +231,19 @@ func (h *handlers) handleGetContentType(w http.ResponseWriter, r *http.Request) 
 		h.writeOperationFailure(w, r, err, "could not read content type")
 		return
 	}
-	writeJSON(w, http.StatusOK, viewWithIDs(def.Name, fields))
+	// CONTRACT-27: the relations come from the definition already read above.
+	// They carry no id in the payload because, unlike a field, a relation has no
+	// editable identity: it is declared at creation and never renamed.
+	writeJSON(w, http.StatusOK, viewWithIDs(def.Name, fields, def.References))
 }
 
 // viewWithIDs is viewOf for the persisted (identity-carrying) field rows.
-func viewWithIDs(name string, fields []store.PersistedField) contentTypeView {
+func viewWithIDs(name string, fields []store.PersistedField, references []schema.ReferenceDefinition) contentTypeView {
 	out := make([]contentTypeField, 0, len(fields))
 	for _, f := range fields {
 		out = append(out, contentTypeField{ID: f.ID, Name: f.Name, Type: string(f.Type)})
 	}
-	return contentTypeView{Name: name, Fields: out}
+	return contentTypeView{Name: name, Fields: out, References: referenceViews(references)}
 }
 
 // contentTypeEditRequest is the PUT body. Name is optional; when present it
@@ -256,7 +305,15 @@ func (h *handlers) handleEditContentType(w http.ResponseWriter, r *http.Request)
 		h.writeOperationFailure(w, r, err, "could not read content type")
 		return
 	}
-	if _, err := store.PlanContentTypeEdit(name, typeID, stored, edits); err != nil {
+	// CONTRACT-27: the relations the type already has take part in the plan — a
+	// new field named like one of them is a duplicate column, and must be a 400
+	// here rather than an opaque failure from compat at apply time.
+	references, err := store.LoadContentTypeReferences(r.Context(), h.store, typeID)
+	if err != nil {
+		h.writeOperationFailure(w, r, err, "could not read content type")
+		return
+	}
+	if _, err := store.PlanContentTypeEdit(name, typeID, stored, references, edits); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -267,7 +324,21 @@ func (h *handlers) handleEditContentType(w http.ResponseWriter, r *http.Request)
 
 	var loss store.DataLossError
 	var unexpected store.UnexpectedConfirmationError
+	var referenced store.ReferencedTypeError
 	switch {
+	case errors.As(err, &referenced):
+		// CONTRACT-27 T3. It is a 400 and not a 500: the request is impossible,
+		// not broken, and the body says exactly which type has to go first. It is
+		// deliberately NOT a 409 — every "refused, and here is what to do about it"
+		// answer of this project (the data-loss refusal of CONTRACT-18, the
+		// confirmation refusal of CONTRACT-26) is a 400 with an actionable body,
+		// and adding a second convention would make them inconsistent.
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error":            referenced.Error(),
+			"referenced_by":    referrerViews(referenced.Referrers),
+			"nothing_was_done": true,
+		})
+		return
 	case errors.As(err, &loss):
 		// The refusal that names EXACTLY what would be destroyed, so the caller
 		// can confirm it item by item. Nothing was written.
@@ -299,7 +370,7 @@ func (h *handlers) handleEditContentType(w http.ResponseWriter, r *http.Request)
 		h.writeOperationFailure(w, r, err, "could not read content type")
 		return
 	}
-	view := viewWithIDs(name, fields)
+	view := viewWithIDs(name, fields, references)
 	renamed := make([]map[string]string, 0, len(plan.Renamed))
 	for _, p := range plan.Renamed {
 		renamed = append(renamed, map[string]string{"from": p[0], "to": p[1]})
@@ -311,6 +382,18 @@ func (h *handlers) handleEditContentType(w http.ResponseWriter, r *http.Request)
 		"removed": emptyIfNil(plan.Removed),
 		"renamed": renamed,
 	})
+}
+
+// referrerViews renders the T3 refusal's referrers as a stable JSON array, so a
+// client can act on the fact (list the types to delete first) instead of parsing
+// the sentence. Never nil: an empty array is the honest shape when the key is
+// present at all.
+func referrerViews(referrers []store.Referrer) []map[string]string {
+	out := make([]map[string]string, 0, len(referrers))
+	for _, r := range referrers {
+		out = append(out, map[string]string{"content_type": r.TypeName, "reference": r.ReferenceName})
+	}
+	return out
 }
 
 // emptyIfNil normalises a nil slice to [] so the response shape is stable.
@@ -392,9 +475,20 @@ func (h *handlers) handleDeleteContentType(w http.ResponseWriter, r *http.Reques
 	h.schemaMu.Unlock()
 
 	var refusal store.DeleteConfirmationError
+	var referenced store.ReferencedTypeError
 	switch {
 	case errors.Is(err, store.ErrContentTypeNotFound):
 		writeError(w, http.StatusNotFound, "content type not found")
+		return
+	case errors.As(err, &referenced):
+		// CONTRACT-27 T3 — the same refusal shape the PUT uses, for the same
+		// reason and with the same status. Nothing was done: the guard runs
+		// before the transaction opens.
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error":            referenced.Error(),
+			"referenced_by":    referrerViews(referenced.Referrers),
+			"nothing_was_done": true,
+		})
 		return
 	case errors.As(err, &refusal):
 		// The refusal that SHOWS what would be destroyed — including the row

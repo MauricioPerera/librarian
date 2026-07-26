@@ -484,6 +484,14 @@ func dynamicContentColumns(def ContentTypeDefinition) ([]compat.RoutineResultCol
 		}
 		columns = append(columns, authResult(f.Name, compat.Type{Family: family}))
 	}
+	// CONTRACT-27: the relation columns, in the SAME order DynamicTable puts them
+	// in the table (fields first, then references). A routine's result columns are
+	// what compat compiles into the SELECT list, so omitting them would make the
+	// value unreadable through the generic CRUD layer even though the column
+	// exists — the mirror of the CONTRACT-23 note above.
+	for _, r := range def.References {
+		columns = append(columns, authResult(r.Name, serverUUID))
+	}
 	return columns, nil
 }
 

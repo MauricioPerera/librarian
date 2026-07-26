@@ -2,6 +2,24 @@
 <div class="card form-card">
   <h1>Borrar el tipo de contenido <code>{{.Name}}</code></h1>
   {{if .Error}}<p class="error" role="alert" id="delete-error">{{.Error}}</p>{{end}}
+  {{if .Referrers}}
+  <div class="error" role="alert" id="referenced-block">
+    <p><strong>Este tipo no se puede borrar: otro tipo de contenido lo referencia.</strong></p>
+    <ul>
+      {{range .Referrers}}<li>El tipo <code class="referrer-type">{{.TypeName}}</code> lo referencia con su relación <code>{{.ReferenceName}}</code>.</li>{{end}}
+    </ul>
+    <p>
+      Borrarlo eliminaría la tabla real <code>{{.Table}}</code>, y una clave foránea existe justamente para impedir eso mientras haya una tabla que apunte. Este proyecto nunca emite <code>ON DELETE CASCADE</code>, así que las filas que apuntan no se destruyen en silencio.
+    </p>
+    <p>
+      Una relación se declara al crear un tipo y no se puede desprender después. Para liberar <code>{{.Name}}</code> hay que <strong>borrar</strong> primero {{if eq (len .Referrers) 1}}el tipo que lo referencia{{else}}los tipos que lo referencian{{end}}.
+    </p>
+    <p class="form-actions">
+      {{range .Referrers}}<a class="btn btn-ghost" href="/admin/content-types/{{.TypeName}}/delete">Borrar {{.TypeName}}</a> {{end}}
+      <a class="btn btn-ghost" href="/admin/content-types">Volver</a>
+    </p>
+  </div>
+  {{else}}
   <div class="error" role="alert" id="delete-warning">
     <p><strong>Atención: esta acción BORRA la tabla completa y no se puede deshacer.</strong></p>
     <ul>
@@ -27,5 +45,6 @@
       <a class="btn btn-ghost" href="/admin/content-types">Cancelar</a>
     </div>
   </form>
+  {{end}}
 </div>
 {{end}}

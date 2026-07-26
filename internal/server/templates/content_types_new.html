@@ -18,6 +18,25 @@
               hx-swap="beforeend">Agregar campo</button>
       <p class="muted">Las filas con el nombre vacío se ignoran. Un tipo sin campos también es válido.</p>
     </fieldset>
+    <fieldset class="fields-fieldset" id="content-type-references-fieldset">
+      <legend>Relaciones</legend>
+      {{if .NoTargets}}
+      <p class="muted" id="no-reference-targets">Todavía no hay ningún otro tipo de contenido dinámico al que apuntar. Una relación es una clave foránea real, así que el tipo destino tiene que existir ANTES: creá primero el tipo destino y después el que lo referencia.</p>
+      {{else}}
+      <div id="content-type-references">
+        {{range .References}}{{template "content_type_reference_row" .}}{{end}}
+      </div>
+      <button type="button" class="btn btn-ghost" id="add-reference"
+              hx-get="/admin/content-types/new/reference"
+              hx-target="#content-type-references"
+              hx-swap="beforeend">Agregar relación</button>
+      <p class="muted">
+        Una relación crea una columna con una clave foránea real hacia el tipo elegido. Es opcional (puede quedar vacía) y el tipo destino tiene que existir ya.
+        <strong>Mientras la relación exista, el tipo destino no se va a poder editar ni borrar</strong>: para liberarlo hay que borrar el tipo que lo referencia.
+        Un tipo no puede referenciarse a sí mismo, y solo se puede apuntar a tipos dinámicos.
+      </p>
+      {{end}}
+    </fieldset>
     <div class="form-actions">
       <button type="submit" class="btn btn-primary">Crear tipo</button>
       <a class="btn btn-ghost" href="/admin/content-types">Cancelar</a>

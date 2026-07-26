@@ -12,7 +12,6 @@ package schema
 
 import (
 	"fmt"
-	"sort"
 
 	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
@@ -92,9 +91,16 @@ type FieldDefinition struct {
 // ContentTypeDefinition is a complete runtime content-type definition: its
 // table name plus its ordered own columns. Everything else (id, author_id,
 // timestamps, metadata) is supplied by ContentType().
+//
+// CONTRACT-27 adds References, the SIBLING of Fields: the scalar columns come
+// from Fields and the foreign-key columns come from References. It is
+// `omitempty` so every JSON artifact produced before this contract — the
+// `--dump-schema` output of an installation with no relations, the API
+// responses — is byte-identical to what it was.
 type ContentTypeDefinition struct {
-	Name   string            `json:"name"`
-	Fields []FieldDefinition `json:"fields"`
+	Name       string                `json:"name"`
+	Fields     []FieldDefinition     `json:"fields"`
+	References []ReferenceDefinition `json:"references,omitempty"`
 }
 
 // Validate applies the T1 identifier gate to the type name and to every field
@@ -124,7 +130,10 @@ func (d ContentTypeDefinition) Validate() error {
 		}
 		seen[f.Name] = struct{}{}
 	}
-	return nil
+	// CONTRACT-27: the relation half, gated with the SAME identifier rules and
+	// against the SAME name set, so a reference can neither shadow a field nor an
+	// injected column of ContentType(). See relations.go.
+	return validateReferences(d.Name, d.References, seen)
 }
 
 // TableName is the REAL name of the table backing this definition: the public
@@ -166,7 +175,30 @@ func DynamicTable(d ContentTypeDefinition) (compat.Table, error) {
 			Nullable: true,
 		})
 	}
-	return ContentType(d.TableName(), own), nil
+	// CONTRACT-27: one nullable uuid column per declared relation, AFTER the
+	// scalar fields so the physical column order is (fields, then references) —
+	// stable, reproducible, and the order every copy statement of a rebuild uses.
+	//
+	// NULLABLE, and that is the contract's decision: a relation is OPTIONAL, like
+	// every other dynamic column. A NOT NULL foreign key with no default would
+	// make every insert that omits it fail with an opaque constraint error, and
+	// the definition model has no notion of "required" to express the choice.
+	for _, r := range d.References {
+		own = append(own, compat.Column{
+			Name:     r.Name,
+			Type:     compat.Type{Family: compat.UUIDType},
+			Nullable: true,
+		})
+	}
+	table := ContentType(d.TableName(), own)
+	// The FKs are appended after ContentType returns, exactly the way
+	// productsTable appends its UNIQUE(sku): ContentType's signature takes a name
+	// and own columns and is NOT touched. The target is the REAL table name of the
+	// target type (DynamicTableName), never its public name.
+	for _, r := range d.References {
+		table.Constraints = append(table.Constraints, foreignKeyRestrict(r.Name, DynamicTableName(r.Target), "id"))
+	}
+	return table, nil
 }
 
 // BuildWith returns THE canonical schema of a running librarian instance:
@@ -199,9 +231,14 @@ func BuildWith(defs []ContentTypeDefinition) (compat.Schema, error) {
 // only ever changes the code half.
 func BuildWithFor(caps Capabilities, defs []ContentTypeDefinition) (compat.Schema, error) {
 	full := BuildFor(caps)
-	sorted := make([]ContentTypeDefinition, len(defs))
-	copy(sorted, defs)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Name < sorted[j].Name })
+	// CONTRACT-27: name order is no longer sufficient — a dynamic table may now
+	// carry an FK to ANOTHER dynamic table, which has to be created first. With no
+	// references this returns exactly the old name order, so nothing changes for an
+	// installation that declares none. See sortDefinitionsByDependency.
+	sorted, err := sortDefinitionsByDependency(defs)
+	if err != nil {
+		return compat.Schema{}, err
+	}
 	for _, d := range sorted {
 		table, err := DynamicTable(d)
 		if err != nil {

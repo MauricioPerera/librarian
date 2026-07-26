@@ -1,0 +1,6 @@
+{{define "content_type_reference_row"}}<div class="field-row reference-row">
+  <input type="text" name="reference_name" value="{{.Name}}" placeholder="nombre_de_la_relacion" class="field-row-name">
+  <select name="reference_target" class="field-row-type">
+    {{range .Targets}}<option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Value}}</option>{{end}}
+  </select>
+</div>{{end}}

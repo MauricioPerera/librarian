@@ -29,6 +29,7 @@ package server
 // no JavaScript of our own.
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strconv"
@@ -43,12 +44,28 @@ import (
 // blank rows are ignored on submit.
 const initialContentTypeFieldRows = 3
 
+// initialContentTypeReferenceRows is how many blank RELATION rows the create
+// form starts with (CONTRACT-27 T4). One, not three: most types declare no
+// relation at all, and blank rows are ignored on submit exactly like blank field
+// rows. It is rendered only when there IS at least one existing type to point
+// at.
+const initialContentTypeReferenceRows = 1
+
 var (
 	adminContentTypesListTmpl = mustParseFS("templates/layout.html", "templates/content_types_list.html")
-	adminContentTypesNewTmpl  = mustParseFS("templates/layout.html", "templates/content_types_new.html", "templates/content_type_field_row.html")
+	adminContentTypesNewTmpl  = mustParseFS("templates/layout.html", "templates/content_types_new.html",
+		"templates/content_type_field_row.html", "templates/content_type_reference_row.html")
 	// Parsed standalone so the htmx "add one more row" route can render the
 	// fragment alone, exactly as ui_articles.go does with the article row.
 	adminContentTypeFieldRowTmpl = mustParseFS("templates/content_type_field_row.html")
+	// CONTRACT-27 T4: the relation row of the create form, and its standalone
+	// parse for the htmx "add one more relation" route. It is a SEPARATE template
+	// from the field row because it holds a different control — a selector over
+	// the EXISTING content types, not over the closed field-type catalog — and
+	// because its inputs feed a different pair of parallel form keys
+	// (reference_name/reference_target). Still a FIXED file in the embedded list;
+	// nothing is generated at runtime (the CONTRACT-15 rule).
+	adminContentTypeReferenceRowTmpl = mustParseFS("templates/content_type_reference_row.html")
 	// CONTRACT-18: the edit form and its own row fragment. The edit row is a
 	// DIFFERENT template from the create row because it carries one extra thing
 	// the create form has no notion of: the field's stored identity
@@ -85,14 +102,39 @@ type adminContentTypesListPage struct {
 	Types []contentTypeView
 }
 
+// contentTypeTargetOption is one <option> of a relation's target selector: an
+// EXISTING dynamic content type. The catalog is the registry itself, so the form
+// can only ever offer a target that exists — which is the T2 order rule made
+// unreachable to break from the panel, rather than merely checked afterwards.
+type contentTypeTargetOption struct {
+	Value    string
+	Selected bool
+}
+
+// contentTypeReferenceRow is ONE row of the relation editor: the typed column
+// name and the selector state. Like contentTypeFieldRow it is the view model of
+// both the full form and the htmx fragment, so an appended row is byte-identical
+// to a pre-rendered one.
+type contentTypeReferenceRow struct {
+	Name    string
+	Targets []contentTypeTargetOption
+}
+
 // adminContentTypeNewPage is the view model of the create form. Name and Fields
 // are echoed back verbatim after a validation error so the admin never loses
 // what they typed.
+//
+// CONTRACT-27 T4 adds References and NoTargets. NoTargets is not cosmetic: on an
+// installation with no dynamic types yet there is nothing to reference, and an
+// empty <select> would be a control that cannot be used and an error the admin
+// could not have predicted. The template then explains it instead.
 type adminContentTypeNewPage struct {
 	pageData
-	Name   string
-	Fields []contentTypeFieldRow
-	Error  string
+	Name       string
+	Fields     []contentTypeFieldRow
+	References []contentTypeReferenceRow
+	NoTargets  bool
+	Error      string
 }
 
 // registerAdminContentTypeRoutes wires the /admin/content-types HTML surface.
@@ -103,6 +145,10 @@ func (h *handlers) registerAdminContentTypeRoutes(mux *http.ServeMux) {
 	mux.Handle("GET /admin/content-types", h.requireSession(http.HandlerFunc(h.handleAdminContentTypesList)))
 	mux.Handle("GET /admin/content-types/new", h.requireSession(http.HandlerFunc(h.handleAdminContentTypeNewForm)))
 	mux.Handle("GET /admin/content-types/new/field", h.requireSession(http.HandlerFunc(h.handleAdminContentTypeFieldRow)))
+	// CONTRACT-27 T4 — one more blank RELATION row. Session only, like the field
+	// fragment: it writes nothing. It sits under the same /new/ prefix so the two
+	// fragments of the create form stay together.
+	mux.Handle("GET /admin/content-types/new/reference", h.requireSession(http.HandlerFunc(h.handleAdminContentTypeReferenceRow)))
 	mux.Handle("POST /admin/content-types", h.requireSessionPermission("content_types.manage")(http.HandlerFunc(h.handleAdminContentTypeCreate)))
 	// CONTRACT-18 T3 — editing the fields of an applied type. Same permission,
 	// same mutex, same store operation as the JSON API: this file stays
@@ -140,14 +186,68 @@ func (h *handlers) handleAdminContentTypesList(w http.ResponseWriter, r *http.Re
 // handleAdminContentTypeNewForm renders the empty create form with a few blank
 // field rows.
 func (h *handlers) handleAdminContentTypeNewForm(w http.ResponseWriter, r *http.Request) {
+	targets, err := h.contentTypeTargets(r.Context())
+	if err != nil {
+		h.httpOperationFailure(w, r, err)
+		return
+	}
 	rows := make([]contentTypeFieldRow, 0, initialContentTypeFieldRows)
 	for i := 0; i < initialContentTypeFieldRows; i++ {
 		rows = append(rows, blankContentTypeFieldRow())
 	}
+	references := make([]contentTypeReferenceRow, 0, initialContentTypeReferenceRows)
+	if len(targets) > 0 {
+		for i := 0; i < initialContentTypeReferenceRows; i++ {
+			references = append(references, blankContentTypeReferenceRow(targets))
+		}
+	}
 	renderContentTypeNew(w, http.StatusOK, adminContentTypeNewPage{
-		pageData: h.page(r, "Nuevo tipo de contenido — librarian"),
-		Fields:   rows,
+		pageData:   h.page(r, "Nuevo tipo de contenido — librarian"),
+		Fields:     rows,
+		References: references,
+		NoTargets:  len(targets) == 0,
 	})
+}
+
+// contentTypeTargets returns the public names of every existing dynamic content
+// type — the only legal targets of a relation (CONTRACT-27: a reference to a
+// CODE type is out of scope; relating to one still requires a code type).
+//
+// It reads the registry rather than a cached list, so the selector cannot offer
+// a type that was deleted in another tab. LoadDefinitions already returns the
+// definitions in the canonical byte-wise order, so the option list is
+// deterministic and identical on both engines.
+func (h *handlers) contentTypeTargets(ctx context.Context) ([]string, error) {
+	defs, err := store.LoadDefinitions(ctx, h.store)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(defs))
+	for _, d := range defs {
+		out = append(out, d.Name)
+	}
+	return out, nil
+}
+
+// handleAdminContentTypeReferenceRow returns ONE blank relation row as an HTML
+// fragment for htmx to append — the relation twin of
+// handleAdminContentTypeFieldRow. Unlike that one it DOES read the database
+// (the selector's options are the existing types), which is why it can fail; a
+// failure renders nothing rather than an empty selector that would silently
+// submit a target of "".
+func (h *handlers) handleAdminContentTypeReferenceRow(w http.ResponseWriter, r *http.Request) {
+	targets, err := h.contentTypeTargets(r.Context())
+	if err != nil {
+		h.httpOperationFailure(w, r, err)
+		return
+	}
+	if len(targets) == 0 {
+		h.httpOperationFailure(w, r, nil)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_ = adminContentTypeReferenceRowTmpl.ExecuteTemplate(w, "content_type_reference_row", blankContentTypeReferenceRow(targets))
 }
 
 // handleAdminContentTypeFieldRow returns ONE blank field row as an HTML
@@ -164,32 +264,37 @@ func (h *handlers) handleAdminContentTypeFieldRow(w http.ResponseWriter, _ *http
 // re-renders the form with the error and the admin's input preserved — never a
 // 500 and never the raw JSON envelope, exactly like the CONTRACT-08 user form.
 func (h *handlers) handleAdminContentTypeCreate(w http.ResponseWriter, r *http.Request) {
-	def, rows, msg, ok := parseContentTypeForm(r)
+	targets, err := h.contentTypeTargets(r.Context())
+	if err != nil {
+		h.httpOperationFailure(w, r, err)
+		return
+	}
+	def, rows, refRows, msg, ok := parseContentTypeForm(r, targets)
 	if !ok {
-		h.rerenderContentTypeNew(w, r, def.Name, rows, msg)
+		h.rerenderContentTypeNew(w, r, def.Name, rows, refRows, targets, msg)
 		return
 	}
 	// The T1 gate first, before anything touches the database — same order as
 	// the JSON handler, so the UI cannot be a laxer door into the same action.
 	if err := def.Validate(); err != nil {
-		h.rerenderContentTypeNew(w, r, def.Name, rows, "Definición inválida: "+err.Error())
+		h.rerenderContentTypeNew(w, r, def.Name, rows, refRows, targets, "Definición inválida: "+err.Error())
 		return
 	}
 
 	h.schemaMu.Lock()
-	err := store.CreateContentType(r.Context(), h.store, def)
+	err = store.CreateContentType(r.Context(), h.store, def)
 	h.schemaMu.Unlock()
 
 	switch {
 	case errors.Is(err, store.ErrDuplicateContentType):
-		h.rerenderContentTypeNew(w, r, def.Name, rows, "Ya existe un tipo de contenido con ese nombre.")
+		h.rerenderContentTypeNew(w, r, def.Name, rows, refRows, targets, "Ya existe un tipo de contenido con ese nombre.")
 		return
 	case err != nil:
 		// A definition compat itself refuses (or any other creation failure) is
 		// still shown as a form error, not a 500 page: the admin can fix the
 		// definition and retry, and nothing was persisted (the whole creation is
 		// one transaction).
-		h.rerenderContentTypeNew(w, r, def.Name, rows, "No se pudo crear el tipo de contenido: "+err.Error())
+		h.rerenderContentTypeNew(w, r, def.Name, rows, refRows, targets, "No se pudo crear el tipo de contenido: "+err.Error())
 		return
 	}
 	http.Redirect(w, r, "/admin/content-types", http.StatusSeeOther)
@@ -215,12 +320,19 @@ type contentTypeEditFieldRow struct {
 // second, explicit submit. The names double as hidden `confirm_remove` inputs,
 // so the confirmation the store demands is exactly the list the admin was shown
 // — it cannot silently cover a field that appeared in between.
+//
+// Referrers (CONTRACT-27 T4) is the OTHER blocking state of this page, and it is
+// stronger than PendingRemovals: a pending removal asks for a confirmation,
+// while a referrer means the edit is IMPOSSIBLE until another content type is
+// deleted. When it is non-empty the template renders the explanation and no
+// form, so the panel cannot offer an action the store is going to refuse.
 type adminContentTypeEditPage struct {
 	pageData
 	Name            string
 	Fields          []contentTypeEditFieldRow
 	Error           string
 	PendingRemovals []string
+	Referrers       []store.Referrer
 }
 
 // handleAdminContentTypeEditForm renders the edit form for one type, with one
@@ -236,6 +348,15 @@ func (h *handlers) handleAdminContentTypeEditForm(w http.ResponseWriter, r *http
 		h.httpOperationFailure(w, r, err)
 		return
 	}
+	// CONTRACT-27 T4 — the guard of T3 has to be visible in the panel, and it has
+	// to be visible HERE: on the page the admin opens to edit, not only after they
+	// have filled a form in and submitted it. When something references this type
+	// the template hides the form entirely and explains what to delete first.
+	referrers, err := store.ReferencesTo(r.Context(), h.store, name)
+	if err != nil {
+		h.httpOperationFailure(w, r, err)
+		return
+	}
 	rows := make([]contentTypeEditFieldRow, 0, len(fields)+1)
 	for _, f := range fields {
 		rows = append(rows, contentTypeEditFieldRow{
@@ -246,7 +367,7 @@ func (h *handlers) handleAdminContentTypeEditForm(w http.ResponseWriter, r *http
 		})
 	}
 	rows = append(rows, blankContentTypeEditFieldRow())
-	h.renderContentTypeEdit(w, r, http.StatusOK, name, rows, "", nil)
+	h.renderContentTypeEdit(w, r, http.StatusOK, name, rows, "", nil, referrers)
 }
 
 // handleAdminContentTypeEditFieldRow returns ONE blank row (no identity ⇒ a new
@@ -276,27 +397,40 @@ func (h *handlers) handleAdminContentTypeEdit(w http.ResponseWriter, r *http.Req
 		h.httpOperationFailure(w, r, err)
 		return
 	}
-	edits, rows, confirmed, ok := parseContentTypeEditForm(r, stored)
-	if !ok {
-		h.renderContentTypeEdit(w, r, http.StatusBadRequest, name, rows, "Formulario inválido.", nil)
+	references, err := store.LoadContentTypeReferences(r.Context(), h.store, typeID)
+	if err != nil {
+		h.httpOperationFailure(w, r, err)
 		return
 	}
-	plan, err := store.PlanContentTypeEdit(name, typeID, stored, edits)
+	edits, rows, confirmed, ok := parseContentTypeEditForm(r, stored)
+	if !ok {
+		h.renderContentTypeEdit(w, r, http.StatusBadRequest, name, rows, "Formulario inválido.", nil, nil)
+		return
+	}
+	plan, err := store.PlanContentTypeEdit(name, typeID, stored, references, edits)
 	if err != nil {
-		h.renderContentTypeEdit(w, r, http.StatusBadRequest, name, rows, "Definición inválida: "+err.Error(), nil)
+		h.renderContentTypeEdit(w, r, http.StatusBadRequest, name, rows, "Definición inválida: "+err.Error(), nil, nil)
 		return
 	}
 	if missing := unconfirmed(plan.Removed, confirmed); len(missing) > 0 {
-		h.renderContentTypeEdit(w, r, http.StatusOK, name, rows, "", missing)
+		h.renderContentTypeEdit(w, r, http.StatusOK, name, rows, "", missing, nil)
 		return
 	}
 
 	h.schemaMu.Lock()
 	_, err = store.EditContentType(r.Context(), h.store, name, edits, plan.Removed)
 	h.schemaMu.Unlock()
-	if err != nil {
+	// CONTRACT-27 T3 in the panel: the refusal is rendered as the same blocking
+	// notice the edit page shows on load, with the referring types named, rather
+	// than as a generic "could not edit" carrying an engine message.
+	var referenced store.ReferencedTypeError
+	switch {
+	case errors.As(err, &referenced):
+		h.renderContentTypeEdit(w, r, http.StatusBadRequest, name, rows, "", nil, referenced.Referrers)
+		return
+	case err != nil:
 		h.renderContentTypeEdit(w, r, http.StatusBadRequest, name, rows,
-			"No se pudo editar el tipo de contenido: "+err.Error(), nil)
+			"No se pudo editar el tipo de contenido: "+err.Error(), nil, nil)
 		return
 	}
 	http.Redirect(w, r, "/admin/content-types", http.StatusSeeOther)
@@ -310,6 +444,12 @@ func (h *handlers) handleAdminContentTypeEdit(w http.ResponseWriter, r *http.Req
 // today there is no other way to find that out from the panel. The number is
 // both displayed and carried in a hidden input, so the submit that follows
 // confirms exactly what was on screen.
+//
+// Referrers (CONTRACT-27 T4) blocks the page in the same way it blocks the edit
+// page: when something references this type the deletion is impossible, so the
+// template explains what to delete first and renders no confirm button. Showing
+// the row count next to a button that cannot work would be worse than not
+// showing the page at all.
 type adminContentTypeDeletePage struct {
 	pageData
 	Name         string
@@ -318,6 +458,7 @@ type adminContentTypeDeletePage struct {
 	Rows         int64
 	TableMissing bool
 	Error        string
+	Referrers    []store.Referrer
 }
 
 // handleAdminContentTypeDeleteForm is STEP ONE: it shows what the deletion would
@@ -365,9 +506,17 @@ func (h *handlers) handleAdminContentTypeDelete(w http.ResponseWriter, r *http.R
 	h.schemaMu.Unlock()
 
 	var refusal store.DeleteConfirmationError
+	var referenced store.ReferencedTypeError
 	switch {
 	case errors.Is(err, store.ErrContentTypeNotFound):
 		h.renderNotFound(w, r)
+		return
+	case errors.As(err, &referenced):
+		// CONTRACT-27 T3 in the panel. rerender re-reads the live plan, whose
+		// Referrers field carries the same fact, so the page comes back showing the
+		// blocking notice instead of the confirm button — no message needed beyond
+		// what the notice itself says.
+		h.rerenderContentTypeDelete(w, r, name, "")
 		return
 	case errors.As(err, &refusal):
 		h.rerenderContentTypeDelete(w, r, name, refusal.Error())
@@ -408,6 +557,7 @@ func (h *handlers) renderContentTypeDelete(w http.ResponseWriter, r *http.Reques
 		Rows:         plan.Rows,
 		TableMissing: plan.TableMissing,
 		Error:        msg,
+		Referrers:    plan.Referrers,
 	})
 }
 
@@ -486,7 +636,7 @@ func parseContentTypeEditForm(r *http.Request, stored []store.PersistedField) ([
 }
 
 // renderContentTypeEdit writes the edit form with the given status.
-func (h *handlers) renderContentTypeEdit(w http.ResponseWriter, r *http.Request, status int, name string, rows []contentTypeEditFieldRow, msg string, pending []string) {
+func (h *handlers) renderContentTypeEdit(w http.ResponseWriter, r *http.Request, status int, name string, rows []contentTypeEditFieldRow, msg string, pending []string, referrers []store.Referrer) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
 	_ = adminContentTypesEditTmpl.ExecuteTemplate(w, "layout", adminContentTypeEditPage{
@@ -495,6 +645,7 @@ func (h *handlers) renderContentTypeEdit(w http.ResponseWriter, r *http.Request,
 		Fields:          rows,
 		Error:           msg,
 		PendingRemovals: pending,
+		Referrers:       referrers,
 	})
 }
 
@@ -511,9 +662,13 @@ func blankContentTypeEditFieldRow() contentTypeEditFieldRow {
 // echo back on error. A row whose NAME is blank is ignored (the form always
 // renders some spare rows); the type selector always submits a value, so the
 // two slices zip positionally.
-func parseContentTypeForm(r *http.Request) (schema.ContentTypeDefinition, []contentTypeFieldRow, string, bool) {
+// CONTRACT-27 T4: the RELATION rows are read from the same kind of parallel
+// repeated keys (`reference_name` / `reference_target`), zipped positionally by
+// the submission order Go's r.PostForm preserves. A row whose NAME is blank is
+// ignored, exactly like a blank field row, so the spare row costs nothing.
+func parseContentTypeForm(r *http.Request, targets []string) (schema.ContentTypeDefinition, []contentTypeFieldRow, []contentTypeReferenceRow, string, bool) {
 	if err := r.ParseForm(); err != nil {
-		return schema.ContentTypeDefinition{}, defaultContentTypeFieldRows(), "Formulario inválido.", false
+		return schema.ContentTypeDefinition{}, defaultContentTypeFieldRows(), nil, "Formulario inválido.", false
 	}
 	def := schema.ContentTypeDefinition{Name: strings.TrimSpace(r.PostFormValue("name"))}
 	names := r.PostForm["field_name"]
@@ -534,20 +689,57 @@ func parseContentTypeForm(r *http.Request) (schema.ContentTypeDefinition, []cont
 	if len(rows) == 0 {
 		rows = defaultContentTypeFieldRows()
 	}
-	if def.Name == "" {
-		return def, rows, "El nombre del tipo es obligatorio.", false
+	refNames := r.PostForm["reference_name"]
+	refTargets := r.PostForm["reference_target"]
+	refRows := make([]contentTypeReferenceRow, 0, len(refNames))
+	for i, raw := range refNames {
+		target := ""
+		if i < len(refTargets) {
+			target = strings.TrimSpace(refTargets[i])
+		}
+		name := strings.TrimSpace(raw)
+		refRows = append(refRows, contentTypeReferenceRow{Name: name, Targets: contentTypeTargetOptions(targets, target)})
+		if name == "" {
+			continue
+		}
+		def.References = append(def.References, schema.ReferenceDefinition{Name: name, Target: target})
 	}
-	return def, rows, "", true
+	if len(refRows) == 0 && len(targets) > 0 {
+		refRows = append(refRows, blankContentTypeReferenceRow(targets))
+	}
+	if def.Name == "" {
+		return def, rows, refRows, "El nombre del tipo es obligatorio.", false
+	}
+	return def, rows, refRows, "", true
 }
 
 // rerenderContentTypeNew re-renders the create form with a 400 and the error.
-func (h *handlers) rerenderContentTypeNew(w http.ResponseWriter, r *http.Request, name string, rows []contentTypeFieldRow, msg string) {
+func (h *handlers) rerenderContentTypeNew(w http.ResponseWriter, r *http.Request, name string, rows []contentTypeFieldRow, refRows []contentTypeReferenceRow, targets []string, msg string) {
 	renderContentTypeNew(w, http.StatusBadRequest, adminContentTypeNewPage{
-		pageData: h.page(r, "Nuevo tipo de contenido — librarian"),
-		Name:     name,
-		Fields:   rows,
-		Error:    msg,
+		pageData:   h.page(r, "Nuevo tipo de contenido — librarian"),
+		Name:       name,
+		Fields:     rows,
+		References: refRows,
+		NoTargets:  len(targets) == 0,
+		Error:      msg,
 	})
+}
+
+// contentTypeTargetOptions builds a relation's target selector from the existing
+// dynamic types, pre-selecting selected when it is one of them.
+func contentTypeTargetOptions(targets []string, selected string) []contentTypeTargetOption {
+	out := make([]contentTypeTargetOption, 0, len(targets))
+	for _, t := range targets {
+		out = append(out, contentTypeTargetOption{Value: t, Selected: t == selected})
+	}
+	return out
+}
+
+// blankContentTypeReferenceRow is one empty relation row with nothing
+// pre-selected, so an admin who leaves it untouched submits a blank NAME and the
+// row is ignored.
+func blankContentTypeReferenceRow(targets []string) contentTypeReferenceRow {
+	return contentTypeReferenceRow{Targets: contentTypeTargetOptions(targets, "")}
 }
 
 // renderContentTypeNew writes the create form with the given status.

@@ -77,6 +77,11 @@ type ContentTypeDeletion struct {
 	// TableMissing is true when the definition exists but its real table does
 	// not — the inconsistent state discussed at the top of this file.
 	TableMissing bool
+	// Referrers (CONTRACT-27) are the relations pointing AT this type. A
+	// non-empty list means the deletion WILL be refused by the T3 guard, and it
+	// is carried in the read-only plan so the panel can say so on the page that
+	// asks for confirmation — rather than only after the admin has confirmed.
+	Referrers []Referrer
 }
 
 // DeleteConfirmation is what a caller must state to be allowed to proceed.
@@ -154,6 +159,13 @@ func PlanContentTypeDeletion(ctx context.Context, store *compat.Store, typeName 
 	for _, f := range fields {
 		plan.Fields = append(plan.Fields, f.Name)
 	}
+	// CONTRACT-27: the reasons this deletion would be refused, read here so the
+	// confirmation page can show them BEFORE anyone confirms anything.
+	referrers, err := ReferencesTo(ctx, store, typeName)
+	if err != nil {
+		return ContentTypeDeletion{}, err
+	}
+	plan.Referrers = referrers
 
 	// The probe goes to the ENGINE'S OWN catalog, never to __compat_schema: the
 	// metadata is precisely what this operation rewrites, so it cannot also be
@@ -260,6 +272,21 @@ func DeleteContentType(ctx context.Context, store *compat.Store, typeName string
 	// checking them here costs nothing and cannot leave anything half-done.
 	// The COUNT COMPARISON deliberately does NOT happen here — see step 2.
 	if err := checkDeleteConfirmationShape(plan, confirm); err != nil {
+		return ContentTypeDeletion{}, err
+	}
+
+	// CONTRACT-27 T3 — THE GUARD, before anything is composed, compiled or
+	// written. Dropping this type's real table is precisely what a foreign key
+	// pointing at it forbids, and this project never emits CASCADE, so the DROP
+	// would otherwise fail inside the transaction with an engine error naming a
+	// constraint instead of a content type.
+	//
+	// It comes AFTER the confirmation-shape check on purpose: a caller that sent
+	// no confirmation at all is asking "what would this destroy?", and the answer
+	// to that question is the same whether or not the type is referenced. It comes
+	// BEFORE the registry DELETE for the reason the whole guard exists — the
+	// refusal must provably have touched nothing.
+	if err := guardNotReferenced(ctx, store, typeName, "delete"); err != nil {
 		return ContentTypeDeletion{}, err
 	}
 

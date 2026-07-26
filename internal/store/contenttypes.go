@@ -32,6 +32,16 @@ var ErrDuplicateContentType = errors.New("content type already exists")
 // with that name exists (→ 404).
 var ErrContentTypeNotFound = errors.New("content type not found")
 
+// ErrUnknownReferenceTarget is returned when a creation declares a reference to
+// a content type that does not exist (CONTRACT-27 T2 — "the target has to exist
+// FIRST; if not, an explicit refusal").
+//
+// It is a 400, not a 500, and it is checked in Go rather than left to the
+// engine: leaving it to the engine would mean the CREATE TABLE failing on a
+// foreign key naming a table (`cpt_autores`) the admin never typed, in an error
+// that says nothing about the ORDER being the problem.
+var ErrUnknownReferenceTarget = errors.New("the target of the reference does not exist")
+
 // registryPresent reports whether the content_types registry table physically
 // exists in the database.
 //
@@ -117,6 +127,25 @@ func LoadContentTypeDefinitions(ctx context.Context, store *compat.Store) ([]sch
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate content type definitions: %w", err)
+	}
+	// CONTRACT-27: the relation half of every definition, read from the third
+	// registry table. It is a SECOND query rather than a third LEFT JOIN on the
+	// one above on purpose: joining two independent one-to-many children of the
+	// same parent multiplies their rows against each other (fields × references),
+	// and de-duplicating that in Go is exactly the kind of implicit
+	// reconstruction that loses a row when one of the two sides is empty.
+	//
+	// On a database whose references table does not exist yet — every
+	// installation, on its first boot with this binary, because LoadDefinitions
+	// runs INSIDE EnsureSchema before the missing tables are created — this
+	// yields an empty map, which is PROVABLY correct: a relation can only live
+	// there. See referencesTablePresent.
+	references, err := loadReferencesByType(ctx, store)
+	if err != nil {
+		return nil, err
+	}
+	for i := range out {
+		out[i].References = references[out[i].Name]
 	}
 	dual.SortByKeys(out, func(d schema.ContentTypeDefinition) []dual.Key {
 		return dual.Ascending(d.Name)
@@ -270,6 +299,29 @@ func CreateContentType(ctx context.Context, store *compat.Store, def schema.Cont
 			return ErrDuplicateContentType
 		}
 	}
+	// 2b. CONTRACT-27 T2 — THE ORDER THIS CONTRACT IMPOSES. A reference is a real
+	//     foreign key, so its target table must already exist; there is no
+	//     ALTER TABLE to add the constraint later, and creating both types in one
+	//     step is not expressible through this API. The check is explicit, and
+	//     it is what turns "you did it in the wrong order" into a sentence rather
+	//     than into a driver error about `cpt_autores`.
+	//
+	//     Only DYNAMIC types are candidates: `existing` comes from the registry,
+	//     which holds nothing else. A reference to a CODE type (articles,
+	//     products) is therefore rejected here by the same check, which is the
+	//     scope DEFINITION-CPT-DINAMICOS.md fixed — relating to a code type still
+	//     requires a code type.
+	present := make(map[string]struct{}, len(existing))
+	for _, d := range existing {
+		present[d.Name] = struct{}{}
+	}
+	for _, r := range def.References {
+		if _, ok := present[r.Target]; !ok {
+			return fmt.Errorf("%w: the content type %q declares a reference %q to %q, which is not a dynamic content type of this installation. Create %q first (a reference is a real foreign key, so its target table must exist before the referring table is created), or check the name: only dynamic content types can be referenced, not the code-defined ones",
+				ErrUnknownReferenceTarget, def.Name, r.Name, r.Target, r.Target)
+		}
+	}
+
 	// CONTRACT-23: composed for the capabilities this installation was CREATED
 	// with, read from the physical table — not for the default. This write ends
 	// with writeFullSchemaMetadata, so composing it with the wrong capabilities
@@ -294,6 +346,15 @@ func CreateContentType(ctx context.Context, store *compat.Store, def schema.Cont
 	}
 	// The expected table is the PREFIXED one (CONTRACT-17): def.Name is the
 	// public name, def.TableName() is what BuildWith actually put in the schema.
+	//
+	// CONTRACT-27 asked explicitly whether "exactly one missing table" still holds
+	// once the new table carries a foreign key to another DYNAMIC table. It does,
+	// and for a checked reason rather than by luck: the target must already exist
+	// (step 2b refuses otherwise), so its table is present in the catalog and the
+	// diff cannot report it as missing. The composition order changed — the target
+	// is now emitted BEFORE the referrer, see schema.sortDefinitionsByDependency —
+	// but the diff is a set difference, so the order affects only which order the
+	// (single) missing table would be created in.
 	if len(missing) != 1 || missing[0].Name != def.TableName() {
 		names := make([]string, 0, len(missing))
 		for _, t := range missing {
@@ -322,6 +383,16 @@ func CreateContentType(ctx context.Context, store *compat.Store, def schema.Cont
 	typeID, err := dual.NewUUID()
 	if err != nil {
 		return fmt.Errorf("generate id for content type %q: %w", def.Name, err)
+	}
+	// The registry ids of the reference targets, resolved BEFORE the transaction
+	// opens — required on SQLite, where compat pins the pool to a single
+	// connection, and correct on both engines. A target that disappears between
+	// this read and the transaction is not a hole: the CREATE TABLE would fail on
+	// its foreign key and the reference INSERT would fail on target_type_id's own
+	// FK, so the whole transaction rolls back and nothing half-exists.
+	targetIDs, err := contentTypeIDsByName(ctx, store, def.References)
+	if err != nil {
+		return err
 	}
 
 	tx, err := store.DB.BeginTx(ctx, nil)
@@ -368,6 +439,12 @@ func CreateContentType(ctx context.Context, store *compat.Store, def schema.Cont
 		); err != nil {
 			return fmt.Errorf("insert field %q of content type %q: %w", f.Name, def.Name, err)
 		}
+	}
+	// CONTRACT-27: the relation rows, in the SAME transaction as everything else.
+	// A reference row without its FK column (or the other way round) is the exact
+	// class of split this function's whole design exists to make unreachable.
+	if err := insertReferenceRows(ctx, engine, tx, typeID, def, targetIDs); err != nil {
+		return err
 	}
 	for _, statement := range statements {
 		if _, err := tx.ExecContext(ctx, statement); err != nil {

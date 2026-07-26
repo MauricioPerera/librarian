@@ -51,10 +51,12 @@ package server
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -195,6 +197,17 @@ func rowJSON(row compat.Row, def schema.ContentTypeDefinition) (map[string]any, 
 			return nil, fmt.Errorf("field %q has unknown type %q", f.Name, string(f.Type))
 		}
 	}
+	// CONTRACT-27: a relation is a uuid column, surfaced as a JSON string (the id
+	// of the referenced row) or null. It reads exactly like `author_id` — which is
+	// the point: a reference is structurally the same thing as the author FK every
+	// content table has already had since CONTRACT-01.
+	for _, r := range def.References {
+		if dual.RowIsNull(row, r.Name) {
+			out[r.Name] = nil
+			continue
+		}
+		out[r.Name] = dual.RowText(row, r.Name)
+	}
 	return out, nil
 }
 
@@ -226,17 +239,26 @@ func (e errBadField) Error() string { return e.msg }
 // a body from touching a common column — `id`, `author_id`, `created_at`,
 // `updated_at` and `metadata` are reserved names, so no field can be called
 // that, so such a key matches nothing and is rejected as unknown.
+//
+// CONTRACT-27: the RELATIONS are bound after the fields, in the same order
+// schema.DynamicTable puts their columns in the table, so one slice drives the
+// whole write. The rule above is unchanged for them: a relation absent from the
+// body, or explicitly null, is stored as NULL — the column is nullable by
+// construction, which is what makes a relation optional.
 func bindValues(def schema.ContentTypeDefinition, body map[string]json.RawMessage) ([]any, error) {
-	known := make(map[string]struct{}, len(def.Fields))
+	known := make(map[string]struct{}, len(def.Fields)+len(def.References))
 	for _, f := range def.Fields {
 		known[f.Name] = struct{}{}
+	}
+	for _, r := range def.References {
+		known[r.Name] = struct{}{}
 	}
 	for key := range body {
 		if _, ok := known[key]; !ok {
 			return nil, errBadField{fmt.Sprintf("unknown field %q for content type %q", key, def.Name)}
 		}
 	}
-	values := make([]any, 0, len(def.Fields))
+	values := make([]any, 0, len(def.Fields)+len(def.References))
 	for _, f := range def.Fields {
 		v, err := bindValue(f, body[f.Name])
 		if err != nil {
@@ -244,7 +266,100 @@ func bindValues(def schema.ContentTypeDefinition, body map[string]json.RawMessag
 		}
 		values = append(values, v)
 	}
+	for _, r := range def.References {
+		v, err := bindReference(r, body[r.Name])
+		if err != nil {
+			return nil, err
+		}
+		values = append(values, v)
+	}
 	return values, nil
+}
+
+// uuidPattern is the canonical 8-4-4-4-12 hexadecimal form, lowercase only.
+//
+// LOWERCASE ONLY, for the same reason schema.identifierPattern is: PostgreSQL's
+// `uuid` type normalises `AB…` and `ab…` to the same value, SQLite stores the
+// TEXT verbatim and compares it byte for byte. Accepting both cases would make
+// the SAME request find a row on one engine and not on the other — the
+// dual-engine divergence this project exists to prevent. Every id this project
+// ever emits is lowercase (dual.NewUUID), so nothing legitimate is rejected.
+var uuidPattern = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
+
+// bindReference validates ONE body value for a declared relation and returns the
+// value to bind. Like bindValue, every rejection is an errBadField (→ 400).
+//
+// THE FORMAT CHECK IS NOT COSMETIC. The column is `uuid` on PostgreSQL, so a
+// value that is not a uuid makes the driver fail with `invalid input syntax for
+// type uuid` — a 500 for what is plainly a bad request — while SQLite (where the
+// carrier is TEXT) would happily store the garbage and simply never match
+// anything. Rejecting the shape here is what makes the two engines answer the
+// same 400 to the same request.
+func bindReference(r schema.ReferenceDefinition, raw json.RawMessage) (any, error) {
+	s := strings.TrimSpace(string(raw))
+	if s == "" || s == "null" {
+		return nil, nil
+	}
+	var v string
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return nil, errBadField{fmt.Sprintf("reference %q must be a JSON string holding the id of a %q row, or null", r.Name, r.Target)}
+	}
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return nil, nil
+	}
+	if !uuidPattern.MatchString(v) {
+		return nil, errBadField{fmt.Sprintf("reference %q must be the id of a %q row: a lowercase uuid in 8-4-4-4-12 form", r.Name, r.Target)}
+	}
+	return v, nil
+}
+
+// checkReferenceTargets verifies that every non-null relation value names a row
+// that actually exists in the target type's table, and turns a miss into a 400.
+//
+// WHY IT EXISTS WHEN THE FOREIGN KEY ALREADY ENFORCES THIS. The FK is the real
+// guarantee and it is not being replaced: it is what makes the constraint hold
+// against every writer, including one that is not this process. But when the FK
+// is the thing that rejects the write, what comes back is a driver error —
+// SQLSTATE 23503 on PostgreSQL, `FOREIGN KEY constraint failed` on SQLite — which
+// this package would report as a 500, because it is indistinguishable from any
+// other failed statement without classifying by engine-specific driver codes.
+// compat exposes IsUniqueViolation but has no foreign-key equivalent (verified in
+// v0.4.0), and this contract does not touch compat. So the CHECKED, portable
+// answer is to ask the question before writing.
+//
+// THE RESIDUAL WINDOW, stated rather than hidden: the referenced row could be
+// deleted between this check and the INSERT. It is narrow and it is not silent —
+// the foreign key still refuses the write, the row is not created, and the caller
+// gets a 500 instead of a 400 for that one interleaving. Nothing is corrupted;
+// only the status code degrades. Closing it would require the FK classifier
+// compat does not offer.
+func (h *handlers) checkReferenceTargets(ctx context.Context, def schema.ContentTypeDefinition, values []any) error {
+	offset := len(def.Fields)
+	for i, r := range def.References {
+		value := values[offset+i]
+		if value == nil {
+			continue
+		}
+		id, ok := value.(string)
+		if !ok { // unreachable: bindReference returns a string or nil.
+			return errBadField{fmt.Sprintf("reference %q has an unexpected value", r.Name)}
+		}
+		table, err := quoteIdentifier(schema.DynamicTableName(r.Target))
+		if err != nil {
+			return err
+		}
+		var found string
+		err = h.db.QueryRowContext(ctx,
+			`SELECT `+quote(colID)+` FROM `+table+` WHERE `+quote(colID)+` = `+dual.Bind(h.engine(), 1), id).Scan(&found)
+		if errors.Is(err, sql.ErrNoRows) {
+			return errBadField{fmt.Sprintf("reference %q points at %q, and no %q row has the id %q", r.Name, r.Target, r.Target, id)}
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // bindValue validates ONE body value against its declared FieldType and returns
@@ -390,6 +505,13 @@ func (h *handlers) handleCreateContent(w http.ResponseWriter, r *http.Request) {
 		writeBindError(w, err)
 		return
 	}
+	// CONTRACT-27: a relation pointing at a row that does not exist is a 400 with
+	// a sentence, not a foreign-key error from the driver. See
+	// checkReferenceTargets.
+	if err := h.checkReferenceTargets(r.Context(), def, values); err != nil {
+		writeBindError(w, err)
+		return
+	}
 	newID, err := h.insertContentRow(r.Context(), def, id.UserID, values)
 	if err != nil {
 		h.writeOperationFailure(w, r, err, "could not create content")
@@ -419,6 +541,10 @@ func (h *handlers) handleUpdateContent(w http.ResponseWriter, r *http.Request) {
 		writeBindError(w, err)
 		return
 	}
+	if err := h.checkReferenceTargets(r.Context(), def, values); err != nil {
+		writeBindError(w, err)
+		return
+	}
 	n, err := h.updateContentRow(r.Context(), def, r.PathValue("id"), values)
 	if err != nil {
 		h.writeOperationFailure(w, r, err, "could not update content")
@@ -441,6 +567,16 @@ func (h *handlers) handleUpdateContent(w http.ResponseWriter, r *http.Request) {
 func (h *handlers) handleDeleteContent(w http.ResponseWriter, r *http.Request) {
 	def, ok := h.resolveType(w, r)
 	if !ok {
+		return
+	}
+	// CONTRACT-27: deleting a REFERENCED row is refused by the foreign key, which
+	// is the point — a reference is never cascaded away. Asking first is what
+	// turns that into a 400 naming who points at the row instead of a 500 built
+	// out of a driver message. Same argument, same limitation, as
+	// checkReferenceTargets: compat has no foreign-key-violation classifier, and
+	// this contract does not touch compat.
+	if err := h.checkNoIncomingReferences(r.Context(), def, r.PathValue("id")); err != nil {
+		writeBindError(w, err)
 		return
 	}
 	n, err := h.deleteContentRow(r.Context(), def, r.PathValue("id"))
@@ -467,6 +603,74 @@ func writeBindError(w http.ResponseWriter, err error) {
 	writeError(w, http.StatusInternalServerError, "could not process content")
 }
 
+// checkNoIncomingReferences refuses the deletion of a row that other rows point
+// at, naming who points at it and how many.
+//
+// It asks the REGISTRY which types reference this one (store.ReferencesTo) and
+// then counts, in each of those types' real tables, the rows whose foreign-key
+// column holds this id. Both the table name and the column name come from the
+// registry — never from the request — and go through the same quoteIdentifier
+// gate as every other interpolated identifier in this file; the id is bound.
+//
+// The residual window is the mirror of checkReferenceTargets': a referring row
+// created between the count and the DELETE still hits the real foreign key, so
+// the deletion is refused either way and nothing is lost — only the status code
+// degrades to a 500 for that interleaving.
+func (h *handlers) checkNoIncomingReferences(ctx context.Context, def schema.ContentTypeDefinition, id string) error {
+	if id == "" || !uuidPattern.MatchString(id) {
+		// A malformed id matches no row, so the DELETE is a 404 and there is
+		// nothing to protect. Returning here also keeps a non-uuid out of a
+		// PostgreSQL `uuid` comparison, which would be a driver error.
+		return nil
+	}
+	referrers, err := store.ReferencesTo(ctx, h.store, def.Name)
+	if err != nil {
+		return err
+	}
+	for _, ref := range referrers {
+		table, err := quoteIdentifier(schema.DynamicTableName(ref.TypeName))
+		if err != nil {
+			return err
+		}
+		column, err := quoteIdentifier(ref.ReferenceName)
+		if err != nil {
+			return err
+		}
+		var count int64
+		if err := h.db.QueryRowContext(ctx,
+			`SELECT count(*) FROM `+table+` WHERE `+column+` = `+dual.Bind(h.engine(), 1), id).Scan(&count); err != nil {
+			return err
+		}
+		if count > 0 {
+			return errBadField{fmt.Sprintf(
+				"this %q row cannot be deleted: %d %q row(s) reference it through %q. This project never emits ON DELETE CASCADE, so those rows are not destroyed silently — clear or delete them first",
+				def.Name, count, ref.TypeName, ref.ReferenceName)}
+		}
+	}
+	return nil
+}
+
+// ownColumnNames is THE order of a dynamic type's own columns: its scalar fields
+// in declaration order, then its relations in declaration order (CONTRACT-27).
+//
+// It exists so that the ONE order is spelled once and shared by everything that
+// zips a definition against a value slice — bindValues, checkReferenceTargets,
+// insertContentRow and updateContentRow. It matches, deliberately and by
+// construction, the order schema.DynamicTable emits the physical columns in and
+// the order schema.dynamicContentColumns declares the routines' output in. A
+// second, independent spelling of that order is exactly how a value would end up
+// written into the wrong column.
+func ownColumnNames(def schema.ContentTypeDefinition) []string {
+	out := make([]string, 0, len(def.Fields)+len(def.References))
+	for _, f := range def.Fields {
+		out = append(out, f.Name)
+	}
+	for _, r := range def.References {
+		out = append(out, r.Name)
+	}
+	return out
+}
+
 // --- Data access -------------------------------------------------------------
 
 // dynamicSchema composes the canonical schema that DECLARES this type's two read
@@ -481,8 +685,15 @@ func writeBindError(w http.ResponseWriter, err error) {
 // executed here is always the dynamic one, so the choice is unobservable in the
 // result — it is threaded anyway because a composed schema that describes a
 // different installation than the one it runs on has no reason to exist.
+//
+// CONTRACT-27: it goes through schema.ReadSchemaFor rather than BuildWithFor,
+// because a composed schema must contain the TARGET of every foreign key it
+// declares. ReadSchemaFor adds the targets as placeholders instead of loading
+// every definition in the instance, which would put a registry query on the hot
+// path of every list and every detail read. See its documentation for why a
+// placeholder is sound HERE and nowhere else.
 func (h *handlers) dynamicSchema(def schema.ContentTypeDefinition) (compat.Schema, error) {
-	return schema.BuildWithFor(h.caps, []schema.ContentTypeDefinition{def})
+	return schema.ReadSchemaFor(h.caps, def)
 }
 
 // listContentRows returns a page of rows ordered by created_at DESC.
@@ -562,8 +773,8 @@ func (h *handlers) insertContentRow(ctx context.Context, def schema.ContentTypeD
 	stamp := nowCanonical()
 	columns := []string{colID, colAuthorID, colCreatedAt, colUpdatedAt}
 	args := []any{id, authorID, stamp, stamp}
-	for i, f := range def.Fields {
-		quoted, err := quoteIdentifier(f.Name)
+	for i, name := range ownColumnNames(def) {
+		quoted, err := quoteIdentifier(name)
 		if err != nil {
 			return "", err
 		}
@@ -592,11 +803,12 @@ func (h *handlers) updateContentRow(ctx context.Context, def schema.ContentTypeD
 		return 0, err
 	}
 	engine := h.engine()
-	assignments := make([]string, 0, len(def.Fields)+1)
-	args := make([]any, 0, len(def.Fields)+2)
+	own := ownColumnNames(def)
+	assignments := make([]string, 0, len(own)+1)
+	args := make([]any, 0, len(own)+2)
 	position := 1
-	for i, f := range def.Fields {
-		quoted, err := quoteIdentifier(f.Name)
+	for i, name := range own {
+		quoted, err := quoteIdentifier(name)
 		if err != nil {
 			return 0, err
 		}

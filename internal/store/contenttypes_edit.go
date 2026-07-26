@@ -237,13 +237,22 @@ func LoadContentTypeFields(ctx context.Context, store *compat.Store, typeName st
 // is PURE (no database access) so every rejection it produces costs nothing and
 // can never leave anything half-done — the contract's "validation errors must
 // not touch the database" is true by construction, not by rollback.
-func PlanContentTypeEdit(typeName, typeID string, stored []PersistedField, edits []FieldEdit) (ContentTypeEdit, error) {
+//
+// CONTRACT-27 adds `references`: the relations the type ALREADY has, which an
+// edit never changes (a relation is declared at creation — see the report) but
+// which the plan must carry for two reasons. First, the rebuild re-creates the
+// table from plan.New, so a definition without them would silently DROP the
+// foreign-key columns and their data. Second, they participate in validation: a
+// new field named like an existing reference would otherwise become a duplicate
+// column, caught by compat at apply time as an opaque error instead of here as a
+// clean 400.
+func PlanContentTypeEdit(typeName, typeID string, stored []PersistedField, references []schema.ReferenceDefinition, edits []FieldEdit) (ContentTypeEdit, error) {
 	plan := ContentTypeEdit{TypeName: typeName, TypeID: typeID}
 
 	// 1. The SAME gate a creation passes — the identifier rules are not relaxed
 	//    because this is an edit. It also rejects duplicate field names and
 	//    unknown field types inside the requested list.
-	def := schema.ContentTypeDefinition{Name: typeName}
+	def := schema.ContentTypeDefinition{Name: typeName, References: references}
 	for _, e := range edits {
 		def.Fields = append(def.Fields, schema.FieldDefinition{Name: e.Name, Type: e.Type})
 	}
@@ -324,7 +333,11 @@ func EditContentType(ctx context.Context, store *compat.Store, typeName string, 
 	if err != nil {
 		return ContentTypeEdit{}, err
 	}
-	plan, err := PlanContentTypeEdit(typeName, typeID, stored, edits)
+	references, err := LoadContentTypeReferences(ctx, store, typeID)
+	if err != nil {
+		return ContentTypeEdit{}, err
+	}
+	plan, err := PlanContentTypeEdit(typeName, typeID, stored, references, edits)
 	if err != nil {
 		return ContentTypeEdit{}, err
 	}
@@ -334,6 +347,20 @@ func EditContentType(ctx context.Context, store *compat.Store, typeName string, 
 	if plan.NoOp {
 		// Nothing changed: succeed without touching the database at all.
 		return plan, nil
+	}
+
+	// CONTRACT-27 T3 — THE GUARD, and it is HERE: after the no-op shortcut (an
+	// edit that rebuilds nothing cannot fail on a foreign key) and before
+	// anything is composed, compiled or written.
+	//
+	// The rebuild DROPS the real table and re-creates it under the same name
+	// (there is no RENAME in compat, see the file header). A foreign key pointing
+	// at that table forbids exactly that, and this project never emits CASCADE,
+	// so the DROP would fail inside the transaction with an engine error naming a
+	// constraint rather than a content type. That limit is accepted; being told
+	// about it in those terms is not.
+	if err := guardNotReferenced(ctx, store, typeName, "edit"); err != nil {
+		return ContentTypeEdit{}, err
 	}
 
 	// The composed schema this database WILL have: every persisted definition,
@@ -536,6 +563,25 @@ func compileRebuild(target compat.Target, plan ContentTypeEdit) ([]string, error
 		}
 		quotedCommon = append(quotedCommon, q)
 	}
+
+	// CONTRACT-27: the RELATION columns are carried VERBATIM, like the injected
+	// ones — an edit changes the field list and never the relations, so their
+	// name is the same on both sides of every copy. They go through
+	// QuoteIdentifier (not QuoteInternalIdentifier): a reference name IS an
+	// admin-supplied dynamic identifier, subject to the same gate as a field.
+	//
+	// Omitting them here would be the quietest way to lose data in this file: the
+	// rebuilt table WOULD have the columns (schema.DynamicTable emits them from
+	// plan.New.References) and the copies would simply leave them NULL.
+	quotedReferences := make([]string, 0, len(plan.New.References))
+	for _, r := range plan.New.References {
+		q, err := schema.QuoteIdentifier(r.Name)
+		if err != nil {
+			return nil, err
+		}
+		quotedReferences = append(quotedReferences, q)
+	}
+	quotedCommon = append(quotedCommon, quotedReferences...)
 
 	// Forward copy: only the SURVIVING fields, mapped new-name ← old-name by
 	// identity. A field being added is simply absent from both lists, so it

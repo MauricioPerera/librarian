@@ -7,7 +7,7 @@
 <div class="table-scroll">
 <table class="table" id="content-types-table">
   <thead>
-    <tr><th>Nombre</th><th>Campos</th><th>Acciones</th></tr>
+    <tr><th>Nombre</th><th>Campos</th><th>Relaciones</th><th>Acciones</th></tr>
   </thead>
   <tbody>
     {{range .Types}}
@@ -16,6 +16,10 @@
       <td>
         {{if .Fields}}{{range .Fields}}<code>{{.Name}}</code> <span class="muted">({{.Type}})</span> {{end}}
         {{else}}<span class="muted">sin campos propios</span>{{end}}
+      </td>
+      <td class="cell-references">
+        {{if .References}}{{range .References}}<code>{{.Name}}</code> <span class="muted">→ {{.Target}}</span> {{end}}
+        {{else}}<span class="muted">sin relaciones</span>{{end}}
       </td>
       <td class="cell-actions">
         <a class="btn btn-ghost" href="/admin/content/{{.Name}}">Ver contenido</a>
@@ -31,4 +35,5 @@
 <p class="empty">No hay tipos de contenido dinámicos todavía. <a href="/admin/content-types/new">Creá el primero</a>.</p>
 {{end}}
 <p class="muted">Los campos de un tipo se pueden editar: agregar uno nuevo (queda vacío en el contenido que ya existe) o renombrar uno existente (conserva sus datos). Quitar un campo BORRA sus datos y pide confirmación. El tipo de un campo no se puede cambiar. «Borrar» elimina el tipo entero —definición, campos y su tabla con todas sus filas— y te muestra cuántas filas se van a destruir antes de pedirte la confirmación.</p>
+<p class="muted">Una <strong>relación</strong> es una clave foránea real hacia otro tipo dinámico y se declara al crear el tipo. Mientras exista, el tipo DESTINO no se puede editar ni borrar: para liberarlo hay que borrar el tipo que lo referencia.</p>
 {{end}}
