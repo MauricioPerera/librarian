@@ -474,6 +474,50 @@ La comprobación es `to_regtype('vector')`, no `pg_extension`: lo que importa no
 es que la extensión esté instalada sino que **esta conexión pueda nombrar el
 tipo**, que es distinto si `pgvector` vive en un esquema fuera del `search_path`.
 
+### La capacidad vectorial es opcional (CONTRACT-23)
+
+Ese prerrequisito solo aplica si la instalación **declara** la capacidad
+vectorial, que es lo que hace por defecto:
+
+| Variable | Valores | Qué hace |
+|---|---|---|
+| `LIBRARIAN_VECTOR` | `enabled` (por defecto; también `on`/`true`/`1`), `disabled` (también `off`/`false`/`0`) | declara si esta instalación tiene la columna `articles.embedding vector(1536)` |
+
+Con `LIBRARIAN_VECTOR=disabled` el esquema canónico **no declara ningún
+`vector(N)`**, así que no hay nada que `pgvector` tenga que resolver: la
+instalación arranca y sirve sobre un PostgreSQL administrado que no ofrezca la
+extensión. A cambio, un pedido que traiga `embedding` se **rechaza con 400** y
+una explicación — no se ignora en silencio — y las lecturas simplemente no traen
+el campo. Un valor desconocido de la variable es un error de arranque, nunca un
+silencio.
+
+> **LA ELECCIÓN ES IRREVERSIBLE DESPUÉS DEL PRIMER ARRANQUE.** `EnsureSchema`
+> crea solo las tablas FALTANTES y jamás altera una existente, así que habilitar
+> la capacidad más tarde **no agregaría** la columna y deshabilitarla **no la
+> quitaría**. Cambiar la declaración sobre una instalación ya creada **no
+> arranca**:
+>
+> ```
+> librarian: this installation was created WITHOUT the vector capability (its articles table
+> has no "embedding" column) but the configuration now declares it ENABLED
+> (LIBRARIAN_VECTOR=enabled): refusing to start. ... Set LIBRARIAN_VECTOR=disabled to keep
+> serving this installation, or create a NEW installation with the capability enabled and move
+> the data into it with `compat copy`
+> ```
+>
+> La comprobación se hace contra la BASE (la columna física en el catálogo del
+> motor), no contra la metadata `__compat_schema` — esa fila la escribe el mismo
+> camino cuya creencia está en duda.
+
+`--dump-schema` refleja la elección de la instalación (la lee de la tabla física
+cuando la instalación existe), lo cual importa más de lo que parece: ese artefacto
+es el `schema_ref` que consume `compat copy`, así que un dump que declarara la
+columna crearía un `vector(1536)` en el DESTINO y le devolvería el requisito de
+`pgvector` a la instalación que existe justamente para no tenerlo.
+
+Toda instalación existente tiene la columna, así que el valor por defecto
+(`enabled`) es exactamente lo que ya corre: actualizar el binario no cambia nada.
+
 ### Instalación en limpio sobre PostgreSQL
 
 ```sql
@@ -481,6 +525,10 @@ CREATE DATABASE librarian;
 \c librarian
 CREATE EXTENSION IF NOT EXISTS vector;   -- requiere superusuario
 ```
+
+(el `CREATE EXTENSION` **solo** si la instalación va a declarar la capacidad
+vectorial, que es el valor por defecto; con `LIBRARIAN_VECTOR=disabled` se omite
+y no hace falta superusuario)
 
 y arrancar con `LIBRARIAN_ENGINE=postgres`. El binario crea todo el esquema
 (tablas, vistas y metadata) en el primer arranque; el segundo es un no-op.

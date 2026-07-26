@@ -14,6 +14,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/MauricioPerera/librarian/internal/schema"
 	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
 
@@ -27,6 +28,9 @@ const (
 	// already sets it, and there is only ever ONE connection string, so a second
 	// variable would be a second source of truth for the same thing.
 	DSNVar = "LIBRARIAN_DB"
+	// VectorVar declares whether this installation has the VECTOR CAPABILITY:
+	// "enabled" (the default) or "disabled". See ResolveCapabilities.
+	VectorVar = "LIBRARIAN_VECTOR"
 )
 
 // DefaultSQLitePath is the database file used when LIBRARIAN_DB is unset. It
@@ -45,6 +49,11 @@ type Config struct {
 	Engine    compat.Engine
 	DSN       string
 	JWTSecret string
+	// Capabilities is the set of optional schema capabilities this installation
+	// DECLARES (CONTRACT-23 T1). It is a declaration, not a fact: the fact lives
+	// in the physical tables, and store.EnsureSchemaFor refuses to start when the
+	// two disagree, because the choice is irreversible after the first boot.
+	Capabilities schema.Capabilities
 }
 
 // DBPath is the DSN under its historical name, kept so log lines and error
@@ -59,11 +68,16 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	caps, err := ResolveCapabilities()
+	if err != nil {
+		return Config{}, err
+	}
 	cfg := Config{
-		Addr:      os.Getenv("LIBRARIAN_ADDR"),
-		Engine:    engine,
-		DSN:       dsn,
-		JWTSecret: os.Getenv("LIBRARIAN_JWT_SECRET"),
+		Addr:         os.Getenv("LIBRARIAN_ADDR"),
+		Engine:       engine,
+		DSN:          dsn,
+		JWTSecret:    os.Getenv("LIBRARIAN_JWT_SECRET"),
+		Capabilities: caps,
 	}
 	if cfg.Addr == "" {
 		cfg.Addr = ":8080"
@@ -132,6 +146,55 @@ func ResolveEngine() (compat.Engine, string, error) {
 		return "", "", fmt.Errorf(
 			"%s=%q is not a supported engine: expected %q (the default) or %q",
 			EngineVar, raw, "sqlite", "postgres")
+	}
+}
+
+// ResolveCapabilities decides which OPTIONAL SCHEMA CAPABILITIES this
+// installation declares (CONTRACT-23 T1).
+//
+// THE FORM: the same one CONTRACT-21 chose for the engine — an EXPLICIT
+// environment variable with NAMED values, where an unrecognised value is a
+// startup error rather than a silent fallback. It is deliberately NOT inferred
+// from anything (whether pgvector happens to be installed, whether any row
+// carries an embedding): a capability inferred from the environment would change
+// with the environment, and this one is irreversible after the first boot.
+//
+//	LIBRARIAN_VECTOR=enabled   (the default; also on/true/1)
+//	LIBRARIAN_VECTOR=disabled  (also off/false/0)
+//
+// THE DEFAULT IS ENABLED, and the justification is the point of the decision.
+// The two candidate defaults are not symmetric:
+//
+//   - Default ENABLED is what EVERY installation deployed today already has:
+//     articles.embedding exists in all of them. Upgrading the binary therefore
+//     changes nothing, which is the only default under which an existing
+//     instance restarts unchanged. Under the opposite default, every deployed
+//     instance would come up declaring a schema WITHOUT a column its table has,
+//     and the coherence guard would (correctly) refuse to start the entire
+//     estate on the first restart after the upgrade — a capability flag would
+//     have become an outage.
+//   - Default DISABLED would optimise for the new lightweight installation,
+//     which is exactly the case that is ALREADY making an explicit deployment
+//     decision (it chose a PostgreSQL without pgvector). Making the party that
+//     is deciding say so out loud costs one variable; making the party that
+//     decided nothing suffer a schema change costs an incident.
+//
+// The general rule this follows: the value a caller gets by saying NOTHING must
+// be the one that preserves what already exists. Removing a column is never
+// something an installation should get by omission.
+func ResolveCapabilities() (schema.Capabilities, error) {
+	raw := strings.TrimSpace(os.Getenv(VectorVar))
+	switch strings.ToLower(raw) {
+	case "", "enabled", "enable", "on", "true", "1":
+		return schema.Capabilities{}, nil
+	case "disabled", "disable", "off", "false", "0":
+		return schema.Capabilities{VectorDisabled: true}, nil
+	default:
+		return schema.Capabilities{}, fmt.Errorf(
+			"%s=%q is not a valid value: expected %q (the default) or %q. "+
+				"This choice declares whether this installation's articles table has the vector(%d) embedding column, "+
+				"and it is IRREVERSIBLE after the first boot, so it is never guessed",
+			VectorVar, raw, "enabled", "disabled", schema.EmbeddingDimension)
 	}
 }
 

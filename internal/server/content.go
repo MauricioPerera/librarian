@@ -475,8 +475,14 @@ func writeBindError(w http.ResponseWriter, err error) {
 // `content_read_*` routines in the same place — so it costs no database round
 // trip. Only this one type is composed, not every type in the instance: a read
 // of `eventos` needs `eventos` declared, and nothing else.
-func dynamicSchema(def schema.ContentTypeDefinition) (compat.Schema, error) {
-	return schema.BuildWith([]schema.ContentTypeDefinition{def})
+//
+// CONTRACT-23: it is composed for THIS installation's capabilities. The dynamic
+// half never depends on them (no field type is a vector), and the routine being
+// executed here is always the dynamic one, so the choice is unobservable in the
+// result — it is threaded anyway because a composed schema that describes a
+// different installation than the one it runs on has no reason to exist.
+func (h *handlers) dynamicSchema(def schema.ContentTypeDefinition) (compat.Schema, error) {
+	return schema.BuildWithFor(h.caps, []schema.ContentTypeDefinition{def})
 }
 
 // listContentRows returns a page of rows ordered by created_at DESC.
@@ -486,7 +492,7 @@ func dynamicSchema(def schema.ContentTypeDefinition) (compat.Schema, error) {
 // read without a total order can select DIFFERENT rows for the same
 // LIMIT/OFFSET on each engine, which is the worst failure mode in this file.
 func (h *handlers) listContentRows(ctx context.Context, def schema.ContentTypeDefinition, limit, offset int) ([]map[string]any, error) {
-	dyn, err := dynamicSchema(def)
+	dyn, err := h.dynamicSchema(def)
 	if err != nil {
 		return nil, err
 	}
@@ -513,7 +519,7 @@ func (h *handlers) listContentRows(ctx context.Context, def schema.ContentTypeDe
 // id (it is a bound parameter, so it just matches nothing); err is non-nil only
 // on a real database failure.
 func (h *handlers) fetchContentRow(ctx context.Context, def schema.ContentTypeDefinition, id string) (map[string]any, bool, error) {
-	dyn, err := dynamicSchema(def)
+	dyn, err := h.dynamicSchema(def)
 	if err != nil {
 		return nil, false, err
 	}

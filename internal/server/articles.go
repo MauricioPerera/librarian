@@ -104,6 +104,14 @@ func (h *handlers) handleCreateArticle(w http.ResponseWriter, r *http.Request) {
 	// against the exact declared dimension and canonicalized to '[c1,c2,...]'.
 	// Validation failures (wrong dimension, non-numeric component) are 400 —
 	// they surface here, before any SQL, so they never become a 500.
+	//
+	// CONTRACT-23 T2: on an installation without the vector capability the field
+	// is REFUSED before anything else looks at it — there is no column to write
+	// it to, and ignoring it would return a success for a write that stored
+	// nothing.
+	if h.refuseEmbeddingIfDisabled(w, req.Embedding) {
+		return
+	}
 	embCanonical, embPresent, _, err := validateEmbedding(req.Embedding, schema.EmbeddingDimension)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -188,6 +196,13 @@ func (h *handlers) handleUpdateArticle(w http.ResponseWriter, r *http.Request) {
 	// explicit null clears it to NULL; a present array is validated against
 	// the exact declared dimension and canonicalized. Validation failures are
 	// 400, surfaced before any SQL — never 500, never silent.
+	//
+	// CONTRACT-23 T2: refused outright when the installation has no vector
+	// capability, including the explicit-null "clear it" form — see
+	// refuseEmbeddingIfDisabled.
+	if h.refuseEmbeddingIfDisabled(w, req.Embedding) {
+		return
+	}
 	embCanonical, embPresent, embIsNull, err := validateEmbedding(req.Embedding, schema.EmbeddingDimension)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -513,7 +528,14 @@ func articleFromRow(row compat.Row) (article, error) {
 		CreatedAt:   dual.RowText(row, "created_at"),
 		UpdatedAt:   dual.RowText(row, "updated_at"),
 	}
-	if !dual.RowIsNull(row, "embedding") {
+	// CONTRACT-23: on an installation without the vector capability the routine
+	// does not DECLARE the column, so the row does not carry it. That is tested
+	// explicitly rather than left to the zero value of a missing map entry: a
+	// column that is absent from the result and one that is present and NULL are
+	// different facts, and only the second is a nullable embedding. Reads simply
+	// omit the field (it is `omitempty`), which is what the contract asks for —
+	// the refusal is on the WRITE side, where a caller stated an intention.
+	if _, declared := row["embedding"]; declared && !dual.RowIsNull(row, "embedding") {
 		if text := dual.RowText(row, "embedding"); text != "" {
 			components, err := ParseVector(text)
 			if err != nil {

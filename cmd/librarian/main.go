@@ -70,19 +70,24 @@ func run() error {
 	defer db.Close()
 
 	ctx := context.Background()
-	if err := store.EnsureSchema(ctx, db); err != nil {
+	// CONTRACT-23: the DECLARED capabilities are handed to EnsureSchemaFor, which
+	// checks them against the physical tables before it applies anything — on an
+	// installation that already exists, a changed declaration stops the service
+	// instead of quietly serving a schema its own database does not have.
+	if err := store.EnsureSchemaFor(ctx, db, cfg.Capabilities); err != nil {
 		return err
 	}
 	if err := store.SeedCatalogs(ctx, db); err != nil {
 		return err
 	}
 
-	mux, err := server.NewMux(server.Deps{Store: db, JWTSecret: cfg.JWTSecret})
+	mux, err := server.NewMux(server.Deps{Store: db, JWTSecret: cfg.JWTSecret, Capabilities: cfg.Capabilities})
 	if err != nil {
 		return err
 	}
 
-	log.Printf("librarian: schema ready on %s (%s), listening on %s", redactDSN(cfg.DSN), cfg.Engine, cfg.Addr)
+	log.Printf("librarian: schema ready on %s (%s, vector %s), listening on %s",
+		redactDSN(cfg.DSN), cfg.Engine, cfg.Capabilities.Describe(), cfg.Addr)
 	srv := &http.Server{Addr: cfg.Addr, Handler: mux}
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
@@ -158,11 +163,28 @@ func dumpSchema(args []string, dumpPath string) error {
 	}
 	defer db.Close()
 
-	defs, err := store.LoadDefinitions(context.Background(), db)
+	ctx := context.Background()
+	defs, err := store.LoadDefinitions(ctx, db)
 	if err != nil {
 		return fmt.Errorf("read dynamic content type definitions from %q: %w", redactDSN(dsn), err)
 	}
-	data, err := schema.JSONWith(defs)
+	// CONTRACT-23 T4: the dump REFLECTS this installation's choice, and it takes
+	// it from the same place everything else does — the physical tables when the
+	// installation exists, the declaration only when it does not. That ordering
+	// matters here more than anywhere else: this artifact is the schema_ref
+	// `compat copy` exports through, so a dump declaring a vector(1536) column
+	// that the source does not have would create it on the DESTINATION and hand
+	// the pgvector requirement to the very installation that exists to avoid it.
+	caps, installed, err := store.InstalledCapabilities(ctx, db)
+	if err != nil {
+		return fmt.Errorf("read the capabilities of %q: %w", redactDSN(dsn), err)
+	}
+	if !installed {
+		if caps, err = config.ResolveCapabilities(); err != nil {
+			return err
+		}
+	}
+	data, err := schema.JSONWithFor(caps, defs)
 	if err != nil {
 		return fmt.Errorf("marshal schema: %w", err)
 	}
@@ -256,8 +278,17 @@ func bootstrapCommand(args []string, in io.Reader, out io.Writer) error {
 	}
 	defer db.Close()
 
+	// CONTRACT-23: the bootstrap applies the schema, so it makes the SAME choice
+	// the server does, from the same variable. A bootstrap that created the
+	// tables with a different capability set than the server declares would make
+	// the very first boot fail the coherence guard.
+	caps, err := config.ResolveCapabilities()
+	if err != nil {
+		return err
+	}
+
 	ctx := context.Background()
-	if err := store.EnsureSchema(ctx, db); err != nil {
+	if err := store.EnsureSchemaFor(ctx, db, caps); err != nil {
 		return err
 	}
 	if err := store.SeedCatalogs(ctx, db); err != nil {

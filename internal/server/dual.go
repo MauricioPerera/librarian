@@ -165,7 +165,21 @@ func (h *handlers) queryOne(ctx context.Context, routine string, args map[string
 // The schema is a pure function of the code (serverSchema below), so no database
 // round trip is needed to know it.
 func (h *handlers) queryRoutine(ctx context.Context, routine string, args map[string]compat.Value) ([]compat.Row, error) {
-	return h.store.QueryRoutine(ctx, serverSchema, routine, args)
+	return h.store.QueryRoutine(ctx, h.codeSchema(), routine, args)
+}
+
+// codeSchema is the canonical code schema THIS INSTALLATION's routines are
+// declared in (CONTRACT-23). It picks between two values built once at init
+// rather than composing per request: the choice is fixed for the life of the
+// process (it is fixed for the life of the INSTALLATION), and a routine's
+// declared columns are what compat compiles into the SELECT list, so an
+// installation without the vector capability must not read a column its
+// articles table does not have.
+func (h *handlers) codeSchema() compat.Schema {
+	if h.caps.VectorDisabled {
+		return serverSchemaNoVector
+	}
+	return serverSchema
 }
 
 // serverSchema is the canonical schema the code-defined routines are declared
@@ -175,3 +189,8 @@ func (h *handlers) queryRoutine(ctx context.Context, routine string, args map[st
 // own schema per request from the persisted definition (content.go), because
 // that is the only place the type's column set is known.
 var serverSchema = schema.Build()
+
+// serverSchemaNoVector is the same schema for an installation that did not
+// declare the vector capability. Built at init like its sibling: both are pure
+// functions of the code, so there is nothing to defer.
+var serverSchemaNoVector = schema.BuildFor(schema.Capabilities{VectorDisabled: true})

@@ -527,7 +527,21 @@ func bootstrapTable() compat.Table {
 // exists to remove: EnsureSchema would erase the dynamic tables from the
 // __compat_schema metadata on every restart, and --dump-schema would hand
 // `compat copy` a schema that silently omits those tables AND their data.
+//
+// CONTRACT-23 T1: Build() is BuildFor(Capabilities{}) — the code schema with
+// every optional capability ENABLED, which is the shape every installation
+// deployed before this contract has. It keeps its parameterless spelling on
+// purpose: it is what internal/auth, the schema tests and the export fixtures
+// mean, and none of them is affected by the choice.
 func Build() compat.Schema {
+	return BuildFor(Capabilities{})
+}
+
+// BuildFor returns the CODE half of the canonical schema for a declared set of
+// capabilities. The ONLY thing caps changes today is articles.embedding (and the
+// routines that read it) — see capabilities.go for why that column is what makes
+// pgvector a hard requirement of an installation that may never use it.
+func BuildFor(caps Capabilities) compat.Schema {
 	return compat.Schema{
 		Tables: []compat.Table{
 			usersTable(),
@@ -541,12 +555,12 @@ func Build() compat.Schema {
 			// more own column via ContentType (its signature is unchanged — adding
 			// a column is adding a compat.Column, not a new parameter). It is
 			// nullable: an article with no embedding yet is valid.
-			ContentType("articles", []compat.Column{
-				textColumn("title", false),
-				textColumn("body", false),
-				timestampColumn("published_at", true),
-				vectorColumn("embedding", EmbeddingDimension, true),
-			}),
+			// CONTRACT-23 T1: the embedding column is appended only when the
+			// installation declares the vector capability. This is the single
+			// declaration site of the ONLY vector(N) column in the schema, so
+			// omitting it here is what removes the pgvector requirement — and it
+			// is why the choice belongs to the schema and not to the API layer.
+			ContentType("articles", articleOwnColumns(caps)),
 			// CONTRACT-11 T1: a SECOND content type, built through the SAME
 			// ContentType helper, with own columns beyond title/body (a decimal
 			// price and a unique sku). products has no published_at / publish
@@ -585,6 +599,23 @@ func Build() compat.Schema {
 		// separately prefixed, so each contract's objects stay legible; they are
 		// one schema because there is only one canonical schema.
 		Views:    append(authViews(), serverViews()...),
-		Routines: append(authRoutines(), serverRoutines()...),
+		Routines: append(authRoutines(), serverRoutines(caps)...),
 	}
+}
+
+// articleOwnColumns returns the own (non-common) columns of the articles content
+// type. CONTRACT-05 declared embedding as one more own column via ContentType
+// (whose signature is unchanged — adding a column is adding a compat.Column, not
+// a new parameter); CONTRACT-23 makes that one column conditional. It is
+// nullable either way: an article with no embedding yet is valid.
+func articleOwnColumns(caps Capabilities) []compat.Column {
+	own := []compat.Column{
+		textColumn("title", false),
+		textColumn("body", false),
+		timestampColumn("published_at", true),
+	}
+	if caps.Vector() {
+		own = append(own, vectorColumn("embedding", EmbeddingDimension, true))
+	}
+	return own
 }

@@ -154,12 +154,34 @@ func LoadDefinitions(ctx context.Context, store *compat.Store) ([]schema.Content
 // content-type definition. It is the single answer to "what is this instance's
 // schema?", and it is what every one of the three former schema.Build() call
 // sites now uses.
+// CONTRACT-23: on an installation that already exists, the capabilities are NOT
+// a matter of opinion — they are read back from the physical tables
+// (InstalledCapabilities), which is what makes it impossible for a caller that
+// does not know the declaration to compose a schema that contradicts the
+// database. A database that has not been created yet has made no choice, so the
+// default (every capability enabled) applies; the only caller that reaches this
+// function on an empty database is a test, because the startup path composes
+// through CanonicalSchemaFor with the declaration it just validated.
 func CanonicalSchema(ctx context.Context, store *compat.Store) (compat.Schema, error) {
+	caps, installed, err := InstalledCapabilities(ctx, store)
+	if err != nil {
+		return compat.Schema{}, err
+	}
+	if !installed {
+		caps = schema.Capabilities{}
+	}
+	return CanonicalSchemaFor(ctx, store, caps)
+}
+
+// CanonicalSchemaFor is CanonicalSchema for a DECLARED set of capabilities. It
+// is what the startup path uses, because on a database that does not exist yet
+// the declaration is the only source there is.
+func CanonicalSchemaFor(ctx context.Context, store *compat.Store, caps schema.Capabilities) (compat.Schema, error) {
 	defs, err := LoadDefinitions(ctx, store)
 	if err != nil {
 		return compat.Schema{}, fmt.Errorf("load dynamic content type definitions: %w", err)
 	}
-	full, err := schema.BuildWith(defs)
+	full, err := schema.BuildWithFor(caps, defs)
 	if err != nil {
 		return compat.Schema{}, fmt.Errorf("compose canonical schema: %w", err)
 	}
@@ -248,7 +270,16 @@ func CreateContentType(ctx context.Context, store *compat.Store, def schema.Cont
 			return ErrDuplicateContentType
 		}
 	}
-	want, err := schema.BuildWith(append(append([]schema.ContentTypeDefinition{}, existing...), def))
+	// CONTRACT-23: composed for the capabilities this installation was CREATED
+	// with, read from the physical table — not for the default. This write ends
+	// with writeFullSchemaMetadata, so composing it with the wrong capabilities
+	// would record a __compat_schema row describing a column the articles table
+	// does not have, on an installation that never asked for one.
+	caps, err := installedCapabilitiesOrDefault(ctx, store)
+	if err != nil {
+		return err
+	}
+	want, err := schema.BuildWithFor(caps, append(append([]schema.ContentTypeDefinition{}, existing...), def))
 	if err != nil {
 		return err
 	}

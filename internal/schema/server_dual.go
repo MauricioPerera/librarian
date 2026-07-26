@@ -270,17 +270,26 @@ func assignedTermColumns(contentColumn string) []compat.RoutineResultColumn {
 // declared as vector(EmbeddingDimension), which is what makes the value arrive
 // canonicalized ('[c1,c2,...]', no spaces) regardless of whether it came out of
 // SQLite's TEXT carrier or PostgreSQL's native pgvector column.
-func articleColumns() []compat.RoutineResultColumn {
-	return []compat.RoutineResultColumn{
+//
+// CONTRACT-23 T1: it is declared only when the installation declares the vector
+// capability. A routine's result columns are what compat COMPILES into the
+// SELECT list, so declaring a column the table does not have is not a cosmetic
+// mismatch — it is a statement that fails on every read.
+func articleColumns(caps Capabilities) []compat.RoutineResultColumn {
+	columns := []compat.RoutineResultColumn{
 		authResult("id", serverUUID),
 		authResult("author_id", serverUUID),
 		authResult("title", serverText),
 		authResult("body", serverText),
 		authResult("published_at", serverTimestamp),
-		authResult("embedding", serverVector),
+	}
+	if caps.Vector() {
+		columns = append(columns, authResult("embedding", serverVector))
+	}
+	return append(columns,
 		authResult("created_at", serverTimestamp),
 		authResult("updated_at", serverTimestamp),
-	}
+	)
 }
 
 // productColumns is the declared output of a products read. price is declared
@@ -303,8 +312,8 @@ func productColumns() []compat.RoutineResultColumn {
 // CODE-defined part of the schema. The routines over DYNAMIC content types are
 // generated per type in dynamicContentRoutines (dynamic.go's BuildWith), because
 // their column set is only known at runtime.
-func serverRoutines() []compat.Routine {
-	return []compat.Routine{
+func serverRoutines(caps Capabilities) []compat.Routine {
+	routines := []compat.Routine{
 		// --- authz.go -------------------------------------------------------
 		// The API-key branch: one role id, its permission names. The JWT branch
 		// filters by a VARIABLE-size list of role names and therefore cannot be a
@@ -405,9 +414,9 @@ func serverRoutines() []compat.Routine {
 			[]compat.RoutineResultColumn{authResult("id", serverUUID)}),
 
 		// --- articles.go ----------------------------------------------------
-		serverListPaged(RoutineListArticles, "articles", articleColumns(),
+		serverListPaged(RoutineListArticles, "articles", articleColumns(caps),
 			[]compat.RoutineOrdering{serverOrderDesc("created_at"), serverOrder("id")}),
-		serverReadByID(RoutineArticleByID, "articles", "id", "article_id", articleColumns()),
+		serverReadByID(RoutineArticleByID, "articles", "id", "article_id", articleColumns(caps)),
 		// A dedicated existence probe rather than reusing the by-id read: the
 		// full read drags a 1536-component vector across the wire, and this
 		// runs before every update/publish.
@@ -415,9 +424,17 @@ func serverRoutines() []compat.Routine {
 			[]compat.RoutineResultColumn{authResult("id", serverUUID)}),
 		serverReadByID(RoutineArticlePublishedAt, "articles", "id", "article_id",
 			[]compat.RoutineResultColumn{authResult("published_at", serverTimestamp)}),
-		serverReadByID(RoutineArticleEmbeddingOnly, "articles", "id", "article_id",
-			[]compat.RoutineResultColumn{authResult("embedding", serverVector)}),
 	}
+	// CONTRACT-23 T1: the embedding-only read exists ONLY as a read of the
+	// vector column, so an installation without the capability has nothing for it
+	// to select. It is appended rather than declared inline so the order of every
+	// pre-existing routine is untouched when the capability is on.
+	if caps.Vector() {
+		routines = append(routines,
+			serverReadByID(RoutineArticleEmbeddingOnly, "articles", "id", "article_id",
+				[]compat.RoutineResultColumn{authResult("embedding", serverVector)}))
+	}
+	return routines
 }
 
 // --- dynamic content types -------------------------------------------------------

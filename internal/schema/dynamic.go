@@ -184,8 +184,21 @@ func DynamicTable(d ContentTypeDefinition) (compat.Table, error) {
 // An invalid definition (which can only happen if the registry rows were
 // tampered with outside the API) is a hard error: composing a schema that
 // silently drops a persisted type is the one outcome this contract forbids.
+// CONTRACT-23 T1: BuildWith is BuildWithFor(Capabilities{}, defs) — every
+// optional capability enabled, the schema of every installation deployed before
+// this contract. Only the callers that KNOW this installation's declaration (the
+// startup path, the --dump-schema path and the content-type writers, which read
+// it back from the physical table) use BuildWithFor.
 func BuildWith(defs []ContentTypeDefinition) (compat.Schema, error) {
-	full := Build()
+	return BuildWithFor(Capabilities{}, defs)
+}
+
+// BuildWithFor is BuildWith for a declared set of capabilities. The dynamic half
+// is unaffected by caps: a dynamic content type has no vector field (the field
+// types are text/integer/decimal/boolean/date — see FieldType), so the choice
+// only ever changes the code half.
+func BuildWithFor(caps Capabilities, defs []ContentTypeDefinition) (compat.Schema, error) {
+	full := BuildFor(caps)
 	sorted := make([]ContentTypeDefinition, len(defs))
 	copy(sorted, defs)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Name < sorted[j].Name })

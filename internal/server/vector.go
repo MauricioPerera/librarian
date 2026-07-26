@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 )
@@ -73,6 +74,40 @@ func ParseVector(text string) ([]float64, error) {
 		out[i] = f
 	}
 	return out, nil
+}
+
+// embeddingRefusedMessage explains why a request carrying `embedding` is refused
+// on an installation that did not declare the vector capability (CONTRACT-23
+// T2).
+//
+// IT IS REFUSED, NOT IGNORED, and that is the whole of T2. Accepting a field and
+// discarding it is the silent degradation this project does not do: the client
+// would receive a 201/200 for a write that stored nothing, and would discover it
+// only when reading the value back — if it ever read it back. The message names
+// the three things the caller needs: what is missing (the column), why (the
+// installation was created without the capability), and that it cannot be turned
+// on for this installation.
+const embeddingRefusedMessage = "this installation does not have the vector capability: its articles table has no embedding column, so an embedding cannot be stored. " +
+	"The field is refused rather than ignored, because accepting it and discarding it would report a success that stored nothing. " +
+	"The choice is made when the installation is created (LIBRARIAN_VECTOR) and is irreversible; a new installation with the capability enabled is the only way to store embeddings"
+
+// refuseEmbeddingIfDisabled answers 400 with the explanation above when the
+// request carries an `embedding` field and this installation has no vector
+// capability. It returns true when it wrote the response, i.e. when the caller
+// must stop.
+//
+// It refuses ANY present value, INCLUDING an explicit JSON null. A null means
+// "clear the embedding", which is a statement about a column that does not
+// exist; answering 200 to it would be exactly the same silent lie as accepting
+// an array. An ABSENT field is not a statement about the embedding at all, so it
+// is the only shape that passes — which is what keeps every existing client that
+// never used the capability working unchanged.
+func (h *handlers) refuseEmbeddingIfDisabled(w http.ResponseWriter, raw json.RawMessage) bool {
+	if h.caps.Vector() || len(raw) == 0 {
+		return false
+	}
+	writeError(w, http.StatusBadRequest, embeddingRefusedMessage)
+	return true
 }
 
 // validateEmbedding decodes an embedding JSON value (a json.RawMessage from the

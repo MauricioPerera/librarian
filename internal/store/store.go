@@ -98,14 +98,41 @@ func Open(engine compat.Engine, dsn string) (*compat.Store, error) {
 // SINGLE pass: composing first and applying once means the reduced metadata
 // compat writes inside ApplySchema is always overwritten with the full composed
 // schema before anything reads it again.
+// CONTRACT-23 T1: EnsureSchema is EnsureSchemaFor with every optional capability
+// ENABLED — the schema of every installation deployed before that contract, and
+// what every existing caller and test means. The startup path passes the
+// installation's declared capabilities through EnsureSchemaFor.
 func EnsureSchema(ctx context.Context, store *compat.Store) error {
+	return EnsureSchemaFor(ctx, store, schema.Capabilities{})
+}
+
+// EnsureSchemaFor is EnsureSchema for a DECLARED set of capabilities
+// (CONTRACT-23). Before it composes or applies anything it runs the COHERENCE
+// GUARD (T3): the declaration is compared against what the physical tables
+// actually have, and a disagreement stops the service instead of booting it onto
+// a schema that does not describe its own database.
+func EnsureSchemaFor(ctx context.Context, store *compat.Store, caps schema.Capabilities) error {
+	// CONTRACT-23 T3 runs FIRST, before requireVectorType and before anything is
+	// composed: a mismatch here means every later step would be operating on the
+	// wrong schema, and the operator must be told what is wrong rather than
+	// shown its downstream symptom.
+	if err := requireCoherentCapabilities(ctx, store, caps); err != nil {
+		return err
+	}
 	// CONTRACT-21 T2: the first real obstacle of a clean PostgreSQL install.
 	// It is checked BEFORE anything is composed or applied so the message is the
 	// first thing the operator sees, not a driver error buried in a CREATE TABLE.
-	if err := requireVectorType(ctx, store); err != nil {
-		return err
+	//
+	// CONTRACT-23: it is now conditional on the capability, and that single `if`
+	// is what closes hueco 5 — an installation that does not declare the vector
+	// capability has no vector(N) column to create, so it has no reason to demand
+	// the extension, and it can run on a managed PostgreSQL that does not offer it.
+	if caps.Vector() {
+		if err := requireVectorType(ctx, store); err != nil {
+			return err
+		}
 	}
-	want, err := CanonicalSchema(ctx, store)
+	want, err := CanonicalSchemaFor(ctx, store, caps)
 	if err != nil {
 		return err
 	}
@@ -185,6 +212,168 @@ func requireVectorType(ctx context.Context, store *compat.Store) error {
 			"Run `CREATE EXTENSION IF NOT EXISTS vector;` in the target database as a superuser, " +
 			"and if it is installed into a schema other than the one this connection uses, make that schema visible on the connection's search_path")
 }
+
+// --- CONTRACT-23: the capability of an INSTALLATION, read from the base -------
+
+// articlesTable / embeddingColumn name the one table and the one column the
+// vector capability adds. Spelled once so the probe, the guard and the schema
+// declaration cannot drift apart.
+const (
+	articlesTable   = "articles"
+	embeddingColumn = "embedding"
+)
+
+// InstalledCapabilities reports the capabilities THIS DATABASE WAS CREATED WITH,
+// read from the physical catalog. installed=false means the installation has not
+// made the choice yet (the articles table does not exist), which is the only
+// state in which a declaration is free to decide anything.
+//
+// IT ASKS THE BASE, NEVER THE METADATA. The obvious shortcut — read the
+// canonical schema back out of __compat_schema and look for the column — is
+// wrong for the reason this project has repeated since CONTRACT-13: that row is
+// a RECORD of what some process believed, written by the very code path whose
+// belief is in question, and EnsureSchema rewrites it on every boot. If a
+// mis-declared instance ever booted, the metadata would already agree with the
+// mistake while the table did not. The physical column is the only fact.
+//
+// It is the direct answer to the contract's first red-team question — what
+// happens to an installation that ALREADY exists with the column, which is every
+// installation today: it reports the capability as ENABLED, which matches the
+// default declaration, so nothing changes for any of them.
+func InstalledCapabilities(ctx context.Context, store *compat.Store) (caps schema.Capabilities, installed bool, err error) {
+	present, err := store.TableExists(ctx, articlesTable)
+	if err != nil {
+		return schema.Capabilities{}, false, fmt.Errorf("probe for the %s table: %w", articlesTable, err)
+	}
+	if !present {
+		return schema.Capabilities{}, false, nil
+	}
+	hasColumn, err := columnExists(ctx, store, articlesTable, embeddingColumn)
+	if err != nil {
+		return schema.Capabilities{}, false, err
+	}
+	return schema.Capabilities{VectorDisabled: !hasColumn}, true, nil
+}
+
+// installedCapabilitiesOrDefault is InstalledCapabilities for the callers that
+// only ever run against an already-created installation (the content-type
+// writers): a database with no articles table has made no choice, so the default
+// applies and the composition is the one every pre-CONTRACT-23 caller produced.
+func installedCapabilitiesOrDefault(ctx context.Context, store *compat.Store) (schema.Capabilities, error) {
+	caps, installed, err := InstalledCapabilities(ctx, store)
+	if err != nil {
+		return schema.Capabilities{}, err
+	}
+	if !installed {
+		return schema.Capabilities{}, nil
+	}
+	return caps, nil
+}
+
+// columnExists reports whether a physical table has a physical column, asking
+// each engine's own catalog.
+//
+// This is the one place in librarian that branches on the engine to READ, and it
+// does so for the same reason store.go owns requireVectorType: a catalog is not
+// portable (SQLite has no information_schema; PostgreSQL has no PRAGMA), compat
+// exposes TableExists but no column-level equivalent, and this contract does not
+// touch compat. On PostgreSQL the lookup is restricted to current_schema(),
+// which is exactly where this code's unqualified CREATE TABLE lands — the same
+// scoping compat.TableExists uses, so the two probes answer about one table.
+func columnExists(ctx context.Context, store *compat.Store, table, column string) (bool, error) {
+	switch store.Target.Engine {
+	case compat.Postgres:
+		var present bool
+		err := store.DB.QueryRowContext(ctx,
+			`SELECT EXISTS (SELECT 1 FROM information_schema.columns
+			   WHERE table_schema = current_schema() AND table_name = $1 AND column_name = $2)`,
+			table, column).Scan(&present)
+		if err != nil {
+			return false, fmt.Errorf("inspect the columns of %s: %w", table, err)
+		}
+		return present, nil
+	case compat.SQLite:
+		// PRAGMA table_info does not accept a bound parameter for its argument,
+		// so the name is quoted with the same rule compat uses for identifiers.
+		// Both names are compile-time constants of this package, never input.
+		rows, err := store.DB.QueryContext(ctx, `SELECT name FROM pragma_table_info(`+quoteLiteral(table)+`)`)
+		if err != nil {
+			return false, fmt.Errorf("inspect the columns of %s: %w", table, err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				return false, fmt.Errorf("inspect the columns of %s: %w", table, err)
+			}
+			if name == column {
+				return true, rows.Err()
+			}
+		}
+		return false, rows.Err()
+	default:
+		return false, fmt.Errorf("unsupported engine %q", store.Target.Engine)
+	}
+}
+
+// quoteLiteral renders a single-quoted SQL string literal (embedded quote
+// doubled), for the one argument that cannot be bound: the table name of
+// pragma_table_info. Its inputs are compile-time constants of this package.
+func quoteLiteral(text string) string {
+	return `'` + strings.ReplaceAll(text, `'`, `''`) + `'`
+}
+
+// requireCoherentCapabilities implements CONTRACT-23 T3: the service does not
+// start when the declared capabilities and the ones this installation was
+// CREATED with disagree.
+//
+// WHY IT CANNOT JUST APPLY THE NEW DECLARATION. EnsureSchema creates only
+// MISSING tables and never alters an existing one — a deliberate decision that
+// is what makes a restart safe. So on an installation whose `articles` table
+// already exists, changing this declaration changes NOTHING physical:
+//
+//   - enabling it later does not add the column, because `articles` is not
+//     missing;
+//   - disabling it later does not drop it, for the same reason.
+//
+// What WOULD change is the canonical schema the process believes it has. That
+// belief is not decorative: it is what compat compiles the read routines from,
+// what EnsureSchema writes into __compat_schema, and what `--dump-schema` hands
+// `compat copy` as the schema_ref of an export. A process running on a schema
+// that disagrees with its own tables breaks reads, writes and the export — not
+// at boot, where it would be found, but later and quietly. Refusing to start is
+// the only outcome that keeps the failure where it can be understood.
+func requireCoherentCapabilities(ctx context.Context, store *compat.Store, declared schema.Capabilities) error {
+	installed, exists, err := InstalledCapabilities(ctx, store)
+	if err != nil {
+		return err
+	}
+	if !exists || installed.Vector() == declared.Vector() {
+		return nil
+	}
+	if declared.Vector() {
+		return fmt.Errorf(
+			"this installation was created WITHOUT the vector capability (its %s table has no %q column) but the configuration now declares it ENABLED (%s=enabled): "+
+				"refusing to start. The choice is made at the first boot and is IRREVERSIBLE — the schema is applied by creating MISSING tables, never by altering an existing one, "+
+				"so enabling it now would NOT add the column; the service would run believing in a schema its own tables do not have, which breaks the export and the writes silently. "+
+				"Set %s=disabled to keep serving this installation, or create a NEW installation with the capability enabled and move the data into it with `compat copy`",
+			articlesTable, embeddingColumn, VectorVarName, VectorVarName)
+	}
+	return fmt.Errorf(
+		"this installation was created WITH the vector capability (its %s table has the %q column) but the configuration now declares it DISABLED (%s=disabled): "+
+			"refusing to start. The choice is made at the first boot and is IRREVERSIBLE — the schema is applied by creating MISSING tables, never by altering an existing one, "+
+			"so disabling it now would NOT drop the column; the service would run believing in a schema its own tables do not match, which breaks the export and the writes silently. "+
+			"Set %s=enabled to keep serving this installation, or create a NEW installation with the capability disabled and move the data into it with `compat copy`",
+		articlesTable, embeddingColumn, VectorVarName, VectorVarName)
+}
+
+// VectorVarName is the name of the environment variable that declares the vector
+// capability, quoted in the guard's message: an error about an irreversible
+// choice has to name the knob the operator actually turns. It is a literal
+// rather than config.VectorVar because internal/config is the ENVIRONMENT layer
+// and sits above this one; importing it downward to read a string constant would
+// invert the layering for no benefit. config_test asserts the two agree.
+const VectorVarName = "LIBRARIAN_VECTOR"
 
 // applyViews recreates every canonical view: DROP VIEW IF EXISTS followed by the
 // CREATE VIEW compat compiles for this engine, all in one transaction.

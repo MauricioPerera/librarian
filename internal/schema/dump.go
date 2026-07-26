@@ -21,7 +21,18 @@ import "encoding/json"
 // defs comes from store.LoadContentTypeDefinitions (or nil for a database that
 // provably has no dynamic types, i.e. one whose registry table does not exist).
 func JSONWith(defs []ContentTypeDefinition) ([]byte, error) {
-	full, err := BuildWith(defs)
+	return JSONWithFor(Capabilities{}, defs)
+}
+
+// JSONWithFor is JSONWith for a declared set of capabilities (CONTRACT-23 T4:
+// `--dump-schema` must REFLECT the choice). This matters beyond cosmetics: the
+// dump is the schema_ref `compat copy` consumes, so an installation without the
+// vector capability must not hand the export a schema declaring a column its
+// tables do not have — the destination would be created with a vector(1536)
+// column, and on PostgreSQL that reintroduces the pgvector requirement the
+// installation exists to avoid.
+func JSONWithFor(caps Capabilities, defs []ContentTypeDefinition) ([]byte, error) {
+	full, err := BuildWithFor(caps, defs)
 	if err != nil {
 		return nil, err
 	}

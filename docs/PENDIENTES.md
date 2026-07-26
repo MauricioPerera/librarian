@@ -14,7 +14,7 @@ vez. El estado va en el índice para no tener que leerlas para saberlo.
 | 2 | [Editar campos de un tipo dinámico](#2-editar-campos-de-un-tipo-de-contenido-dinámico-media) | **RESUELTO** (CONTRACT-18) |
 | 3 | [Colisión de nombre entre un CPT y una tabla de código](#3-colisión-de-nombre-entre-un-cpt-dinámico-y-una-tabla-de-código-futura-baja) | **RESUELTO** (CONTRACT-17) |
 | 4 | [Crear la primera identidad desde el producto](#4-no-hay-forma-de-crear-la-primera-identidad-desde-el-producto-media) | **RESUELTO** (CONTRACT-22) |
-| 5 | [`pgvector` obligatorio aunque no se usen vectores](#5-pgvector-es-obligatorio-aunque-no-se-usen-vectores-media) | Abierto (MEDIA) |
+| 5 | [`pgvector` obligatorio aunque no se usen vectores](#5-pgvector-es-obligatorio-aunque-no-se-usen-vectores-media) | **RESUELTO** (CONTRACT-23) |
 | 6 | [La migración sin ventana de corte nunca se ejercitó](#6-la-migración-sin-ventana-de-corte-nunca-se-ejercitó-media) | Abierto (MEDIA) |
 
 ## 1. No hay forma de otorgar permisos a un rol desde el producto (ALTA)
@@ -171,7 +171,19 @@ una comodidad.
 
 ## 5. `pgvector` es obligatorio aunque no se usen vectores (MEDIA)
 
-**Estado:** abierto, por diseño heredado.
+**Estado:** RESUELTO por CONTRACT-23 (`specs/CONTRACT-23-vector-opcional.md`,
+reporte en `docs/reports/CONTRACT-23-REPORT.md`). La capacidad vectorial se
+declara por instalación con `LIBRARIAN_VECTOR` (por defecto `enabled`, que es lo
+que toda instalación desplegada ya tiene): con `disabled`, `articles.embedding`
+no se declara, no hay ningún `vector(N)` en el esquema y la instalación **arranca
+y sirve sobre un PostgreSQL 17 sin `pgvector`** — verificado con el binario real
+contra un servidor donde la extensión ni siquiera se puede instalar. La elección
+es IRREVERSIBLE después del primer arranque (`EnsureSchema` nunca altera una
+tabla existente), así que cambiarla sobre una instalación ya creada **no
+arranca**: falla con un mensaje que explica qué pasó y qué se puede hacer, y la
+incoherencia se detecta contra la BASE (la columna física), nunca contra la
+metadata `__compat_schema`. Con la capacidad habilitada nada cambió. El texto de
+abajo se conserva como registro de cómo se descubrió el hueco.
 
 **Qué pasa:** `articles.embedding` es una columna `vector(1536)`, y aunque es
 **nullable** —una instancia puede no guardar jamás un embedding— la columna

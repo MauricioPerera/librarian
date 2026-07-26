@@ -350,7 +350,15 @@ func EditContentType(ctx context.Context, store *compat.Store, typeName string, 
 		}
 		want = append(want, d)
 	}
-	full, err := schema.BuildWith(want)
+	// CONTRACT-23: composed for the capabilities this installation was CREATED
+	// with (read from the physical table), for the same reason CreateContentType
+	// is — this operation rewrites __compat_schema, and a composition built from
+	// the default would put a column the articles table does not have into it.
+	caps, err := installedCapabilitiesOrDefault(ctx, store)
+	if err != nil {
+		return ContentTypeEdit{}, err
+	}
+	full, err := schema.BuildWithFor(caps, want)
 	if err != nil {
 		return ContentTypeEdit{}, err
 	}

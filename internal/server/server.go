@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/MauricioPerera/librarian/internal/auth"
+	"github.com/MauricioPerera/librarian/internal/schema"
 	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
 
@@ -34,6 +35,12 @@ import (
 type Deps struct {
 	Store     *compat.Store
 	JWTSecret string
+	// Capabilities is this installation's declared set of optional schema
+	// capabilities (CONTRACT-23). Its ZERO VALUE is "everything enabled", which
+	// is what every caller written before that contract means and what every
+	// deployed installation has, so an un-updated construction of Deps keeps
+	// today's behavior exactly.
+	Capabilities schema.Capabilities
 }
 
 // NewMux returns the librarian HTTP handler wired with the auth routes. It
@@ -54,6 +61,7 @@ func NewMux(deps Deps) (*http.ServeMux, error) {
 		store:     deps.Store,
 		jwtSecret: deps.JWTSecret,
 		now:       time.Now,
+		caps:      deps.Capabilities,
 	}
 	h.registerRoutes(mux)
 	return mux, nil
@@ -147,6 +155,12 @@ type handlers struct {
 	store     *compat.Store
 	jwtSecret string
 	now       func() time.Time
+	// caps is this installation's declared capability set (CONTRACT-23). Zero
+	// value = everything enabled, so a handlers built without it behaves exactly
+	// as it did before that contract. It decides two things and no others: which
+	// canonical schema the read routines are compiled from (codeSchema), and
+	// whether a request carrying an `embedding` field is accepted or refused.
+	caps schema.Capabilities
 	// schemaMu serializes the schema-MUTATING requests (CONTRACT-13: creating a
 	// dynamic content type). That operation reads which tables are missing and
 	// then creates one; two concurrent creations of different types could
