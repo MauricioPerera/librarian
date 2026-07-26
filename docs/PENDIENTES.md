@@ -17,7 +17,7 @@ vez. El estado va en el índice para no tener que leerlas para saberlo.
 | 5 | [`pgvector` obligatorio aunque no se usen vectores](#5-pgvector-es-obligatorio-aunque-no-se-usen-vectores-media) | **RESUELTO** (CONTRACT-23) |
 | 6 | [La migración sin ventana de corte nunca se ejercitó](#6-la-migración-sin-ventana-de-corte-nunca-se-ejercitó-media) | **RESUELTO** (ensayo 2026-07-25) |
 | 7 | [`/health` no mira la base, y una caída se ve como 401](#7-health-no-mira-la-base-y-una-caída-se-ve-como-401-alta) | **RESUELTO** (CONTRACT-24) |
-| 8 | [Las rutas de datos tardan ~21 s en fallar con la base caída](#8-las-rutas-de-datos-tardan-21-s-en-fallar-con-la-base-caída-media) | Abierto (MEDIA) |
+| 8 | [Un fallo de base da 500 en las rutas de datos y 503 en el resto](#8-un-fallo-de-base-da-500-en-las-rutas-de-datos-y-503-en-el-resto-baja) | Abierto (BAJA) |
 
 ## 1. No hay forma de otorgar permisos a un rol desde el producto (ALTA)
 
@@ -298,35 +298,45 @@ diseñarlo: la ruta de salud no debe quedar cara ni convertirse en una vía de
 carga contra la base, y no debe filtrar detalles de la conexión.
 
 
-## 8. Las rutas de datos tardan ~21 s en fallar con la base caída (MEDIA)
+## 8. Un fallo de base da 500 en las rutas de datos y 503 en el resto (BAJA)
 
 **Estado:** abierto.
 
-**Qué pasa:** `CONTRACT-24` le puso un límite de tiempo propio a la sonda de
-disponibilidad, así que `/ready` responde en ~2 s. Las **rutas de datos no
-tienen ese límite**: esperan lo que el driver decida. Medido con la base
-detenida y un token válido:
+**Qué pasa:** ante un fallo de base, `CONTRACT-24` devuelve `503` en el login y
+en `/ready`, pero las rutas de datos siguen devolviendo `500`. Las dos son 5xx
+—o sea que el contrato se cumple— pero significan cosas distintas para quien las
+recibe: `503` le dice a un balanceador "sacame de rotación y reintentá", `500`
+le dice "esto está roto". Ante la misma causa deberían decir lo mismo.
+
+**Qué haría falta:** que un error de conexión a la base se traduzca a `503`
+también en las rutas de datos. Ojo: hay que distinguirlo de un `500` legítimo
+(una fila corrupta, un fallo al firmar un token), que debe seguir siendo `500`.
+
+### Corrección de una entrada previa, y por qué vale registrarla
+
+Esta entrada decía originalmente que **las rutas de datos tardaban ~21 s en
+fallar** con la base caída, y estaba **mal**. Los 21 segundos eran un artefacto
+del banco de pruebas: el cliente corría en una máquina Windows y el PostgreSQL en
+el VPS, así que al detener el contenedor los paquetes iban a un puerto que el
+firewall descarta, y 21 s son los reintentos de SYN de Windows. No era el driver
+ni la aplicación.
+
+Medido después en la **topología real de producción**, donde la aplicación y la
+base comparten host y se hablan por `127.0.0.1`, con la base detenida de verdad:
 
 ```
-GET /content-types  ->  500  en 21,03 s
-POST /auth/login    ->  503  en 21,06 s
+/ready              -> 503 en 0,056 s
+POST /auth/login    -> 503 en 0,051 s
 ```
 
-**Por qué importa:** con la base caída, cada petición ocupa una goroutine y una
-ranura del pool durante ~21 s antes de rendirse. Bajo carga eso se acumula: el
-servicio pasa de "responde error rápido" a "no responde", que es un modo de
-fallo peor. Un cliente con reintentos lo empeora.
+Un puerto cerrado en localhost rechaza al instante; no hay reintentos que
+esperar. El problema descrito no existe en producción.
 
-**Cómo se descubrió (2026-07-26, verificando CONTRACT-24):** al medir el
-comportamiento con la base realmente detenida. Las primeras corridas parecían
-colgarse; eran los 21 s del driver superando el timeout del cliente.
+La lección operativa: **una medición de latencia hecha desde una topología
+distinta a la real mide la topología, no el sistema**. El número era correcto y
+la conclusión falsa.
 
-**Nota aparte, del mismo hallazgo:** las rutas de datos devuelven **500** ante
-un fallo de base, no 503. Es 5xx —o sea que cumple `CONTRACT-24`— pero 503 le
-dice a un balanceador "reintentá", y 500 le dice "esto está roto". Vale decidir
-si conviene unificarlo.
-
-**Qué haría falta:** un límite de tiempo por petición para las operaciones
-contra la base, de modo que el fallo sea rápido y explícito. Ojo al elegirlo: un
-límite corto de más convierte una base lenta pero sana en errores; hay que
-medirlo contra el comportamiento real, no elegirlo de memoria.
+Queda como observación menor, no como hueco: las rutas de datos **no tienen
+límite de tiempo propio**, así que una base *lenta pero viva* podría demorarlas
+sin techo. Eso no se midió porque no se reprodujo; anotarlo como problema sin
+evidencia sería repetir el error de arriba.
