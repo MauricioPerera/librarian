@@ -513,11 +513,15 @@ func DynamicSearchRoutine(def ContentTypeDefinition) string {
 // option would fail to find it.
 //
 // IT MUST BE OF TYPE text, and that is not squeamishness either. The filter
-// compiles to LIKE/ILIKE, and PostgreSQL has no LIKE operator for integer,
-// numeric, boolean or date — `ERROR: operator does not exist: integer ~~ unknown`
-// — while SQLite would happily coerce and answer something. Declaring the
-// routine for such a type would therefore produce a routine that works on one
-// engine and fails on the other: the precise divergence this project forbids.
+// compiles to instr (SQLite) / strpos (PostgreSQL), and strpos REFUSES a
+// non-text argument while instr happily coerces one and answers something.
+// Declaring the routine for such a type would therefore produce a routine that
+// works on one engine and fails on the other: the precise divergence this
+// project forbids. (Before CONTRACT-33 the filter was `like`, and the same
+// restriction held for a different reason — PostgreSQL has no LIKE operator for
+// integer: `ERROR: operator does not exist: integer ~~ unknown`. compat v0.7.0
+// now type-checks the `contains` operands itself, so this gate agrees with a
+// rule the compiler also enforces instead of being the only thing standing.)
 // A type whose first field is not text (or that declares no field at all, which
 // is legal) simply gets no search routine, and the panel says so instead of
 // offering a control that cannot work.
@@ -550,19 +554,29 @@ func dynamicContentRoutines(def ContentTypeDefinition) ([]compat.Routine, error)
 	// established. This routine reads a bounded page instead, so the cost of a
 	// search does not grow with the target table.
 	//
-	// The price of that choice is that `like` compiles to LIKE on SQLite and
-	// ILIKE on PostgreSQL, whose case folding genuinely differs (measured: see
-	// the contract report). That divergence is neutralised on the CALLER's side —
-	// the pattern it binds is built so both engines answer the same set, and the
-	// exact matching is redone in Go. Nothing about that repair belongs here: this
-	// declaration only says WHICH column is filtered, WITH what parameter, in
-	// WHICH order, and that the order is total so the page is the same page on
-	// both engines.
+	// CONTRACT-33 — THE OPERATOR IS `contains`, NOT `like`, AND THAT IS FORCED.
+	// compat v0.7.0 REFUSES `like` in a routine WHERE: it compiled to LIKE on
+	// SQLite and ILIKE on PostgreSQL, whose case folding genuinely differs, so the
+	// same pattern selected different rows per engine. `contains` compiles to
+	// instr/strpos: a plain substring test, CASE-SENSITIVE, with NO wildcards and
+	// no escape character, identical on both engines by construction.
+	//
+	// The parameter is therefore a NEEDLE, not a pattern: the caller binds the
+	// text as typed, with no %…% around it and no metacharacter substitution.
+	// Anything it did to a pattern before is now not just unnecessary but wrong —
+	// a `%` here is a percent sign.
+	//
+	// The cost of the swap is stated where it is paid, not here: the search became
+	// case-sensitive, because the database can no longer fold and folding in Go
+	// would mean reading rows the WHERE already discarded. See
+	// internal/server/ui_content.go and docs/PENDIENTES.md. This declaration only
+	// says WHICH column is filtered, WITH what parameter, in WHICH order, and that
+	// the order is total so the page is the same page on both engines.
 	if field, ok := DynamicSearchField(def); ok {
 		routines = append(routines, compat.Routine{
 			Name: DynamicSearchRoutine(def),
 			Parameters: []compat.RoutineParameter{
-				authParameter("search_pattern", serverText),
+				authParameter("search_text", serverText),
 				authParameter("page_limit", serverInteger),
 				authParameter("page_offset", serverInteger),
 			},
@@ -570,8 +584,8 @@ func dynamicContentRoutines(def ContentTypeDefinition) ([]compat.Routine, error)
 				Kind:     "select",
 				Relation: table,
 				Columns:  columns,
-				Where: ptrExpr(compat.Expression{Kind: "like", Args: []compat.Expression{
-					authColumn(field.Name), authParam("search_pattern"),
+				Where: ptrExpr(compat.Expression{Kind: "contains", Args: []compat.Expression{
+					authColumn(field.Name), authParam("search_text"),
 				}}),
 				// The SAME total order the list routine declares, so "the N most
 				// recent that match" is the same notion of recent the unfiltered

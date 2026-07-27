@@ -49,6 +49,16 @@
            hx-include="#reference-select-{{.Name}}"
            hx-target="#reference-options-{{.Name}}"
            hx-swap="outerHTML">
+    {{/* CONTRACT-33 — el aviso va ACÁ, pegado a la caja donde se escribe, y no
+         adentro del bloque de opciones: el fragmento htmx reemplaza solo las
+         opciones, así que un aviso puesto ahí desaparecería justo cuando la
+         persona está buscando. Acá queda fijo mientras dura el formulario.
+
+         Y hay que decirlo: la búsqueda pasó a distinguir mayúsculas porque el
+         operador portable (`contains`) no pliega — plegar Unicode devuelve
+         conjuntos distintos según el motor. Un buscador que parece insensible y
+         no lo es hace que uno concluya que la fila no existe. */}}
+    <span class="muted" id="reference-search-case-{{.Name}}">Distingue mayúsculas y minúsculas: «borges» no encuentra «BORGES». Escribilo tal cual figura.</span>
     {{end}}
     {{template "content_reference_options" .}}
   </label>

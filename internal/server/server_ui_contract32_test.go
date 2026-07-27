@@ -112,6 +112,11 @@ func TestSearchReachesARowBeyondTheCap(t *testing.T) {
 	if len(values) != 2 || values[0] != "" || values[1] != oldestID {
 		t.Fatalf("the search offers %v, want the empty option plus %q", values, oldestID)
 	}
+	// CONTRACT-33 T4 asks for this proof WITH THE EXACT BOX, so the box is printed
+	// rather than described: what an admin gets back after typing the name of a row
+	// the offered page had already cut off.
+	t.Logf("THE EXACT BOX the search returns for %q (the row is beyond the cap of %d):\n%s",
+		"Sarmiento", 100, strings.TrimSpace(fragment))
 
 	// And picking it actually stores it: the search is a way to REACH the row,
 	// not a separate write path.
@@ -346,9 +351,14 @@ func TestSearchIsNotAValidation(t *testing.T) {
 }
 
 // TestSearchWildcardsAreNotWildcards is the red-team question about `%` and `_`:
-// a person typing them means those characters, not "match anything". The bound
-// pattern deliberately widens them (see referenceSearchPattern), so the proof
-// that it does not leak is that the RESULT is still exact.
+// a person typing them means those characters, not "match anything".
+//
+// CONTRACT-33 made this cheaper to guarantee, not harder. Under `like` the bound
+// pattern had to widen a typed `%` into `_` so it could not match everything, and
+// this test proved the widening did not leak. `contains` has NO wildcards and NO
+// escape character, so `%`, `_` and `\` are three ordinary characters that go
+// into the bound needle exactly as typed. The assertions are unchanged on
+// purpose: the same questions, answered by a simpler mechanism.
 func TestSearchWildcardsAreNotWildcards(t *testing.T) {
 	db, srv, cleanup := openUITLS(t)
 	defer cleanup()
@@ -399,11 +409,26 @@ func htmlEscapeForTest(s string) string {
 	return r.Replace(s)
 }
 
-// TestSearchIsCaseInsensitiveIncludingAccents pins the behaviour the dual-engine
-// battery then proves is the SAME on PostgreSQL: `ñandú` finds `ÑANDÚ`. On
-// SQLite the raw LIKE would not (measured), so this is the Go matcher doing its
-// job, not the database's.
-func TestSearchIsCaseInsensitiveIncludingAccents(t *testing.T) {
+// TestSearchIsCaseSensitiveIncludingAccents is the REWRITTEN twin of
+// TestSearchIsCaseInsensitiveIncludingAccents, and it is rewritten rather than
+// deleted on purpose: a test dropped during a migration is a property that stops
+// being true with nobody recording that it did.
+//
+// WHAT IT USED TO ASSERT (CONTRACT-32): `ñandú` finds `ÑANDÚ`. The `like` WHERE
+// folded at least ASCII on both engines, so the true matches always reached Go
+// and referenceSearchMatches — case-insensitive over the whole Unicode range —
+// could level the two engines UP to the better behaviour.
+//
+// WHAT IT ASSERTS NOW (CONTRACT-33): `ñandú` does NOT find `ÑANDÚ`. compat v0.7.0
+// refuses `like`, and the portable replacement `contains` compiles to
+// instr/strpos, which do not fold. The row is discarded by the WHERE, so Go never
+// sees it and no amount of folding in Go can bring it back. The regression is
+// real and visible in the panel; it is registered as a gap in docs/PENDIENTES.md
+// with its way out, and the form states it next to the search box.
+//
+// The accented cases are kept exactly because that is where the old divergence
+// lived: what changed is the ANSWER, not the questions asked.
+func TestSearchIsCaseSensitiveIncludingAccents(t *testing.T) {
 	db, srv, cleanup := openUITLS(t)
 	defer cleanup()
 	grant(t, db, "editor", "content_types.manage", "content.create")
@@ -420,10 +445,17 @@ func TestSearchIsCaseInsensitiveIncludingAccents(t *testing.T) {
 		want  []string
 		deny  []string
 	}{
-		{"ñandú", []string{"ÑANDÚ", "ñandú menor"}, []string{"Ábaco", "abaco sin tilde"}},
-		{"ÑANDÚ", []string{"ÑANDÚ", "ñandú menor"}, []string{"Ábaco"}},
-		{"ábaco", []string{"Ábaco"}, []string{"abaco sin tilde", "ÑANDÚ"}},
+		// The case barrier, in both directions. Each query finds the row spelled
+		// its way and NOT the one spelled the other way.
+		{"ñandú", []string{"ñandú menor"}, []string{"ÑANDÚ", "Ábaco", "abaco sin tilde"}},
+		{"ÑANDÚ", []string{"ÑANDÚ"}, []string{"ñandú menor", "Ábaco"}},
+		{"Ábaco", []string{"Ábaco"}, []string{"abaco sin tilde", "ÑANDÚ"}},
 		{"abaco", []string{"abaco sin tilde"}, []string{"Ábaco", "ÑANDÚ"}},
+		// And the accent itself is NOT the barrier: `baco` — a pure-ASCII needle
+		// whose match runs right after a non-ASCII letter — finds both rows. So
+		// what `contains` lost is case folding specifically, not the ability to
+		// match text with accents in it.
+		{"baco", []string{"Ábaco", "abaco sin tilde"}, []string{"ÑANDÚ", "ñandú menor"}},
 	}
 	for _, c := range cases {
 		status, fragment := uiSearchReference(t, client, srv, "libros", "autor", c.query, "")
@@ -440,6 +472,24 @@ func TestSearchIsCaseInsensitiveIncludingAccents(t *testing.T) {
 				t.Errorf("search %q wrongly offers %q: %.500q", c.query, deny, fragment)
 			}
 		}
+	}
+
+	// THE REGRESSION, ASSERTED AS A WHOLE and not only as an absent label: a query
+	// that differs from the row ONLY in case answers «ninguna coincide». That is
+	// exactly what the admin sees, and it is why the form has to say the search
+	// distinguishes case — otherwise this message reads as "that row is not here".
+	_, fragment := uiSearchReference(t, client, srv, "libros", "autor", "ábaco", "")
+	if !strings.Contains(fragment, `id="reference-no-matches-autor"`) {
+		t.Errorf("searching «ábaco» against the row «Ábaco» found something — case folding came back without the docs: %.500q", fragment)
+	}
+
+	// And the form WARNS about it, where the searching happens.
+	_, page := getBody(t, client, srv.URL+"/admin/content/libros/new")
+	if !strings.Contains(page, `id="reference-search-case-autor"`) {
+		t.Fatalf("the form does not warn that the search distinguishes case: %.1200q", page)
+	}
+	if !strings.Contains(page, "Distingue mayúsculas") {
+		t.Errorf("the warning does not say what it warns about: %.1200q", page)
 	}
 }
 

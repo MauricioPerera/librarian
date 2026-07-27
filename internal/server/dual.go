@@ -137,9 +137,9 @@ func integerValue(v int) compat.Value {
 }
 
 // textValue builds a canonical text routine argument. Its only caller is the
-// CONTRACT-32 search, whose LIKE pattern is a bound value like any other — the
-// point of it having a constructor at all is that the pattern can never be
-// mistaken for a fragment of SQL.
+// CONTRACT-32/33 search, whose `contains` needle is a bound value like any
+// other — the point of it having a constructor at all is that the text a person
+// typed can never be mistaken for a fragment of SQL.
 func textValue(v string) compat.Value {
 	return compat.Value{Kind: compat.TextValue, Value: v}
 }

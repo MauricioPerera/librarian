@@ -108,11 +108,31 @@ package server
 //     ONCE for both the page and the fragment.
 //   - THE FILTER RUNS IN THE DATABASE, so the search reaches rows the page never
 //     read, and its cost stays a constant instead of growing with the target
-//     table. compat compiles `like` to LIKE on SQLite and ILIKE on PostgreSQL,
-//     whose case folding and escape character genuinely differ (measured), so
-//     what is bound is a deliberately COARSE pattern both engines answer
-//     identically, and the exact match is decided in Go. See
-//     referenceSearchPattern and referenceSearchMatches.
+//     table.
+//
+// CONTRACT-33 — THE SEARCH MOVED TO `contains`, AND IT COST SOMETHING REAL.
+// compat v0.7.0 REFUSES `like` in a routine WHERE, because it compiled to LIKE
+// on SQLite and ILIKE on PostgreSQL and the two answered different sets. The
+// portable replacement is `contains`: a substring test compiled to instr/strpos,
+// CASE-SENSITIVE, with no wildcards and no escape character. The needle is bound
+// exactly as typed.
+//
+// THE PRICE, SAID OUT LOUD BECAUSE HIDING IT WOULD BE WORSE THAN THE PRICE. The
+// whole design rests on one invariant — the database NARROWS and Go DECIDES —
+// and for that the database must never discard a TRUE match. `like` honoured
+// that by folding at least ASCII; `contains` does not fold at all, so searching
+// `borges` discards the row `BORGES` before Go ever sees it. **The search is
+// therefore case-sensitive**, and three things follow, all of them deliberate:
+//
+//   - referenceSearchMatches keeps its case-INSENSITIVE test. It is now strictly
+//     wider than the WHERE, so it can only ever accept what the database already
+//     selected. Keeping it is what makes the day a folded column arrives (see
+//     docs/PENDIENTES.md) a change of ONE layer instead of two.
+//   - THE FORM SAYS SO, next to the box where the searching happens. A search
+//     that looks case-insensitive and is not makes a person conclude the row does
+//     not exist. See templates/content_fields.html.
+//   - referenceSearchPattern is GONE, not simplified — see the note where it used
+//     to live, above referenceSearchMatches.
 
 import (
 	"context"
@@ -123,7 +143,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"unicode"
 
 	"github.com/MauricioPerera/librarian/internal/schema"
 	"github.com/MauricioPerera/librarian/internal/store"
@@ -939,91 +958,74 @@ func (h *handlers) referenceOptionByID(ctx context.Context, target schema.Conten
 	return option, nil
 }
 
-// referenceSearchScanLimit is how many CANDIDATE rows one search reads before
-// Go decides which of them actually match.
+// referenceSearchScanLimit is how many CANDIDATE rows one search reads before Go
+// decides which of them are offered.
 //
-// WHY IT IS BIGGER THAN referenceOptionLimit, AND WHY IT EXISTS AT ALL. The LIKE
-// pattern this file binds is a deliberate OVER-approximation (see
-// referenceSearchPattern): for a pure-ASCII query it is exact, but every
-// non-ASCII rune and every LIKE metacharacter becomes `_`, so the database can
-// hand back rows that do not really match. Reading only referenceOptionLimit
-// candidates would let that noise push genuine matches out of the page. Five
-// times the offered cap is headroom for the noise while keeping the read bounded
-// by a CONSTANT — which is the whole point: the cost of a search does not grow
-// with the target table, and CONTRACT-31's bound survives.
+// CONTRACT-33 SHRANK IT FROM referenceOptionLimit*5 TO referenceOptionLimit, and
+// the reason is the whole point of the migration. Under `like` this file bound a
+// deliberate OVER-approximation of the query (every non-ASCII rune and every LIKE
+// metacharacter became `_`), so the database handed back rows that did not really
+// match and the extra headroom kept that noise from pushing genuine matches out
+// of the page. `contains` is EXACT: the needle goes in as typed and the WHERE
+// selects substring matches and nothing else. There is no noise left to absorb,
+// so reading five times the offered cap would be five times the cost for rows
+// that can never be dropped. What matters — that the read is bounded by a
+// CONSTANT, so a search's cost does not grow with the target table and
+// CONTRACT-31's bound survives — is unchanged.
 //
 // The price is stated rather than hidden: if a search's candidate set exceeds
 // this, the form says the list is partial (contentReferenceInput.Truncated) —
 // the same honesty the option cap already owed the admin.
-const referenceSearchScanLimit = referenceOptionLimit * 5
+const referenceSearchScanLimit = referenceOptionLimit
 
-// referenceSearchPattern turns what a person TYPED into the LIKE pattern the
-// search routine binds. It is deliberately LOSSY, and every loss is a measured
-// engine divergence being removed at the source.
+// CONTRACT-33 — referenceSearchPattern IS GONE, and this note is its headstone
+// because deleting it silently would hide what the deletion cost.
 //
-// MEASURED, on SQLite and on a real PostgreSQL 17, through the same `like`
-// expression compat compiles (LIKE on SQLite, ILIKE on PostgreSQL):
+// It existed to turn what a person typed into a LIKE pattern both engines
+// answered identically: `%…%` around the text, and every non-ASCII rune and every
+// LIKE metacharacter rewritten to `_`. Measured then, through the same `like`
+// expression compat compiled to LIKE on SQLite and ILIKE on PostgreSQL:
 //
 //	pattern      sqlite LIKE          postgres ILIKE
 //	%ñandú%      [ñandú]              [ñandú Ñandú ÑANDÚ]   ← case folding
-//	%ábaco%      [ábaco]              [ábaco ÁBACO]         ← case folding
-//	%borges%     [BORGES borges]      [borges BORGES]       ← same SET
 //	%a\b%        [a\b]                []                    ← escape character
-//	%a\%b%       [a\b]                [a%b]                 ← escape character
 //
-// Two independent divergences, both real:
+// compat v0.7.0 refuses `like` outright, so there is no pattern to build any
+// more. It did NOT survive simplified, and that was a choice against an obvious
+// alternative: `contains` has no wildcards and no escape character, so a
+// "simplified" version could only be func(q string) string { return q } — an
+// identity function whose name lies about doing something. Every reason it had
+// to exist (widen a metacharacter, neutralise a backslash, hide a folding
+// difference) is a reason `contains` no longer has. The needle now travels bare
+// from the form to the bound parameter, which is why a typed `%` finds the row
+// containing a literal `%` and a typed `\` finds the row containing a backslash —
+// both measured, see TestSearchWildcardsAreNotWildcards.
 //
-//   - CASE FOLDING. SQLite's LIKE folds ASCII only; PostgreSQL's ILIKE folds the
-//     whole Unicode range. So the same query finds a row on one engine and not on
-//     the other the moment an accented letter differs in case.
-//   - THE ESCAPE CHARACTER. PostgreSQL's LIKE has a default escape (backslash);
-//     SQLite's has none. A backslash therefore means two different things.
-//
-// THE RULE, and it is one sentence: an ASCII character that is not a LIKE
-// metacharacter stays literal; everything else becomes `_`. `_` matches exactly
-// one character on both engines, so what is bound is a pattern both engines
-// answer IDENTICALLY — no backslash survives to be an escape, and no cased
-// non-ASCII letter survives to be folded differently.
-//
-// Widening the pattern can only ADD rows, never remove them, so the true matches
-// are all still in the candidate set. referenceSearchMatches then narrows it back
-// to exactly the right rows, in Go, identically on both engines. That is the
-// division of labour: the database NARROWS (cheaply, and it is why this scales),
-// Go DECIDES (exactly, and it is why the two engines agree).
-func referenceSearchPattern(query string) string {
-	var b strings.Builder
-	b.WriteByte('%')
-	for _, r := range query {
-		switch {
-		case r > unicode.MaxASCII:
-			// Cased or not, a non-ASCII rune is not worth reasoning about per
-			// engine — one wildcard costs a few false candidates and removes a
-			// whole class of divergence.
-			b.WriteByte('_')
-		case r == '%' || r == '_' || r == '\\':
-			// The metacharacters, including the one PostgreSQL treats as an escape
-			// and SQLite does not. A literal `%` typed by an admin is ONE character,
-			// so `_` is a correct (and engine-identical) over-approximation of it —
-			// which is also why no ESCAPE clause is needed to keep a typed `%` from
-			// matching everything.
-			b.WriteByte('_')
-		default:
-			b.WriteRune(r)
-		}
-	}
-	b.WriteByte('%')
-	return b.String()
-}
+// Its `unicode` import went with it; nothing else in this file used it.
 
-// referenceSearchMatches is the AUTHORITY on whether a row matches: a
+// referenceSearchMatches decides whether a candidate row is offered: a
 // case-insensitive substring test, done in Go and therefore byte-identical on
-// both engines. strings.ToLower folds the full Unicode range, so it gives the
-// PostgreSQL-like behaviour (`ñandú` finds `ÑANDÚ`) on SQLite too — the
-// divergence is closed by levelling UP, not by degrading the better engine.
+// both engines.
 //
-// It deliberately does NOT strip accents: `nandu` does not find `ñandú`, exactly
-// as ILIKE would not. Making search accent-insensitive is a different, larger
-// decision about the whole panel and it is not this contract's to take.
+// CONTRACT-33 LEFT IT DELIBERATELY WIDER THAN THE DATABASE, and that is not an
+// oversight. The `contains` WHERE is case-SENSITIVE, so every row that reaches
+// here already contains the needle verbatim and this test accepts all of them:
+// today it filters nothing. It is kept, rather than deleted as dead weight, for
+// two reasons. It is still the correct statement of what the panel MEANS by "this
+// row matches" — the WHERE is an optimisation of it, not a redefinition. And the
+// known way out of the case-sensitivity regression (an application-maintained
+// folded column, see docs/PENDIENTES.md) makes the WHERE fold too, at which point
+// the database stops being narrower and this test starts filtering again, with no
+// edit here.
+//
+// WHAT IT DOES NOT DO, and the difference matters to whoever reads a bug report:
+// it cannot RESCUE a row the WHERE discarded. Searching `borges` never offers
+// `BORGES`, because that row never leaves the database. The folding here is only
+// the promise the panel keeps once the row is in hand.
+//
+// It deliberately does NOT strip accents either: `nandu` does not find `ñandú`.
+// Making search accent-insensitive is a different, larger decision about the
+// whole panel and it is not this contract's to take.
 func referenceSearchMatches(text, query string) bool {
 	return strings.Contains(strings.ToLower(text), strings.ToLower(query))
 }
@@ -1046,7 +1048,9 @@ func (h *handlers) referenceSearchPage(ctx context.Context, target schema.Conten
 	if !ok { // unreachable: every caller gates on DynamicSearchField first.
 		return h.referenceRecentPage(ctx, target)
 	}
-	candidates, err := h.searchContentRows(ctx, target, referenceSearchPattern(query), referenceSearchScanLimit+1, 0)
+	// The needle goes in BARE: `contains` has no wildcards, so wrapping it in %…%
+	// would look for a row whose text literally contains a percent sign.
+	candidates, err := h.searchContentRows(ctx, target, query, referenceSearchScanLimit+1, 0)
 	if err != nil {
 		return nil, err
 	}

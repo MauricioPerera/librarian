@@ -21,6 +21,7 @@ vez. El estado va en el índice para no tener que leerlas para saberlo.
 | 9 | [El selector de relación ofrece 100 filas y no tiene buscador](#9-el-selector-de-relación-ofrece-100-filas-y-no-tiene-buscador-baja) | **RESUELTO** (CONTRACT-32) |
 | 10 | [Abrir un formulario con relaciones cuesta N+1 consultas](#10-abrir-un-formulario-con-relaciones-cuesta-n1-consultas-baja) | **RESUELTO** (CONTRACT-31) |
 | 11 | [El listado genérico no muestra las columnas de relación](#11-el-listado-genérico-no-muestra-las-columnas-de-relación-baja) | **RESUELTO** (CONTRACT-31) |
+| 12 | [El buscador del selector de relación distingue mayúsculas](#12-el-buscador-del-selector-de-relación-distingue-mayúsculas-media) | ABIERTO |
 
 ## 1. No hay forma de otorgar permisos a un rol desde el producto (ALTA)
 
@@ -475,3 +476,49 @@ que resolver la MISMA etiqueta legible que ya calcula el selector
 (`referenceOptionLabel`: primer campo declarado + 8 caracteres del id)—, y
 hacerlo para todas las filas del listado son N lecturas más. Es el hueco 10 otra
 vez, en otra pantalla: conviene resolver los dos juntos.
+
+## 12. El buscador del selector de relación distingue mayúsculas (MEDIA)
+
+**Estado:** ABIERTO. Lo introdujo CONTRACT-33 a sabiendas, como precio de volver
+a tener buscador contra `sqlite-postgres-compat` v0.7.0.
+
+**Qué pasa:** en el buscador del selector de relación
+(`GET /admin/content/{tipo}/reference?name={relación}`), escribir `borges` **no**
+encuentra la fila `BORGES`, y escribir `ábaco` no encuentra `Ábaco`. Hay que
+escribir el texto tal como figura. El formulario lo dice al lado de la caja
+(`reference-search-case-{relación}`), que es lo mínimo para que no se confunda con
+«esa fila no existe», pero decirlo no es resolverlo.
+
+**Por qué es MEDIA y no BAJA:** es una regresión funcional visible para quien usa
+el panel. Antes de CONTRACT-33 el mismo buscador era insensible a mayúsculas en
+todo el rango Unicode. No se pierde ni se corrompe ningún dato —la fila sigue
+estando y sigue siendo alcanzable escribiéndola bien—, pero la persona que escribe
+en minúsculas concluye razonablemente que no está.
+
+**La causa, que no es un descuido:** compat v0.7.0 **rechaza `like`** en el WHERE
+de una rutina, y con razón: compilaba a `LIKE` en SQLite (pliega solo ASCII) y a
+`ILIKE` en PostgreSQL (pliega todo Unicode), o sea que la misma búsqueda devolvía
+conjuntos distintos según el motor. El reemplazo portable es `contains`
+(`instr`/`strpos`): subcadena, **sensible a mayúsculas**, sin comodines. Es
+portable justamente porque no pliega — plegar Unicode es donde los motores
+divergen.
+
+Y el plegado no se puede mudar a Go, que es donde estaría la tentación: el diseño
+se sostiene sobre que **la base ACOTA y Go DECIDE**, y para eso la base nunca puede
+descartar una coincidencia verdadera. `contains` descarta `BORGES` antes de que Go
+la vea, y ningún filtro posterior en Go puede rescatar una fila que la consulta no
+trajo. `referenceSearchMatches` sigue siendo insensible a mayúsculas y hoy no
+filtra nada: quedó a propósito, para que la vía de salida sea un cambio de una
+capa y no de dos.
+
+**La vía de salida conocida: una columna plegada mantenida por la aplicación.** La
+app escribe el valor del primer campo también en minúsculas en una columna
+paralela, y la rutina hace `contains` sobre esa columna con la aguja pasada a
+minúsculas en Go. Es portable porque **el plegado ocurre en Go**, idéntico en los
+dos motores por construcción, y la base sigue haciendo un `contains` que no pliega
+nada.
+
+No se hace acá porque es un **cambio de esquema para tipos dinámicos**: una columna
+más por tipo, que hay que crear al declarar el tipo, rellenar en cada escritura,
+mantener en las ediciones de campos (CONTRACT-18) y decidir qué hacer con las filas
+que ya existen. Merece contrato propio.

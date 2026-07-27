@@ -2,23 +2,30 @@
 
 package server
 
-// CONTRACT-32 — THE RELATION SEARCH, on BOTH engines, and the divergence it had
-// to neutralise to exist at all.
+// CONTRACT-32/33 — THE RELATION SEARCH, on BOTH engines.
 //
-// WHY THIS BATTERY IS THE POINT OF THE CONTRACT. T2 left the technical decision
-// open between pushing the filter into the database (which scales, but goes
-// through compat's `like` → LIKE on SQLite, ILIKE on PostgreSQL) and matching in
-// Go (identical by construction, but reading the whole table). The database road
-// was taken, so the burden of proof is here: the two engines must return THE SAME
-// THING, accents included.
+// WHY THIS BATTERY IS THE POINT OF THE CONTRACT. CONTRACT-32 T2 left the
+// technical decision open between pushing the filter into the database (which
+// scales) and matching in Go (identical by construction, but reading the whole
+// table). The database road was taken, so the burden of proof is here: the two
+// engines must return THE SAME THING, accents included.
+//
+// CONTRACT-33 CHANGED THE OPERATOR AND THIS BATTERY IS WHERE THAT SHOWS. compat
+// v0.7.0 refuses `like` (LIKE on SQLite, ILIKE on PostgreSQL — genuinely
+// different sets), so the WHERE is now `contains`: instr/strpos, case-sensitive,
+// no wildcards, no escape character. The needle is bound EXACTLY as typed. The
+// queries below are unchanged on purpose — the traps are the same traps — but the
+// answers to the cased ones are now the case-sensitive ones on BOTH engines,
+// which is the whole point: identical, at the price of folding nothing.
 //
 // It runs in two halves:
 //
-//  1. THE RAW MEASUREMENT. The production search routine is called with a NAKED
-//     pattern — the text as typed, wrapped in %…% — and the rows it returns are
-//     logged per engine. This is the divergence the contract suspected, measured
-//     rather than argued. It is LOGGED, not asserted: the day compat changes that
-//     mapping this battery should report the new truth, not fail.
+//  1. THE RAW MEASUREMENT. The production search routine is called directly with
+//     the bare needle and the rows it returns are logged per engine. Under `like`
+//     this half existed to EXHIBIT a divergence; under `contains` it exists to
+//     show there is none left to neutralise. It is LOGGED, not asserted: the day
+//     compat changes that mapping this battery should report the new truth, not
+//     fail.
 //  2. THE PANEL. The real /admin/content/{type}/reference fragment is rendered for
 //     a list of queries designed to hit every trap (case, accents, ñ, the LIKE
 //     metacharacters, a backslash, a quote) and the OFFERED LABELS are compared
@@ -95,8 +102,8 @@ func TestDualEngineReferenceSearch(t *testing.T) {
 	pgRaw, pgTranscript := runReferenceSearchScenario(t, "postgres", pgStore)
 
 	// --- half 1: the measurement, logged ------------------------------------
-	t.Log("RAW `like` THROUGH THE PRODUCTION ROUTINE (pattern = %<texto>%, no repair):")
-	t.Logf("%-14s | %-6s | %-34s | %s", "texto", "same?", "sqlite LIKE", "postgres ILIKE")
+	t.Log("RAW `contains` THROUGH THE PRODUCTION ROUTINE (needle = the text as typed):")
+	t.Logf("%-14s | %-6s | %-34s | %s", "texto", "same?", "sqlite instr", "postgres strpos")
 	divergences := 0
 	for _, q := range c32Queries {
 		mark := "SAME"
@@ -106,8 +113,8 @@ func TestDualEngineReferenceSearch(t *testing.T) {
 		}
 		t.Logf("%-14q | %-6s | %-34s | %s", q, mark, sqliteRaw[q], pgRaw[q])
 	}
-	t.Logf("raw divergences: %d of %d queries — this is WHY referenceSearchPattern exists",
-		divergences, len(c32Queries))
+	t.Logf("raw divergences: %d of %d queries — with `contains` the operator itself is portable, "+
+		"so this must be 0 and no pattern repair exists any more", divergences, len(c32Queries))
 
 	// --- half 2: the panel, asserted ----------------------------------------
 	t.Logf("panel transcript (%d lines):\n%s", len(sqliteTranscript), strings.Join(sqliteTranscript, "\n"))
@@ -165,7 +172,9 @@ func runReferenceSearchScenario(t *testing.T, engineLabel string, st *compat.Sto
 	h := &handlers{db: st.DB, store: st, jwtSecret: dualJWTSecret, now: time.Now}
 	raw := map[string]string{}
 	for _, q := range c32Queries {
-		rows, err := h.searchContentRows(ctx, def, "%"+q+"%", referenceSearchScanLimit, 0)
+		// BARE, not "%"+q+"%": `contains` has no wildcards, so a % here would be a
+		// percent sign to look for.
+		rows, err := h.searchContentRows(ctx, def, q, referenceSearchScanLimit, 0)
 		if err != nil {
 			raw[q] = "ERROR: " + err.Error()
 			continue
