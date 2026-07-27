@@ -28,19 +28,30 @@
      no una sección aparte, y así no hace falta tocar la hoja de estilos. */}}
 <div class="content-field content-reference" id="reference-{{.Name}}">
   <label>{{.Name}} <span class="muted">(relación → {{.Target}})</span>
-    {{if .Options}}
-      {{/* El value SIEMPRE es el id; lo que se lee es solo la etiqueta. La opción
-           vacía significa «sin relación» a propósito: la columna es nullable y
-           quitar una relación tiene que poder hacerse queriendo. */}}
-      <select name="{{.Name}}">
-        <option value=""{{if not .Value}} selected{{end}}>— sin relación —</option>
-        {{range .Options}}<option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Label}}</option>{{end}}
-      </select>
-    {{else}}
-      <p class="muted" id="no-reference-rows-{{.Name}}">Todavía no hay ninguna fila de «{{.Target}}» a la que apuntar. Creá primero una fila de «{{.Target}}» y después volvé acá: esta relación queda sin valor.</p>
+    {{if .Searchable}}
+    {{/* CONTRACT-32 — el buscador. Recarga SOLO el bloque de opciones desde el
+         servidor (htmx + plantilla, sin JavaScript propio), así que busca en la
+         base y no entre las filas ya traídas.
+
+         hx-include manda el <select> junto con el texto: su value es la relación
+         VIGENTE, y el fragmento la devuelve siempre presente y seleccionada
+         aunque no coincida con la búsqueda. Sin eso, buscar y guardar borraría
+         una relación que nadie tocó.
+
+         El name lleva guion porque un campo o una relación nunca puede llevarlo
+         (^[a-z][a-z0-9_]*$): así este control viaja en el POST sin poder pisar
+         ningún dato declarado. */}}
+    <input type="search" name="q-{{.Name}}" value="{{.Query}}" autocomplete="off"
+           id="reference-search-{{.Name}}"
+           placeholder="Buscar en «{{.Target}}»…"
+           hx-get="/admin/content/{{.Type}}/reference?name={{.Name}}"
+           hx-trigger="keyup changed delay:300ms, search"
+           hx-include="#reference-select-{{.Name}}"
+           hx-target="#reference-options-{{.Name}}"
+           hx-swap="outerHTML">
     {{end}}
+    {{template "content_reference_options" .}}
   </label>
-  {{if .Truncated}}<p class="muted" id="reference-truncated-{{.Name}}">Se están ofreciendo solo las {{.Limit}} filas más recientes de «{{.Target}}». Si la fila que buscás no está en la lista, no la vas a poder elegir desde acá.</p>{{end}}
 </div>
 {{end}}
 {{end}}

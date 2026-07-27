@@ -89,6 +89,30 @@ package server
 // as bounded as the selector's option list, so a relation pointing at a row
 // older than that page renders as unresolvedReferenceLabel — visibly SET, and
 // visibly not translated — instead of costing one more query per row.
+//
+// CONTRACT-32 — REACHING A ROW THE CUT LEFT OUT, without rebuilding the loss.
+// The two contracts above left the selector honest but still capped: an admin
+// told "these are only the newest 100" had no way to reach number 101 from the
+// panel. This one adds a search that re-renders the option list FROM THE
+// DATABASE — the cap does not move, the reachable set does.
+//
+//	GET /admin/content/{type}/reference?name={relación}   options fragment (session)
+//
+// Two things about it are load-bearing and easy to get wrong:
+//
+//   - THE CURRENT VALUE TRAVELS WITH EVERY SEARCH and stays selected, match or
+//     no match. A fragment that answered a fruitless search with a <select>
+//     lacking it would drop the control to «sin relación», and the next save
+//     would clear a relation nobody touched — CONTRACT-30's defect, rebuilt out
+//     of a feature meant to help. See referenceInput, where the rescue lives
+//     ONCE for both the page and the fragment.
+//   - THE FILTER RUNS IN THE DATABASE, so the search reaches rows the page never
+//     read, and its cost stays a constant instead of growing with the target
+//     table. compat compiles `like` to LIKE on SQLite and ILIKE on PostgreSQL,
+//     whose case folding and escape character genuinely differ (measured), so
+//     what is bound is a deliberately COARSE pattern both engines answer
+//     identically, and the exact match is decided in Go. See
+//     referenceSearchPattern and referenceSearchMatches.
 
 import (
 	"context"
@@ -99,6 +123,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/MauricioPerera/librarian/internal/schema"
 	"github.com/MauricioPerera/librarian/internal/store"
@@ -106,8 +131,14 @@ import (
 
 var (
 	adminContentListTmpl = mustParseFS("templates/layout.html", "templates/content_list.html", "templates/content_row.html")
-	adminContentNewTmpl  = mustParseFS("templates/layout.html", "templates/content_new.html", "templates/content_fields.html")
-	adminContentEditTmpl = mustParseFS("templates/layout.html", "templates/content_edit.html", "templates/content_fields.html")
+	adminContentNewTmpl  = mustParseFS("templates/layout.html", "templates/content_new.html",
+		"templates/content_fields.html", "templates/content_reference_options.html")
+	adminContentEditTmpl = mustParseFS("templates/layout.html", "templates/content_edit.html",
+		"templates/content_fields.html", "templates/content_reference_options.html")
+	// CONTRACT-32: the options block ALONE, so the search can replace exactly it
+	// and nothing else of the form. It is the same file the full form includes —
+	// one spelling of the <select>, so the fragment and the page cannot drift.
+	adminContentReferenceOptionsTmpl = mustParseFS("templates/content_reference_options.html")
 )
 
 // contentFieldInput is ONE form control: everything the shared field template
@@ -141,13 +172,29 @@ type contentReferenceOption struct {
 // an admin cannot pick a row that is not offered, and a silent cut here would be
 // the very same class of failure this contract exists to close — the panel
 // deciding something about the data without telling anyone.
+//
+// CONTRACT-32 adds the search half. Type is the type being EDITED (the fragment
+// route hangs off it, so the template needs it); Query is what the admin typed,
+// echoed back so a re-render never loses it; Searchable says the target CAN be
+// searched at all (see schema.DynamicSearchField); Empty distinguishes "this
+// target has no rows whatsoever" — CONTRACT-30's message, no control at all —
+// from "your search matched none of them", which still renders a usable control.
 type contentReferenceInput struct {
-	Name      string
-	Target    string
-	Value     string
-	Options   []contentReferenceOption
-	Truncated bool
-	Limit     int
+	Name       string
+	Type       string
+	Target     string
+	Value      string
+	Query      string
+	Options    []contentReferenceOption
+	Truncated  bool
+	Limit      int
+	Searchable bool
+	Empty      bool
+	// NoMatches says the SEARCH matched no row of the target. It is not
+	// `len(Options) == 0`: a fruitless search still carries the current value as
+	// an option (that rescue is the point of this contract), so counting options
+	// would report "hay resultados" for a search that found none.
+	NoMatches bool
 }
 
 // contentRowView is one row of the generic list: the cells in own-column order
@@ -200,6 +247,10 @@ type contentFormBinding struct {
 func (h *handlers) registerAdminContentRoutes(mux *http.ServeMux) {
 	mux.Handle("GET /admin/content/{type}", h.requireSession(http.HandlerFunc(h.handleAdminContentList)))
 	mux.Handle("GET /admin/content/{type}/new", h.requireSession(http.HandlerFunc(h.handleAdminContentNewForm)))
+	// CONTRACT-32 — the relation selector, re-rendered for a search text. Session
+	// only, like the two fragments of the content-type form: it writes nothing and
+	// shows nothing the same session could not already see in the form itself.
+	mux.Handle("GET /admin/content/{type}/reference", h.requireSession(http.HandlerFunc(h.handleAdminContentReferenceOptions)))
 	mux.Handle("POST /admin/content/{type}", h.requireSessionPermission("content.create")(http.HandlerFunc(h.handleAdminContentCreate)))
 	mux.Handle("GET /admin/content/{type}/{id}/edit", h.requireSession(http.HandlerFunc(h.handleAdminContentEditForm)))
 	mux.Handle("PUT /admin/content/{type}/{id}", h.requireSessionPermission("content.update")(http.HandlerFunc(h.handleAdminContentUpdate)))
@@ -658,7 +709,24 @@ func (c *referenceTargetCache) page(ctx context.Context, target string) (*refere
 	if err != nil {
 		return nil, err
 	}
-	rows, err := c.h.listContentRows(ctx, def, referenceOptionLimit+1, 0)
+	page, err := c.h.referenceRecentPage(ctx, def)
+	if err != nil {
+		return nil, err
+	}
+	c.pages[target] = page
+	return page, nil
+}
+
+// referenceRecentPage is the UNFILTERED page of a target: its newest
+// referenceOptionLimit rows, plus whether there were more. It asks for one row
+// MORE than it will keep, which is how truncation is detected without a second
+// COUNT round trip.
+//
+// CONTRACT-32 split it out of referenceTargetCache.page so the search fragment —
+// which resolves its target on its own and must NOT poison a per-request cache
+// with a FILTERED page — can build the same shape through the same code.
+func (h *handlers) referenceRecentPage(ctx context.Context, def schema.ContentTypeDefinition) (*referenceTargetPage, error) {
+	rows, err := h.listContentRows(ctx, def, referenceOptionLimit+1, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -668,7 +736,6 @@ func (c *referenceTargetCache) page(ctx context.Context, target string) (*refere
 		page.truncated = true
 	}
 	page.rows = rows
-	c.pages[target] = page
 	return page, nil
 }
 
@@ -783,38 +850,71 @@ func (h *handlers) referenceInputs(ctx context.Context, def schema.ContentTypeDe
 		if err != nil {
 			return nil, err
 		}
-		current := strings.TrimSpace(selected[ref.Name])
-		in := contentReferenceInput{
-			Name:      ref.Name,
-			Target:    ref.Target,
-			Value:     current,
-			Limit:     referenceOptionLimit,
-			Truncated: page.truncated,
+		in, err := h.referenceInput(ctx, def, ref, page, selected[ref.Name], "")
+		if err != nil {
+			return nil, err
 		}
-		found := false
-		options := make([]contentReferenceOption, 0, len(page.rows))
-		for _, row := range page.rows {
-			id, _ := row[colID].(string)
-			if id == current {
-				found = true
-			}
-			options = append(options, contentReferenceOption{
-				Value:    id,
-				Label:    referenceOptionLabel(page.def, row),
-				Selected: id == current,
-			})
-		}
-		if current != "" && !found {
-			option, err := h.referenceOptionByID(ctx, page.def, current)
-			if err != nil {
-				return nil, err
-			}
-			options = append([]contentReferenceOption{option}, options...)
-		}
-		in.Options = options
 		out = append(out, in)
 	}
 	return out, nil
+}
+
+// referenceInput turns ONE already-resolved page of target rows into ONE
+// selector, preselected with `current` and echoing back `query` (empty for the
+// full-form render, the admin's text for the search fragment).
+//
+// CONTRACT-32 — THE GUARANTEE THAT LIVES HERE, and the reason this function is
+// shared instead of the fragment growing its own copy: **the current value is
+// always an option and is always selected**, whether it came from the page or
+// not. CONTRACT-30 added that rescue for the truncation cut; a search rebuilds
+// the very same trap and makes it far easier to spring, because the admin does
+// not have to own an old row — typing three letters that miss the current target
+// is enough. If the option went missing the <select> would fall back to «sin
+// relación» and the next save would clear a relation nobody touched. One
+// spelling of the rescue, used by both entry points, is what keeps the fragment
+// from silently drifting away from it.
+func (h *handlers) referenceInput(ctx context.Context, def schema.ContentTypeDefinition, ref schema.ReferenceDefinition, page *referenceTargetPage, selected, query string) (contentReferenceInput, error) {
+	current := strings.TrimSpace(selected)
+	_, searchable := schema.DynamicSearchField(page.def)
+	// "The target has nothing to point at" is CONTRACT-30's case and renders no
+	// control at all. It is NOT the same as "your search matched nothing", which
+	// must still render a usable control — so it is only claimed when no search is
+	// in play.
+	empty := query == "" && len(page.rows) == 0 && current == ""
+	in := contentReferenceInput{
+		Name:       ref.Name,
+		Type:       def.Name,
+		Target:     ref.Target,
+		Value:      current,
+		Query:      query,
+		Limit:      referenceOptionLimit,
+		Truncated:  page.truncated,
+		Searchable: searchable && !empty,
+		Empty:      empty,
+		NoMatches:  query != "" && len(page.rows) == 0,
+	}
+	found := false
+	options := make([]contentReferenceOption, 0, len(page.rows))
+	for _, row := range page.rows {
+		id, _ := row[colID].(string)
+		if id == current {
+			found = true
+		}
+		options = append(options, contentReferenceOption{
+			Value:    id,
+			Label:    referenceOptionLabel(page.def, row),
+			Selected: id == current,
+		})
+	}
+	if current != "" && !found {
+		option, err := h.referenceOptionByID(ctx, page.def, current)
+		if err != nil {
+			return contentReferenceInput{}, err
+		}
+		options = append([]contentReferenceOption{option}, options...)
+	}
+	in.Options = options
+	return in, nil
 }
 
 // referenceOptionByID builds the option for ONE id that the offered page did not
@@ -837,6 +937,231 @@ func (h *handlers) referenceOptionByID(ctx context.Context, target schema.Conten
 		option.Label = referenceOptionLabel(target, row)
 	}
 	return option, nil
+}
+
+// referenceSearchScanLimit is how many CANDIDATE rows one search reads before
+// Go decides which of them actually match.
+//
+// WHY IT IS BIGGER THAN referenceOptionLimit, AND WHY IT EXISTS AT ALL. The LIKE
+// pattern this file binds is a deliberate OVER-approximation (see
+// referenceSearchPattern): for a pure-ASCII query it is exact, but every
+// non-ASCII rune and every LIKE metacharacter becomes `_`, so the database can
+// hand back rows that do not really match. Reading only referenceOptionLimit
+// candidates would let that noise push genuine matches out of the page. Five
+// times the offered cap is headroom for the noise while keeping the read bounded
+// by a CONSTANT — which is the whole point: the cost of a search does not grow
+// with the target table, and CONTRACT-31's bound survives.
+//
+// The price is stated rather than hidden: if a search's candidate set exceeds
+// this, the form says the list is partial (contentReferenceInput.Truncated) —
+// the same honesty the option cap already owed the admin.
+const referenceSearchScanLimit = referenceOptionLimit * 5
+
+// referenceSearchPattern turns what a person TYPED into the LIKE pattern the
+// search routine binds. It is deliberately LOSSY, and every loss is a measured
+// engine divergence being removed at the source.
+//
+// MEASURED, on SQLite and on a real PostgreSQL 17, through the same `like`
+// expression compat compiles (LIKE on SQLite, ILIKE on PostgreSQL):
+//
+//	pattern      sqlite LIKE          postgres ILIKE
+//	%ñandú%      [ñandú]              [ñandú Ñandú ÑANDÚ]   ← case folding
+//	%ábaco%      [ábaco]              [ábaco ÁBACO]         ← case folding
+//	%borges%     [BORGES borges]      [borges BORGES]       ← same SET
+//	%a\b%        [a\b]                []                    ← escape character
+//	%a\%b%       [a\b]                [a%b]                 ← escape character
+//
+// Two independent divergences, both real:
+//
+//   - CASE FOLDING. SQLite's LIKE folds ASCII only; PostgreSQL's ILIKE folds the
+//     whole Unicode range. So the same query finds a row on one engine and not on
+//     the other the moment an accented letter differs in case.
+//   - THE ESCAPE CHARACTER. PostgreSQL's LIKE has a default escape (backslash);
+//     SQLite's has none. A backslash therefore means two different things.
+//
+// THE RULE, and it is one sentence: an ASCII character that is not a LIKE
+// metacharacter stays literal; everything else becomes `_`. `_` matches exactly
+// one character on both engines, so what is bound is a pattern both engines
+// answer IDENTICALLY — no backslash survives to be an escape, and no cased
+// non-ASCII letter survives to be folded differently.
+//
+// Widening the pattern can only ADD rows, never remove them, so the true matches
+// are all still in the candidate set. referenceSearchMatches then narrows it back
+// to exactly the right rows, in Go, identically on both engines. That is the
+// division of labour: the database NARROWS (cheaply, and it is why this scales),
+// Go DECIDES (exactly, and it is why the two engines agree).
+func referenceSearchPattern(query string) string {
+	var b strings.Builder
+	b.WriteByte('%')
+	for _, r := range query {
+		switch {
+		case r > unicode.MaxASCII:
+			// Cased or not, a non-ASCII rune is not worth reasoning about per
+			// engine — one wildcard costs a few false candidates and removes a
+			// whole class of divergence.
+			b.WriteByte('_')
+		case r == '%' || r == '_' || r == '\\':
+			// The metacharacters, including the one PostgreSQL treats as an escape
+			// and SQLite does not. A literal `%` typed by an admin is ONE character,
+			// so `_` is a correct (and engine-identical) over-approximation of it —
+			// which is also why no ESCAPE clause is needed to keep a typed `%` from
+			// matching everything.
+			b.WriteByte('_')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	b.WriteByte('%')
+	return b.String()
+}
+
+// referenceSearchMatches is the AUTHORITY on whether a row matches: a
+// case-insensitive substring test, done in Go and therefore byte-identical on
+// both engines. strings.ToLower folds the full Unicode range, so it gives the
+// PostgreSQL-like behaviour (`ñandú` finds `ÑANDÚ`) on SQLite too — the
+// divergence is closed by levelling UP, not by degrading the better engine.
+//
+// It deliberately does NOT strip accents: `nandu` does not find `ñandú`, exactly
+// as ILIKE would not. Making search accent-insensitive is a different, larger
+// decision about the whole panel and it is not this contract's to take.
+func referenceSearchMatches(text, query string) bool {
+	return strings.Contains(strings.ToLower(text), strings.ToLower(query))
+}
+
+// referenceSearchPage is the searched twin of referenceRecentPage: the rows of
+// one target whose LABEL FIELD matches what the admin typed, capped at the same
+// referenceOptionLimit the unfiltered page offers.
+//
+// The field searched is schema.DynamicSearchField, which is the FIRST DECLARED
+// FIELD — the very one referenceOptionLabel puts in the option text. Searching a
+// different column than the one shown would mean typing what you can read fails
+// to find it.
+//
+// THE CAP IS NOT RAISED BY SEARCHING. The contract is explicit: the search exists
+// to REACH rows the cut left out, not to show more of them at once. So a search
+// that matches thousands still offers referenceOptionLimit options and still says
+// it is partial.
+func (h *handlers) referenceSearchPage(ctx context.Context, target schema.ContentTypeDefinition, query string) (*referenceTargetPage, error) {
+	field, ok := schema.DynamicSearchField(target)
+	if !ok { // unreachable: every caller gates on DynamicSearchField first.
+		return h.referenceRecentPage(ctx, target)
+	}
+	candidates, err := h.searchContentRows(ctx, target, referenceSearchPattern(query), referenceSearchScanLimit+1, 0)
+	if err != nil {
+		return nil, err
+	}
+	page := &referenceTargetPage{def: target}
+	if len(candidates) > referenceSearchScanLimit {
+		// More candidates than this search is willing to read: whatever it shows
+		// is a prefix of the answer, and the form has to say so.
+		candidates = candidates[:referenceSearchScanLimit]
+		page.truncated = true
+	}
+	rows := make([]map[string]any, 0, len(candidates))
+	for _, row := range candidates {
+		if !referenceSearchMatches(displayValue(row[field.Name]), query) {
+			continue
+		}
+		if len(rows) == referenceOptionLimit {
+			page.truncated = true
+			break
+		}
+		rows = append(rows, row)
+	}
+	page.rows = rows
+	return page, nil
+}
+
+// referenceSearchParam is the name of the search control of ONE relation.
+//
+// THE HYPHEN IS THE WHOLE POINT. The control lives INSIDE the content form, so
+// whatever it is called is also submitted with every create/update. A field or a
+// relation of a dynamic type is validated by schema's identifier pattern
+// (^[a-z][a-z0-9_]*$), which cannot contain a hyphen — so `q-<relación>` is a
+// name no declared column can ever collide with, and bindContentForm (which only
+// ever looks up DECLARED names) ignores it by construction.
+func referenceSearchParam(relation string) string {
+	return "q-" + relation
+}
+
+// handleAdminContentReferenceOptions returns the <select> of ONE relation,
+// filtered by what the admin typed. It is the CONTRACT-32 fragment, and it is the
+// same shape the project already uses for /admin/content-types/new/reference:
+// htmx asks for a piece of server-rendered HTML and swaps it in. No JavaScript of
+// this project's own, no JSON API from the panel.
+//
+// THE ROUTE HAS A LITERAL SEGMENT AND THE RELATION TRAVELS AS A QUERY PARAMETER,
+// which is not a style choice: `GET /admin/content/{type}/reference/{name}` would
+// overlap `GET /admin/content/{type}/{id}/edit` on the path
+// /admin/content/x/reference/edit, and net/http's mux PANICS at registration on
+// two patterns where neither is more specific than the other.
+//
+// WHAT IT SWAPS, AND WHAT IT MUST NOT. The target is the options block ALONE.
+// The search box itself, and every other control of the form, sit outside it, so
+// searching cannot take away half-typed text from the rest of the form — nor the
+// search text itself, nor the caret. That is the red-team item that would make
+// this feature worse than not having it.
+//
+// Session only, no permission: it renders strictly less than the form the same
+// session can already open, and it writes nothing.
+func (h *handlers) handleAdminContentReferenceOptions(w http.ResponseWriter, r *http.Request) {
+	def, ok := h.resolveTypeUI(w, r)
+	if !ok {
+		return
+	}
+	var ref schema.ReferenceDefinition
+	name := r.URL.Query().Get("name")
+	found := false
+	for _, candidate := range def.References {
+		if candidate.Name == name {
+			ref, found = candidate, true
+			break
+		}
+	}
+	if !found {
+		// An unknown relation name is a 404 exactly like an unknown {type}: the
+		// name is only ever compared against the PERSISTED definition, and nothing
+		// derived from it reaches a query before that comparison succeeds.
+		h.renderNotFound(w, r)
+		return
+	}
+	target, err := store.FetchContentType(r.Context(), h.store, ref.Target)
+	if err != nil {
+		h.httpOperationFailure(w, r, err)
+		return
+	}
+	query := strings.TrimSpace(r.URL.Query().Get(referenceSearchParam(ref.Name)))
+	if _, searchable := schema.DynamicSearchField(target); !searchable {
+		// The control is not rendered for such a target, so this can only be a
+		// hand-made request. Answering with the unfiltered page is the honest
+		// reply: there is nothing to search BY, and pretending otherwise would
+		// mean answering "no matches" to every query.
+		query = ""
+	}
+	// THE CURRENT VALUE ARRIVES UNDER THE RELATION'S OWN NAME because that is the
+	// name of the <select> htmx includes in the request. It is echoed back into
+	// the fragment and re-selected there, which is what keeps a search from
+	// clearing a relation nobody touched.
+	current := strings.TrimSpace(r.URL.Query().Get(ref.Name))
+
+	var page *referenceTargetPage
+	if query == "" {
+		page, err = h.referenceRecentPage(r.Context(), target)
+	} else {
+		page, err = h.referenceSearchPage(r.Context(), target, query)
+	}
+	if err != nil {
+		h.httpOperationFailure(w, r, err)
+		return
+	}
+	in, err := h.referenceInput(r.Context(), def, ref, page, current, query)
+	if err != nil {
+		h.httpOperationFailure(w, r, err)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_ = adminContentReferenceOptionsTmpl.ExecuteTemplate(w, "content_reference_options", in)
 }
 
 // referenceOptionLabel is THE label rule, and it is only ever cosmetic — the

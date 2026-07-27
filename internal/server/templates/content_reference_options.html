@@ -1,0 +1,30 @@
+{{define "content_reference_options"}}
+{{/* CONTRACT-32 — el bloque que la búsqueda reemplaza, y NADA más. El buscador
+     y el resto del formulario quedan afuera a propósito: un swap más grande se
+     llevaría puesto lo que la persona venía escribiendo. */}}
+<div id="reference-options-{{.Name}}">
+  {{if .Empty}}
+    <p class="muted" id="no-reference-rows-{{.Name}}">Todavía no hay ninguna fila de «{{.Target}}» a la que apuntar. Creá primero una fila de «{{.Target}}» y después volvé acá: esta relación queda sin valor.</p>
+  {{else}}
+    {{/* El value SIEMPRE es el id; lo que se lee es solo la etiqueta. La opción
+         vacía significa «sin relación» a propósito: la columna es nullable y
+         quitar una relación tiene que poder hacerse queriendo. */}}
+    <select name="{{.Name}}" id="reference-select-{{.Name}}">
+      <option value=""{{if not .Value}} selected{{end}}>— sin relación —</option>
+      {{range .Options}}<option value="{{.Value}}"{{if .Selected}} selected{{end}}>{{.Label}}</option>{{end}}
+    </select>
+    {{if .NoMatches}}
+    {{/* Sin coincidencias NO es lo mismo que sin filas: el control sigue usable y
+         la relación vigente sigue puesta, así que guardar acá no borra nada. */}}
+    <p class="muted" id="reference-no-matches-{{.Name}}">Ninguna fila de «{{.Target}}» coincide con «{{.Query}}». La relación que ya estaba puesta sigue seleccionada; borrá el texto para volver a ver las {{.Limit}} más recientes.</p>
+    {{end}}
+    {{if .Truncated}}
+      {{if .Query}}
+    <p class="muted" id="reference-truncated-{{.Name}}">La búsqueda «{{.Query}}» coincide con más filas de las que se pueden ofrecer: se muestran solo las primeras {{.Limit}}. Afiná el texto para llegar a la que buscás.</p>
+      {{else}}
+    <p class="muted" id="reference-truncated-{{.Name}}">Se están ofreciendo solo las {{.Limit}} filas más recientes de «{{.Target}}».{{if .Searchable}} Si la fila que buscás no está en la lista, buscala por nombre acá arriba.{{else}} «{{.Target}}» no declara un primer campo de texto, así que no se puede buscar por nombre: la fila que no esté en la lista no la vas a poder elegir desde acá.{{end}}</p>
+      {{end}}
+    {{end}}
+  {{end}}
+</div>
+{{end}}

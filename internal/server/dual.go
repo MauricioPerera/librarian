@@ -136,6 +136,14 @@ func integerValue(v int) compat.Value {
 	return compat.Value{Kind: compat.IntegerValue, Value: fmt.Sprintf("%d", v)}
 }
 
+// textValue builds a canonical text routine argument. Its only caller is the
+// CONTRACT-32 search, whose LIKE pattern is a bound value like any other — the
+// point of it having a constructor at all is that the pattern can never be
+// mistaken for a fragment of SQL.
+func textValue(v string) compat.Value {
+	return compat.Value{Kind: compat.TextValue, Value: v}
+}
+
 // rowTextPointer returns a *string that is nil exactly when the column is NULL.
 // It is the shape the JSON views of this package use for a nullable text/uuid
 // column (article.PublishedAt, term.ParentID), and no other package needs it.

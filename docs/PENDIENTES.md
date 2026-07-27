@@ -354,6 +354,45 @@ evidencia sería repetir el error de arriba.
 
 ## 9. El selector de relación ofrece 100 filas y no tiene buscador (BAJA)
 
+**Estado:** RESUELTO por CONTRACT-32. El control ahora trae un buscador que
+recarga las opciones **desde la base** (htmx + fragmento de servidor, sin
+JavaScript propio: `GET /admin/content/{tipo}/reference?name={relación}`), así
+que una fila que el tope dejaba afuera se alcanza desde el panel. **El tope no se
+movió** —sigue ofreciendo 100 y sigue avisando cuando recorta—: lo que cambió es
+el conjunto alcanzable, no el mostrado.
+
+Dos decisiones que conviene no perder:
+
+- **El filtro va a la base, no a Go.** La alternativa (`compat.Store.SearchText`)
+  es idéntica en los dos motores por construcción pero lee la tabla entera, que
+  es justo la cota que el hueco 10 acababa de poner. Medido: una búsqueda cuesta
+  7 sentencias con 21 filas destino y 7 con 221.
+- **El precio de esa decisión, y cómo se paga.** `compat` compila `like` a `LIKE`
+  en SQLite y a `ILIKE` en PostgreSQL, y los dos difieren de verdad: medido
+  contra PostgreSQL 17, `%ñandú%` trae `[ñandú menor]` en SQLite y
+  `[ÑANDÚ ñandú menor]` en Postgres, y una barra invertida —que en Postgres es el
+  escape por defecto de `LIKE` y en SQLite no es nada— trae `[barra\invertida]`
+  en uno y `[]` en el otro. 6 de 18 búsquedas divergían en crudo. El patrón que
+  se bindea es por eso deliberadamente GRUESO (todo lo que no sea ASCII literal
+  pasa a `_`), la base solo ACOTA, y el match exacto lo decide Go. El resultado
+  es idéntico en los dos motores: `TestDualEngineReferenceSearch`.
+
+**Residuo declarado:** la búsqueda filtra por el PRIMER campo declarado del tipo
+destino, que es el mismo del que sale la etiqueta. Un destino sin campos, o cuyo
+primer campo no es `text`, no se puede buscar por nombre (PostgreSQL no tiene
+`LIKE` para `integer`/`numeric`/`date`); el formulario lo dice en vez de ofrecer
+un control que no funciona. Tampoco es insensible a acentos: `nandu` no encuentra
+`ñandú`, igual que no lo encontraría `ILIKE`.
+
+**Lo que NO se rompió, y era lo fácil de romper:** el valor vigente viaja con cada
+búsqueda y vuelve siempre seleccionado, coincida o no. Sin eso, buscar cualquier
+cosa que no coincida y guardar borraría una relación que nadie tocó — el defecto
+de CONTRACT-30 reconstruido desde su propio arreglo. Lo fija
+`TestSearchDoesNotDropTheCurrentRelation`, y se verificó comentando el rescate:
+el formulario pasa a mandar `autor=""` y la columna queda en NULL.
+
+El texto de abajo se conserva como registro de cómo se descubrió el hueco.
+
 **Qué pasa:** el `<select>` que CONTRACT-30 agregó al formulario de contenido
 ofrece las 100 filas más recientes del tipo destino — el MISMO tope que usa el
 listado genérico, para que lo elegible y lo visible coincidan. Si el destino

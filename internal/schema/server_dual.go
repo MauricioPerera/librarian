@@ -495,19 +495,92 @@ func dynamicContentColumns(def ContentTypeDefinition) ([]compat.RoutineResultCol
 	return columns, nil
 }
 
-// dynamicContentRoutines generates the list + read routines of ONE dynamic
-// content type. Both are reads; every write on a dynamic table needs
-// RowsAffected to answer 404 vs 200, so it stays raw SQL composed with
-// compat.Placeholder.
+// DynamicSearchRoutine names the label-search routine of one dynamic content
+// type (CONTRACT-32). It is declared ONLY for a type DynamicSearchField accepts;
+// asking for it on any other type is a "routine not found" from QueryRoutine,
+// which is why every caller must gate on DynamicSearchField first.
+func DynamicSearchRoutine(def ContentTypeDefinition) string {
+	return "content_search_" + def.TableName()
+}
+
+// DynamicSearchField answers WHICH column a search over this type filters on,
+// and whether searching it is possible at all.
+//
+// IT IS THE FIRST DECLARED FIELD, and that is not a coincidence: it is exactly
+// the field referenceOptionLabel builds the readable label from (see
+// internal/server/ui_content.go). Filtering on anything else would mean the
+// panel searches one thing and shows another, so typing what you can READ in an
+// option would fail to find it.
+//
+// IT MUST BE OF TYPE text, and that is not squeamishness either. The filter
+// compiles to LIKE/ILIKE, and PostgreSQL has no LIKE operator for integer,
+// numeric, boolean or date — `ERROR: operator does not exist: integer ~~ unknown`
+// — while SQLite would happily coerce and answer something. Declaring the
+// routine for such a type would therefore produce a routine that works on one
+// engine and fails on the other: the precise divergence this project forbids.
+// A type whose first field is not text (or that declares no field at all, which
+// is legal) simply gets no search routine, and the panel says so instead of
+// offering a control that cannot work.
+func DynamicSearchField(def ContentTypeDefinition) (FieldDefinition, bool) {
+	if len(def.Fields) == 0 || def.Fields[0].Type != FieldText {
+		return FieldDefinition{}, false
+	}
+	return def.Fields[0], true
+}
+
+// dynamicContentRoutines generates the read routines of ONE dynamic content
+// type: list, read-by-id and — when DynamicSearchField accepts it — search.
+// All of them are reads; every write on a dynamic table needs RowsAffected to
+// answer 404 vs 200, so writes stay raw SQL composed with compat.Placeholder.
 func dynamicContentRoutines(def ContentTypeDefinition) ([]compat.Routine, error) {
 	columns, err := dynamicContentColumns(def)
 	if err != nil {
 		return nil, err
 	}
 	table := def.TableName()
-	return []compat.Routine{
+	routines := []compat.Routine{
 		serverListPaged(DynamicListRoutine(def), table, columns,
 			[]compat.RoutineOrdering{serverOrderDesc("created_at"), serverOrder("id")}),
 		serverReadByID(DynamicReadRoutine(def), table, "id", "row_id", columns),
-	}, nil
+	}
+	// CONTRACT-32 T2 — THE FILTER IS PUSHED TO THE DATABASE, on purpose. The
+	// alternative the contract weighed (compat.Store.SearchText) matches in Go and
+	// is therefore identical on both engines by construction, but it reads the
+	// WHOLE table on every keystroke — undoing the bound CONTRACT-31 just
+	// established. This routine reads a bounded page instead, so the cost of a
+	// search does not grow with the target table.
+	//
+	// The price of that choice is that `like` compiles to LIKE on SQLite and
+	// ILIKE on PostgreSQL, whose case folding genuinely differs (measured: see
+	// the contract report). That divergence is neutralised on the CALLER's side —
+	// the pattern it binds is built so both engines answer the same set, and the
+	// exact matching is redone in Go. Nothing about that repair belongs here: this
+	// declaration only says WHICH column is filtered, WITH what parameter, in
+	// WHICH order, and that the order is total so the page is the same page on
+	// both engines.
+	if field, ok := DynamicSearchField(def); ok {
+		routines = append(routines, compat.Routine{
+			Name: DynamicSearchRoutine(def),
+			Parameters: []compat.RoutineParameter{
+				authParameter("search_pattern", serverText),
+				authParameter("page_limit", serverInteger),
+				authParameter("page_offset", serverInteger),
+			},
+			Actions: []compat.RoutineAction{{
+				Kind:     "select",
+				Relation: table,
+				Columns:  columns,
+				Where: ptrExpr(compat.Expression{Kind: "like", Args: []compat.Expression{
+					authColumn(field.Name), authParam("search_pattern"),
+				}}),
+				// The SAME total order the list routine declares, so "the N most
+				// recent that match" is the same notion of recent the unfiltered
+				// list uses, and a tie can never select different rows per engine.
+				OrderBy: []compat.RoutineOrdering{serverOrderDesc("created_at"), serverOrder("id")},
+				Limit:   &compat.Expression{Kind: "parameter", Value: "page_limit"},
+				Offset:  &compat.Expression{Kind: "parameter", Value: "page_offset"},
+			}},
+		})
+	}
+	return routines, nil
 }

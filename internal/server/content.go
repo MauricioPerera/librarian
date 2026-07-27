@@ -834,6 +834,46 @@ func (h *handlers) listContentRows(ctx context.Context, def schema.ContentTypeDe
 	return out, nil
 }
 
+// searchContentRows returns a page of rows whose FIRST DECLARED FIELD matches a
+// LIKE pattern, in the same total order listContentRows uses.
+//
+// CONTRACT-32. It is the read half of the relation search and it is deliberately
+// the ONLY thing this file knows about searching: the pattern arrives already
+// built (referenceSearchPattern in ui_content.go) and is BOUND, never
+// interpolated — the routine's WHERE resolves it through compileRoutineWhere,
+// which emits the engine's own placeholder. The caller is also the one that
+// decides the final matching; this returns CANDIDATES, bounded by limit.
+//
+// It refuses a type schema.DynamicSearchField does not accept instead of asking
+// for a routine that was never declared, so the failure is a sentence about the
+// definition and not a "routine not found" from the runtime.
+func (h *handlers) searchContentRows(ctx context.Context, def schema.ContentTypeDefinition, pattern string, limit, offset int) ([]map[string]any, error) {
+	if _, ok := schema.DynamicSearchField(def); !ok {
+		return nil, fmt.Errorf("content type %q declares no searchable text field", def.Name)
+	}
+	dyn, err := h.dynamicSchema(def)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := h.store.QueryRoutine(ctx, dyn, schema.DynamicSearchRoutine(def), map[string]compat.Value{
+		"search_pattern": textValue(pattern),
+		"page_limit":     integerValue(limit),
+		"page_offset":    integerValue(offset),
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]map[string]any, 0, len(rows))
+	for _, row := range rows {
+		item, err := rowJSON(row, def)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, item)
+	}
+	return out, nil
+}
+
 // fetchContentRow loads one row by id. found=false for a missing OR malformed
 // id (it is a bound parameter, so it just matches nothing); err is non-nil only
 // on a real database failure.
