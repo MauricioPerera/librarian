@@ -19,8 +19,8 @@ vez. El estado va en el índice para no tener que leerlas para saberlo.
 | 7 | [`/health` no mira la base, y una caída se ve como 401](#7-health-no-mira-la-base-y-una-caída-se-ve-como-401-alta) | **RESUELTO** (CONTRACT-24) |
 | 8 | [Un fallo de base da 500 en las rutas de datos y 503 en el resto](#8-un-fallo-de-base-da-500-en-las-rutas-de-datos-y-503-en-el-resto-baja) | **RESUELTO** (CONTRACT-25) |
 | 9 | [El selector de relación ofrece 100 filas y no tiene buscador](#9-el-selector-de-relación-ofrece-100-filas-y-no-tiene-buscador-baja) | ABIERTO |
-| 10 | [Abrir un formulario con relaciones cuesta N+1 consultas](#10-abrir-un-formulario-con-relaciones-cuesta-n1-consultas-baja) | ABIERTO |
-| 11 | [El listado genérico no muestra las columnas de relación](#11-el-listado-genérico-no-muestra-las-columnas-de-relación-baja) | ABIERTO |
+| 10 | [Abrir un formulario con relaciones cuesta N+1 consultas](#10-abrir-un-formulario-con-relaciones-cuesta-n1-consultas-baja) | **RESUELTO** (CONTRACT-31) |
+| 11 | [El listado genérico no muestra las columnas de relación](#11-el-listado-genérico-no-muestra-las-columnas-de-relación-baja) | **RESUELTO** (CONTRACT-31) |
 
 ## 1. No hay forma de otorgar permisos a un rol desde el producto (ALTA)
 
@@ -382,6 +382,14 @@ resolvió CONTRACT-30 y por eso quedó fuera de su alcance.
 
 ## 10. Abrir un formulario con relaciones cuesta N+1 consultas (BAJA)
 
+**Estado:** RESUELTO por CONTRACT-31, junto con el hueco 11: son el mismo
+problema en dos pantallas. Cada tipo destino distinto se resuelve **una vez por
+petición** (`referenceTargetCache`), así que dos relaciones al mismo destino ya
+no pagan dos veces — medido: 11 consultas con una relación y 11 con dos al mismo
+destino. El caché es POR PETICIÓN a propósito: uno compartido entre peticiones
+ofrecería filas ya borradas, que es cambiar un problema de costo por uno de
+corrección. El texto de abajo se conserva como registro.
+
 **Qué pasa:** dibujar el formulario de un tipo con relaciones cuesta, **por cada
 relación declarada**, un `FetchContentType` (para resolver el destino desde el
 registro, que es lo que evita tratar un nombre como identificador) más un
@@ -399,6 +407,20 @@ hoy se releen del registro: el nombre de un tipo nunca se trata como identificad
 sin resolverlo antes.
 
 ## 11. El listado genérico no muestra las columnas de relación (BAJA)
+
+**Estado:** RESUELTO por CONTRACT-31. El listado tiene una columna por relación,
+con la MISMA etiqueta que el selector (las dos llaman a `referenceOptionLabel`,
+no hay dos cálculos que puedan divergir). **La cota es el criterio que se midió**:
+un listado de 100 filas cuesta las mismas 12 consultas que uno de 3, porque los
+ids ya viajan en las filas leídas y se traducen contra UNA página por tipo
+destino distinto — no una consulta por fila. Una relación enteramente en NULL
+cuesta 0 extra (carga perezosa).
+
+**Residuo declarado, que es el precio de la cota:** una relación que apunta a una
+fila más vieja que esa página se muestra como `(sin resolver) · <id8>` — visible
+como PUESTA y visiblemente sin traducir, nunca confundible con la raya del NULL.
+El listado no avisa que su traducción está acotada, al estilo del aviso que sí
+tiene el formulario; la celda es la única señal.
 
 **Qué pasa:** `/admin/content/{tipo}` arma sus columnas recorriendo `def.Fields`,
 así que una relación declarada no aparece en la tabla. Se ve al abrir la fila,

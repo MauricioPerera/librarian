@@ -66,6 +66,29 @@ package server
 // products already have. The missing fourth piece was HERE, and it is what this
 // file now adds: the form offers the relations, so the body carries them, so
 // nothing is absent and nothing is silently reset. The JSON surface is untouched.
+//
+// CONTRACT-31 — THE RELATIONS, READABLE IN THE LISTING AND BOUNDED IN COST.
+// Two consequences of the previous contract are closed here, and they are the
+// same problem on two screens: turning a relation into something a person can
+// READ costs a read of the target, and that cost has to be paid once per
+// distinct target — never once per relation (the form's defect) and never once
+// per row (the defect a naive listing would have introduced).
+//
+//   - THE LISTING now has one column per declared relation, filled with the SAME
+//     text the selector shows, because both call referenceOptionLabel. Two rows
+//     pointing at different targets stopped looking identical.
+//   - THE COST is bounded by construction, not by care: the ids are already in
+//     the rows the listing read (a relation is one of the type's own columns),
+//     and they are translated against ONE page of target rows per distinct
+//     target type — see referenceCells and referenceTargetCache. A listing of a
+//     hundred rows issues exactly the queries a listing of three does.
+//   - THE FORM shares that cache, so two relations pointing at the same target
+//     stopped reading it twice.
+//
+// The bound has a price and it is stated rather than hidden: the translation is
+// as bounded as the selector's option list, so a relation pointing at a row
+// older than that page renders as unresolvedReferenceLabel — visibly SET, and
+// visibly not translated — instead of costing one more query per row.
 
 import (
 	"context"
@@ -127,8 +150,9 @@ type contentReferenceInput struct {
 	Limit     int
 }
 
-// contentRowView is one row of the generic list: the cells in field-declaration
-// order plus the id/type needed by the edit and delete controls.
+// contentRowView is one row of the generic list: the cells in own-column order
+// (fields then relations, ownColumnNames) plus the id/type needed by the edit
+// and delete controls.
 type contentRowView struct {
 	Type      string
 	ID        string
@@ -137,7 +161,8 @@ type contentRowView struct {
 }
 
 // adminContentListPage is the view model of the generic listing. Columns are
-// the type's own field names, in declaration order.
+// the type's own column names, in declaration order: its fields and then its
+// relations (ownColumnNames), which is the same order the cells are built in.
 type adminContentListPage struct {
 	pageData
 	Type    string
@@ -199,8 +224,17 @@ func (h *handlers) resolveTypeUI(w http.ResponseWriter, r *http.Request) (schema
 }
 
 // handleAdminContentList renders the rows of a dynamic type, one column per
-// declared field. A type with ZERO fields still lists its rows (id + created),
-// which is why the columns are a range and not a hardcoded header.
+// declared field AND one per declared relation. A type with ZERO fields still
+// lists its rows (id + created), which is why the columns are a range and not a
+// hardcoded header.
+//
+// CONTRACT-31: the relation columns are why this handler no longer walks
+// def.Fields to build its header — the order is taken from ownColumnNames, the
+// single spelling of "this type's own columns" that bindValues and
+// updateContentRow already zip against, so a cell can never drift under the
+// wrong header. The ids the cells translate are read from the rows this listing
+// ALREADY has (a relation is one of the type's own columns, so listContentRows
+// returns it); nothing is re-read per row.
 func (h *handlers) handleAdminContentList(w http.ResponseWriter, r *http.Request) {
 	def, ok := h.resolveTypeUI(w, r)
 	if !ok {
@@ -211,16 +245,19 @@ func (h *handlers) handleAdminContentList(w http.ResponseWriter, r *http.Request
 		h.httpOperationFailure(w, r, err)
 		return
 	}
-	columns := make([]string, 0, len(def.Fields))
-	for _, f := range def.Fields {
-		columns = append(columns, f.Name)
+	relations, err := h.referenceCells(r.Context(), def, rows)
+	if err != nil {
+		h.httpOperationFailure(w, r, err)
+		return
 	}
+	columns := ownColumnNames(def)
 	views := make([]contentRowView, 0, len(rows))
-	for _, row := range rows {
-		cells := make([]string, 0, len(def.Fields))
+	for i, row := range rows {
+		cells := make([]string, 0, len(columns))
 		for _, f := range def.Fields {
 			cells = append(cells, cellValue(row[f.Name]))
 		}
+		cells = append(cells, relations[i]...)
 		views = append(views, contentRowView{
 			Type:      def.Name,
 			ID:        fmt.Sprint(row[colID]),
@@ -549,14 +586,188 @@ func referenceRefusal(err error, fallback string) string {
 // reach the row through the JSON API; an admin who is not told simply loses it.
 const referenceOptionLimit = 100
 
+// referenceTargetPage is ONE relation target, resolved ONCE: its definition read
+// back from the registry, plus the page of its rows the panel is willing to work
+// with. Those two reads are everything a relation needs to become readable, in
+// the form AND in the listing, so they are cached together.
+//
+// labels is the id → text index of that page, built on first use. It is what
+// turns the listing's translation from "one lookup per row" into "one map
+// lookup per row": the ids to translate are already in the listed rows, so once
+// this page exists no further query depends on how many rows are shown.
+type referenceTargetPage struct {
+	def       schema.ContentTypeDefinition
+	rows      []map[string]any
+	truncated bool
+	labels    map[string]string
+}
+
+// label answers with the readable text of one target id, and whether this page
+// contains that row at all. The caller decides what to say when it does not —
+// see unresolvedReferenceLabel — because the honest answer differs between the
+// form (which can still re-fetch the ONE current value) and the listing (which
+// must not, or the cost would grow with the rows).
+func (p *referenceTargetPage) label(id string) (string, bool) {
+	if p.labels == nil {
+		p.labels = make(map[string]string, len(p.rows))
+		for _, row := range p.rows {
+			rowID, _ := row[colID].(string)
+			p.labels[rowID] = referenceOptionLabel(p.def, row)
+		}
+	}
+	text, ok := p.labels[id]
+	return text, ok
+}
+
+// referenceTargetCache resolves each DISTINCT target type at most once per
+// request.
+//
+// CONTRACT-31 T2 — WHY IT EXISTS. Before it, referenceInputs paid a
+// FetchContentType plus a listContentRows for EVERY declared relation, so a type
+// with `autor` and `prologuista` both pointing at `autores` read the same
+// definition and the same page of rows twice, for byte-identical results. The
+// cost of drawing the form was therefore the number of RELATIONS; it is now the
+// number of distinct TARGETS, which is the number of genuinely different answers
+// there are to fetch.
+//
+// It is deliberately per-request state and not a field of handlers: a page of
+// target rows is a snapshot, and caching it across requests would offer an admin
+// options that were deleted minutes ago — trading this contract's cost problem
+// for CONTRACT-30's correctness one.
+type referenceTargetCache struct {
+	h     *handlers
+	pages map[string]*referenceTargetPage
+}
+
+func (h *handlers) newReferenceTargetCache() *referenceTargetCache {
+	return &referenceTargetCache{h: h, pages: make(map[string]*referenceTargetPage)}
+}
+
+// page resolves one target type, reading it at most once. The target name comes
+// from the persisted definition and is read BACK from the registry exactly like
+// the {type} segment is — the name in a definition is never trusted as an
+// identifier.
+//
+// It asks for one row MORE than it will keep, which is how truncation is
+// detected without a second COUNT round trip.
+func (c *referenceTargetCache) page(ctx context.Context, target string) (*referenceTargetPage, error) {
+	if page, ok := c.pages[target]; ok {
+		return page, nil
+	}
+	def, err := store.FetchContentType(ctx, c.h.store, target)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := c.h.listContentRows(ctx, def, referenceOptionLimit+1, 0)
+	if err != nil {
+		return nil, err
+	}
+	page := &referenceTargetPage{def: def}
+	if len(rows) > referenceOptionLimit {
+		rows = rows[:referenceOptionLimit]
+		page.truncated = true
+	}
+	page.rows = rows
+	c.pages[target] = page
+	return page, nil
+}
+
+// referenceCells translates the relation columns of an ALREADY READ page of rows
+// into the text the listing shows, one slice of cells per row, in declaration
+// order.
+//
+// CONTRACT-31 T1 — THE COST, WHICH IS THE POINT. The ids are not fetched: they
+// travel in the rows the listing already has, because a relation is one of the
+// type's own columns. So the only reads here are the ones referenceTargetCache
+// makes, and there is at most one set of them PER DISTINCT TARGET TYPE — never
+// per row. A hundred rows pointing at a hundred different targets of the same
+// type costs exactly what three rows pointing at one target cost.
+//
+// A target is read LAZILY, on the first row that actually names one of its rows:
+// a relation whose every listed value is NULL asks the database nothing, and a
+// type with no relations at all leaves this function on its first line with the
+// listing it had before this contract.
+//
+// THE ROW THAT IS NOT ON THE PAGE. Translating is bounded, so an id can name a
+// row outside the page — see unresolvedReferenceLabel for what is shown and why
+// it is not resolved with one more query.
+func (h *handlers) referenceCells(ctx context.Context, def schema.ContentTypeDefinition, rows []map[string]any) ([][]string, error) {
+	cells := make([][]string, len(rows))
+	if len(def.References) == 0 {
+		return cells, nil
+	}
+	for i := range cells {
+		cells[i] = make([]string, 0, len(def.References))
+	}
+	cache := h.newReferenceTargetCache()
+	for _, ref := range def.References {
+		var page *referenceTargetPage
+		for i, row := range rows {
+			id, _ := row[ref.Name].(string)
+			if id == "" {
+				// A relation that is not set is a NULL like any other NULL of this
+				// listing: the em dash, so "no apunta a nada" and "apunta a algo que
+				// no supe traducir" can never be read as the same thing.
+				cells[i] = append(cells[i], cellValue(nil))
+				continue
+			}
+			if page == nil {
+				var err error
+				if page, err = cache.page(ctx, ref.Target); err != nil {
+					return nil, err
+				}
+			}
+			text, found := page.label(id)
+			if !found {
+				text = unresolvedReferenceLabel(id)
+			}
+			cells[i] = append(cells[i], text)
+		}
+	}
+	return cells, nil
+}
+
+// unresolvedReferenceLabel is what a SET relation looks like when the bounded
+// translation did not contain its target row.
+//
+// WHY THIS EXISTS AT ALL. The listing translates against the same
+// referenceOptionLimit page the selector offers, so a relation pointing at an
+// older row than those falls outside it. Resolving it with an extra read would
+// put one query per unresolved row back on the page — precisely the cost this
+// contract exists to bound — so it is NOT resolved, and the cell says so.
+//
+// WHAT IT MUST NOT BE. Not empty and not the em dash: those are what a NULL
+// looks like, and a relation that IS set must never render like one that is not.
+// Not an invented name either. So it is the id's first eight characters — the
+// same discriminator referenceOptionLabel uses, and enough to find the row
+// through the edit form or the JSON API — carried by the same "texto · id"
+// shape the resolved labels have, so the column reads as one column.
+//
+// The wording is "sin resolver" rather than "fuera de las N más recientes"
+// because both causes are indistinguishable from here and the second one would
+// sometimes be a lie: the target row can also have vanished in the window
+// between the listing read and this translation (rare — a relation's target is
+// ON DELETE RESTRICT, so it takes clearing the relation first — but real).
+func unresolvedReferenceLabel(id string) string {
+	short := id
+	if len(short) > 8 {
+		short = short[:8]
+	}
+	return "(sin resolver) · " + short
+}
+
 // referenceInputs builds one selector per declared relation, preselected with
 // `selected[name]` (the stored id when the edit form opens, the submitted id when
 // a refused form is re-rendered, "" for a create form).
 //
 // It reads the target's rows from the REGISTRY-resolved definition through the
 // same listContentRows every other read uses — no new SQL, so no new placeholder
-// dialect to get wrong — and asks for one row MORE than it will show, which is
-// how truncation is detected without a second COUNT round trip.
+// dialect to get wrong.
+//
+// CONTRACT-31 T2: the reads go through referenceTargetCache, so two relations
+// pointing at the SAME target resolve it once and share the page. The selectors
+// stay independent — two controls, two names, two current values — because what
+// is shared is the ANSWER, not the control.
 //
 // THE PRESELECTED ROW IS ADDED BACK WHEN THE CUT WOULD HIDE IT. A relation may
 // point at a row that is not in the newest `referenceOptionLimit`; if the option
@@ -566,38 +777,35 @@ const referenceOptionLimit = 100
 // fetched on its own and prepended, still marked selected.
 func (h *handlers) referenceInputs(ctx context.Context, def schema.ContentTypeDefinition, selected map[string]string) ([]contentReferenceInput, error) {
 	out := make([]contentReferenceInput, 0, len(def.References))
+	cache := h.newReferenceTargetCache()
 	for _, ref := range def.References {
-		// The target is read back from the registry, exactly like the {type}
-		// segment is: the name in the definition is never trusted as an identifier.
-		target, err := store.FetchContentType(ctx, h.store, ref.Target)
+		page, err := cache.page(ctx, ref.Target)
 		if err != nil {
 			return nil, err
 		}
 		current := strings.TrimSpace(selected[ref.Name])
-		rows, err := h.listContentRows(ctx, target, referenceOptionLimit+1, 0)
-		if err != nil {
-			return nil, err
-		}
-		in := contentReferenceInput{Name: ref.Name, Target: ref.Target, Value: current, Limit: referenceOptionLimit}
-		if len(rows) > referenceOptionLimit {
-			rows = rows[:referenceOptionLimit]
-			in.Truncated = true
+		in := contentReferenceInput{
+			Name:      ref.Name,
+			Target:    ref.Target,
+			Value:     current,
+			Limit:     referenceOptionLimit,
+			Truncated: page.truncated,
 		}
 		found := false
-		options := make([]contentReferenceOption, 0, len(rows))
-		for _, row := range rows {
+		options := make([]contentReferenceOption, 0, len(page.rows))
+		for _, row := range page.rows {
 			id, _ := row[colID].(string)
 			if id == current {
 				found = true
 			}
 			options = append(options, contentReferenceOption{
 				Value:    id,
-				Label:    referenceOptionLabel(target, row),
+				Label:    referenceOptionLabel(page.def, row),
 				Selected: id == current,
 			})
 		}
 		if current != "" && !found {
-			option, err := h.referenceOptionByID(ctx, target, current)
+			option, err := h.referenceOptionByID(ctx, page.def, current)
 			if err != nil {
 				return nil, err
 			}
