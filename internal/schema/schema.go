@@ -556,6 +556,42 @@ func contentTypeReferencesTable() compat.Table {
 	}
 }
 
+// contentTypeFoldsTable is the CONTRACT-34 register: one row per dynamic
+// content type whose real table carries SearchFoldColumn.
+//
+// WHY THE PRESENCE OF A ROW IS THE FLAG, AND WHY THERE IS NO BOOLEAN COLUMN. A
+// `folded` boolean would need a default for the rows that already exist, which
+// is the same problem as adding a column: it cannot be applied to a deployed
+// database. A row that is either there or not needs no default and no
+// migration — an installation upgrading to this binary gets an EMPTY table,
+// which reads as "no type is folded", which is exactly the truth about its
+// tables.
+//
+//   - content_type_id: the type. UNIQUE, so "folded" is a set membership and not
+//     a counter — inserting twice is a constraint violation, not a second yes.
+//     ON DELETE CASCADE, identical to content_type_fields.content_type_id and for
+//     the identical reason: this is the registry's own parent→child link, so
+//     deleting a type takes its fold marker with it in the same statement.
+//
+// There is deliberately no `created_at` and no other column: everything else
+// about the fold is derivable (which field is folded is DynamicSearchField, what
+// the fold IS is FoldSearchText), and a column nothing reads is a column that
+// drifts.
+func contentTypeFoldsTable() compat.Table {
+	return compat.Table{
+		Name: ContentTypeFoldsTable,
+		Columns: []compat.Column{
+			idColumn(),
+			uuidColumn("content_type_id", false),
+		},
+		Constraints: []compat.Constraint{
+			primaryKey("id"),
+			unique("content_type_id"),
+			foreignKeyCascade("content_type_id", ContentTypesTable, "id"),
+		},
+	}
+}
+
 // BootstrapTable is the one-row table that records that the initial bootstrap
 // (CONTRACT-22) has been performed on this installation.
 //
@@ -684,6 +720,20 @@ func BuildFor(caps Capabilities) compat.Schema {
 			// needs no entry for it — a dynamic type called
 			// "content_type_references" produces "cpt_content_type_references".
 			contentTypeReferencesTable(),
+			// CONTRACT-34 T1/T2: the register of which dynamic types carry the
+			// folded search column. It goes after content_type_references for the
+			// same reason that one went after content_type_fields — the position of
+			// every pre-existing table is untouched — and after content_types
+			// because its single foreign key points there.
+			//
+			// THE FACT THAT IT IS A NEW *TABLE* IS THE WHOLE MECHANISM, not an
+			// implementation detail. EnsureSchema creates MISSING TABLES and never
+			// alters an existing one, so a new table reaches every already-deployed
+			// installation on the next restart, with no hand-run migration and no
+			// destructive step — while a new COLUMN on content_types could not have
+			// reached any of them. That asymmetry is what let the per-type "is this
+			// type folded?" answer be persisted at all.
+			contentTypeFoldsTable(),
 			// CONTRACT-22 T1: the one-row bootstrap marker. It references nothing
 			// and nothing references it, so its position in the list is free; it
 			// goes last so the order of every pre-existing table is untouched.

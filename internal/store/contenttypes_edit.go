@@ -341,6 +341,22 @@ func EditContentType(ctx context.Context, store *compat.Store, typeName string, 
 	if err != nil {
 		return ContentTypeEdit{}, err
 	}
+	// CONTRACT-34 — THE FOLD STATE IS CARRIED, NEVER DECIDED, BY AN EDIT. Folded
+	// says whether the physical table has the system column; an edit reshapes the
+	// FIELDS and has no business adding or removing a system column, so plan.New
+	// must describe the table as it is. Getting this wrong is not cosmetic: the
+	// rebuild re-creates the table from plan.New, so a false here would silently
+	// DROP the folded column of a type that has one (and every search over it
+	// would then ask for a column the routine declares and the table lacks).
+	//
+	// It is resolved HERE and not in PlanContentTypeEdit because the plan is PURE
+	// — that purity is what makes "a rejected edit provably wrote nothing" true by
+	// construction — and this answer only exists in the database.
+	folded, err := loadFoldedTypeNames(ctx, store)
+	if err != nil {
+		return ContentTypeEdit{}, err
+	}
+	_, plan.New.Folded = folded[typeName]
 	if err := checkConfirmation(plan.Removed, confirmedRemovals); err != nil {
 		return ContentTypeEdit{}, err
 	}
@@ -426,6 +442,30 @@ func EditContentType(ctx context.Context, store *compat.Store, typeName string, 
 	for _, statement := range statements {
 		if _, err := tx.ExecContext(ctx, statement); err != nil {
 			return ContentTypeEdit{}, fmt.Errorf("rebuild table for content type %q: %w", typeName, err)
+		}
+	}
+	// CONTRACT-34 T3 — THE FOLD IS RECOMPUTED, NOT COPIED, AND UNCONDITIONALLY.
+	//
+	// compileRebuild deliberately does not list SearchFoldColumn in either copy,
+	// so after the statements above the column exists and is NULL for every row.
+	// That is not an oversight to be patched by adding it to the copy lists: an
+	// edit can RENAME the searched field, REORDER the fields so a different one
+	// becomes first, REMOVE it, or ADD a new first field that is NULL everywhere —
+	// in three of those four cases a copied fold would be a fold of text that is
+	// no longer what the panel searches, and the search would find rows by their
+	// OLD value. A stale fold is strictly worse than no fold, because it is wrong
+	// instead of merely case-sensitive.
+	//
+	// Recomputing ALWAYS rather than only when the source changed is a deliberate
+	// trade of work for the absence of a "when is it stale?" rule: a rebuild is a
+	// rare administrative action that already accepts an O(2n) copy of every row
+	// (see the file header), and this adds an O(n) pass to it. The alternative —
+	// folding in the SQL of the copy with lower() — is forbidden by the contract
+	// and would defeat the entire point: lower() is exactly what diverges between
+	// the two engines, and the fold has to happen in Go or not at all.
+	if plan.New.Folded {
+		if err := refoldRows(ctx, store.Target.Engine, tx, plan.New); err != nil {
+			return ContentTypeEdit{}, fmt.Errorf("recompute the folded search column of content type %q: %w", typeName, err)
 		}
 	}
 	if err := applyRegistryEdit(ctx, store.Target.Engine, tx, plan); err != nil {

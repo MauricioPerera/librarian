@@ -129,7 +129,7 @@ func TestCreateContentTypeCreatesRealTable(t *testing.T) {
 		t.Fatal("an UNPREFIXED table 'reviews' exists — the prefix is not being applied")
 	}
 	got := tableColumns(t, db, "cpt_reviews")
-	want := []string{"id", "author_id", "headline", "score", "price_paid", "verified", "read_on", "created_at", "updated_at", "metadata"}
+	want := []string{"id", "author_id", "headline", "score", "price_paid", "verified", "read_on", "_search_fold", "created_at", "updated_at", "metadata"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("columns of 'cpt_reviews' = %v, want %v", got, want)
 	}

@@ -510,7 +510,7 @@ func TestDeleteContentTypeNameIsReusable(t *testing.T) {
 		t.Fatalf("re-create with the same name: %v", err)
 	}
 	cols := columnsOf(t, db.DB, "cpt_eventos")
-	if strings.Join(cols, ",") != "id,author_id,encabezado,cupos,created_at,updated_at,metadata" {
+	if strings.Join(cols, ",") != "id,author_id,encabezado,cupos,_search_fold,created_at,updated_at,metadata" {
 		t.Fatalf("the re-created table has the wrong shape: %v", cols)
 	}
 	var rows int

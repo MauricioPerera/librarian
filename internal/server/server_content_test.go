@@ -357,7 +357,7 @@ func TestDynamicContentFieldValidation(t *testing.T) {
 	// And the common columns were never touched: the injected/common-column
 	// bodies could not have altered the table shape either.
 	got := tableColumns(t, db, "cpt_reviews")
-	want := []string{"id", "author_id", "headline", "score", "price_paid", "verified", "read_on", "created_at", "updated_at", "metadata"}
+	want := []string{"id", "author_id", "headline", "score", "price_paid", "verified", "read_on", "_search_fold", "created_at", "updated_at", "metadata"}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("reviews columns changed: %v, want %v", got, want)
 	}

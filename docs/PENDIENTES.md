@@ -21,7 +21,7 @@ vez. El estado va en el índice para no tener que leerlas para saberlo.
 | 9 | [El selector de relación ofrece 100 filas y no tiene buscador](#9-el-selector-de-relación-ofrece-100-filas-y-no-tiene-buscador-baja) | **RESUELTO** (CONTRACT-32) |
 | 10 | [Abrir un formulario con relaciones cuesta N+1 consultas](#10-abrir-un-formulario-con-relaciones-cuesta-n1-consultas-baja) | **RESUELTO** (CONTRACT-31) |
 | 11 | [El listado genérico no muestra las columnas de relación](#11-el-listado-genérico-no-muestra-las-columnas-de-relación-baja) | **RESUELTO** (CONTRACT-31) |
-| 12 | [El buscador del selector de relación distingue mayúsculas](#12-el-buscador-del-selector-de-relación-distingue-mayúsculas-media) | ABIERTO |
+| 12 | [El buscador del selector de relación distingue mayúsculas](#12-el-buscador-del-selector-de-relación-distingue-mayúsculas-media) | **PARCIAL** (CONTRACT-34): resuelto para los tipos creados desde CONTRACT-34; sigue ABIERTO para los anteriores |
 
 ## 1. No hay forma de otorgar permisos a un rol desde el producto (ALTA)
 
@@ -479,15 +479,73 @@ vez, en otra pantalla: conviene resolver los dos juntos.
 
 ## 12. El buscador del selector de relación distingue mayúsculas (MEDIA)
 
-**Estado:** ABIERTO. Lo introdujo CONTRACT-33 a sabiendas, como precio de volver
-a tener buscador contra `sqlite-postgres-compat` v0.7.0.
+**Estado:** PARCIALMENTE RESUELTO por CONTRACT-34
+(`specs/CONTRACT-34-busqueda-insensible.md`). Lo introdujo CONTRACT-33 a
+sabiendas, como precio de volver a tener buscador contra
+`sqlite-postgres-compat` v0.7.0.
 
-**Qué pasa:** en el buscador del selector de relación
-(`GET /admin/content/{tipo}/reference?name={relación}`), escribir `borges` **no**
-encuentra la fila `BORGES`, y escribir `ábaco` no encuentra `Ábaco`. Hay que
-escribir el texto tal como figura. El formulario lo dice al lado de la caja
-(`reference-search-case-{relación}`), que es lo mínimo para que no se confunda con
-«esa fila no existe», pero decirlo no es resolverlo.
+**Qué quedó resuelto:** todo tipo de contenido dinámico **creado desde
+CONTRACT-34** lleva una columna de sistema `_search_fold` con el valor del campo
+buscado en minúsculas (plegado con `strings.ToLower`, **en Go**), y la búsqueda
+hace `contains` sobre esa columna con la aguja plegada por la misma función. En
+esos tipos `borges` encuentra `BORGES` y `ñandú` encuentra `ÑANDÚ`, en los dos
+motores, y sin que la base pliegue nada: sigue haciendo una comparación exacta,
+que es lo único que hace igual en SQLite y en PostgreSQL. Los acentos siguen
+contando (`nandu` no encuentra `ñandú`): plegar acentos es otra decisión, más
+grande, sobre todo el panel.
+
+**Qué sigue abierto, y es la parte que hay que leer:** un tipo creado **antes** de
+CONTRACT-34 **no** tiene esa columna, así que su búsqueda sigue distinguiendo
+mayúsculas exactamente como la describe el resto de esta sección. El arranque
+(`EnsureSchema`) crea tablas faltantes y **nunca altera una existente** —esa
+restricción es lo que hace seguro cada reinicio y no se tocó—, así que la columna
+no aparece sola.
+
+**No hay migración, y la razón está medida, no supuesta.** La única maquinaria
+capaz de cambiar la forma de una tabla es la reconstrucción de CONTRACT-18, que
+**borra y recrea** la tabla (compat no tiene `ALTER TABLE` ni `RENAME`). La
+guarda de CONTRACT-27 rechaza esa reconstrucción para cualquier tipo que otro
+tipo referencie, porque una foreign key prohíbe justamente ese `DROP` y este
+proyecto nunca emite `CASCADE`. Y el conjunto que esa guarda excluye no es un
+borde: **el buscador de relación solo corre sobre el DESTINO de una relación**, o
+sea que «los tipos que el buscador sirve» y «los tipos que la reconstrucción
+rechaza» son el mismo conjunto. Una migración construida sobre esa maquinaria no
+podría alcanzar ni uno solo de los tipos cuyo buscador se quiere arreglar. Medido
+en `TestRebuildIsRefusedForARelationTarget` (`internal/server`).
+
+**Precisión del orquestador sobre ese argumento, porque es más angosto de lo que
+suena:** vale para los tipos que HOY son destino de una relación. Un tipo viejo
+que todavía NO es destino sí se puede reconstruir — y aun así tampoco obtiene la
+columna, porque la reconstrucción **arrastra** el estado de plegado y nunca lo
+enciende (`contenttypes_edit.go`: «THE FOLD STATE IS CARRIED, NEVER DECIDED, BY
+AN EDIT»). Así que el conjunto realmente inalcanzable es más grande que el que
+describe el párrafo anterior: no es solo «los destinos actuales», es **todo tipo
+anterior a CONTRACT-34**, incluidos los que mañana serán destino y hoy podrían
+migrarse sin que nada lo impida. Eso no cambia la decisión de no entregar
+migración en ese contrato, pero sí cambia qué haría falta para entregarla: no
+alcanza con reconstruir, hay que poder ENCENDER el plegado.
+
+**Cómo se sabe en qué modo está cada tipo, que es la condición innegociable:** el
+formulario lo dice al lado de la caja de búsqueda, por destino y con dos textos
+distintos — `reference-search-fold-{relación}` («No distingue mayúsculas…») o
+`reference-search-case-{relación}` («Distingue mayúsculas…»). Además la
+definición que devuelve la API (`GET /content-types`, `GET /content-types/{name}`)
+trae `"folded": true` en los tipos que ya tienen la columna y omite el campo en
+los que no. Dos tipos que se ven iguales y se comportan distinto **sin avisar**
+sería peor que el hueco; por eso esto es parte del arreglo y no un adorno.
+
+**La vía de salida para los tipos viejos**, cuando se decida pagarla: recrear el
+tipo (crearlo de nuevo y mover los datos), o un contrato que enseñe a la
+reconstrucción a soltar y rehacer las foreign keys que apuntan al tipo dentro de
+la misma transacción. Lo segundo es un contrato propio: toca la integridad
+referencial de todo el esquema compuesto.
+
+**Qué pasaba (y sigue pasando en un tipo sin la columna):** en el buscador del
+selector de relación (`GET /admin/content/{tipo}/reference?name={relación}`),
+escribir `borges` **no** encuentra la fila `BORGES`, y escribir `ábaco` no
+encuentra `Ábaco`. Hay que escribir el texto tal como figura. El formulario lo
+dice al lado de la caja (`reference-search-case-{relación}`), que es lo mínimo
+para que no se confunda con «esa fila no existe», pero decirlo no es resolverlo.
 
 **Por qué es MEDIA y no BAJA:** es una regresión funcional visible para quien usa
 el panel. Antes de CONTRACT-33 el mismo buscador era insensible a mayúsculas en
@@ -518,7 +576,9 @@ minúsculas en Go. Es portable porque **el plegado ocurre en Go**, idéntico en 
 dos motores por construcción, y la base sigue haciendo un `contains` que no pliega
 nada.
 
-No se hace acá porque es un **cambio de esquema para tipos dinámicos**: una columna
-más por tipo, que hay que crear al declarar el tipo, rellenar en cada escritura,
-mantener en las ediciones de campos (CONTRACT-18) y decidir qué hacer con las filas
-que ya existen. Merece contrato propio.
+No se hizo en CONTRACT-33 porque es un **cambio de esquema para tipos dinámicos**:
+una columna más por tipo, que hay que crear al declarar el tipo, rellenar en cada
+escritura, mantener en las ediciones de campos (CONTRACT-18) y decidir qué hacer
+con las filas que ya existen. Eso es exactamente lo que hizo CONTRACT-34, y la
+última de esas cuatro cosas —las filas y los tipos que ya existen— es la que quedó
+sin resolver, por la razón medida que está más arriba.

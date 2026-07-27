@@ -188,7 +188,7 @@ func TestDeleteContentTypeNameIsReusableOverHTTP(t *testing.T) {
 	if status, body := doJSON(t, srv, http.MethodPost, "/content-types", again, authHeader(admin)); status != http.StatusCreated {
 		t.Fatalf("re-create: %d %v", status, body)
 	}
-	if got := strings.Join(tableColumns(t, db, "cpt_eventos"), ","); got != "id,author_id,encabezado,cupos,created_at,updated_at,metadata" {
+	if got := strings.Join(tableColumns(t, db, "cpt_eventos"), ","); got != "id,author_id,encabezado,cupos,_search_fold,created_at,updated_at,metadata" {
 		t.Fatalf("re-created shape: %s", got)
 	}
 	status, list := doJSON(t, srv, http.MethodGet, "/content/eventos", nil, authHeader(admin))

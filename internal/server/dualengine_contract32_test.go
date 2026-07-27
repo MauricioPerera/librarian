@@ -12,11 +12,18 @@ package server
 //
 // CONTRACT-33 CHANGED THE OPERATOR AND THIS BATTERY IS WHERE THAT SHOWS. compat
 // v0.7.0 refuses `like` (LIKE on SQLite, ILIKE on PostgreSQL — genuinely
-// different sets), so the WHERE is now `contains`: instr/strpos, case-sensitive,
-// no wildcards, no escape character. The needle is bound EXACTLY as typed. The
-// queries below are unchanged on purpose — the traps are the same traps — but the
-// answers to the cased ones are now the case-sensitive ones on BOTH engines,
-// which is the whole point: identical, at the price of folding nothing.
+// different sets), so the WHERE is now `contains`: instr/strpos, no wildcards,
+// no escape character. The needle is bound EXACTLY as typed.
+//
+// CONTRACT-34 CHANGED THE COLUMN, NOT THE OPERATOR, AND THIS BATTERY IS WHERE
+// THAT SHOWS TOO. The types created below go through the real API, so they carry
+// the folded system column; the WHERE runs over it and the needle is lowercased
+// by the same Go function that wrote it. So the cased queries answer
+// case-INSENSITIVELY again — `borges` finds `BORGES`, `ñandú` finds `ÑANDÚ` — and
+// they answer it IDENTICALLY on both engines, which is the property this file
+// exists to defend. Nothing was folded by either engine; both were handed two
+// strings Go had already folded. The queries below are unchanged on purpose: the
+// traps are the same traps, only the answers moved.
 //
 // It runs in two halves:
 //

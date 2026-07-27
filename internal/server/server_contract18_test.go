@@ -145,7 +145,7 @@ func TestEditContentTypeDataLossNeedsItemisedConfirmation(t *testing.T) {
 		t.Fatalf("confirmed removal: status=%d body=%v, want 200", status, body)
 	}
 	got := tableColumns(t, db, "cpt_reviews")
-	want := "id,author_id,headline,score,created_at,updated_at,metadata"
+	want := "id,author_id,headline,score,_search_fold,created_at,updated_at,metadata"
 	if strings.Join(got, ",") != want {
 		t.Fatalf("columns after the confirmed removal = %v, want %s", got, want)
 	}
@@ -207,7 +207,7 @@ func TestEditContentTypeHTTPRejections(t *testing.T) {
 		t.Logf("%-28s → %d %s", c.name, status, msg)
 	}
 	// The type is untouched by every one of them.
-	if got := strings.Join(tableColumns(t, db, "cpt_reviews"), ","); got != "id,author_id,headline,score,price_paid,verified,read_on,created_at,updated_at,metadata" {
+	if got := strings.Join(tableColumns(t, db, "cpt_reviews"), ","); got != "id,author_id,headline,score,price_paid,verified,read_on,_search_fold,created_at,updated_at,metadata" {
 		t.Fatalf("a rejected edit changed the table: %s", got)
 	}
 }

@@ -49,16 +49,23 @@
            hx-include="#reference-select-{{.Name}}"
            hx-target="#reference-options-{{.Name}}"
            hx-swap="outerHTML">
-    {{/* CONTRACT-33 — el aviso va ACÁ, pegado a la caja donde se escribe, y no
-         adentro del bloque de opciones: el fragmento htmx reemplaza solo las
+    {{/* CONTRACT-33/34 — el aviso va ACÁ, pegado a la caja donde se escribe, y
+         no adentro del bloque de opciones: el fragmento htmx reemplaza solo las
          opciones, así que un aviso puesto ahí desaparecería justo cuando la
          persona está buscando. Acá queda fijo mientras dura el formulario.
 
-         Y hay que decirlo: la búsqueda pasó a distinguir mayúsculas porque el
-         operador portable (`contains`) no pliega — plegar Unicode devuelve
-         conjuntos distintos según el motor. Un buscador que parece insensible y
-         no lo es hace que uno concluya que la fila no existe. */}}
-    <span class="muted" id="reference-search-case-{{.Name}}">Distingue mayúsculas y minúsculas: «borges» no encuentra «BORGES». Escribilo tal cual figura.</span>
+         Y DICE CUÁL DE LOS DOS MODOS APLICA, que es lo que el CONTRACT-34 exige.
+         Un tipo creado con la columna plegada busca sin distinguir mayúsculas
+         (el plegado lo hace la aplicación, en Go, y la base sigue comparando
+         exacto). Un tipo creado ANTES no tiene esa columna —el arranque nunca
+         altera una tabla existente— y su búsqueda sigue distinguiendo. Que dos
+         tipos se vean iguales y se comporten distinto sin avisar es peor que el
+         hueco que estamos cerrando. */}}
+    {{if .Folded}}
+    <span class="muted" id="reference-search-fold-{{.Name}}">No distingue mayúsculas ni minúsculas: «borges» encuentra «BORGES». Los acentos sí cuentan: «nandu» no encuentra «ñandú».</span>
+    {{else}}
+    <span class="muted" id="reference-search-case-{{.Name}}">Distingue mayúsculas y minúsculas: «borges» no encuentra «BORGES». Escribilo tal cual figura. (Este tipo se creó antes de que existiera la búsqueda insensible.)</span>
+    {{end}}
     {{end}}
     {{template "content_reference_options" .}}
   </label>

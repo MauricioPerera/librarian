@@ -12,6 +12,7 @@ package schema
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/MauricioPerera/sqlite-postgres-compat/compat"
 )
@@ -25,6 +26,10 @@ const (
 	ContentTypesTable = "content_types"
 	// ContentTypeFieldsTable holds one row per field of a dynamic content type.
 	ContentTypeFieldsTable = "content_type_fields"
+	// ContentTypeFoldsTable holds one row per dynamic content type whose real
+	// table carries SearchFoldColumn (CONTRACT-34). A type with no row there does
+	// not have the column, and its search stays case-sensitive.
+	ContentTypeFoldsTable = "content_type_folds"
 )
 
 // FieldType is the closed set of scalar field types a dynamic content type may
@@ -97,10 +102,39 @@ type FieldDefinition struct {
 // `omitempty` so every JSON artifact produced before this contract — the
 // `--dump-schema` output of an installation with no relations, the API
 // responses — is byte-identical to what it was.
+//
+// CONTRACT-34 adds Folded, which is NOT a declaration an admin writes: it says
+// whether this type's real table CARRIES the system column SearchFoldColumn, and
+// its only source of truth is the registry table ContentTypeFoldsTable, written
+// in the SAME transaction that creates the table. It is part of the definition
+// because the definition is what composes the table AND its routines, and those
+// two must agree with the physical column set exactly — a definition claiming a
+// column the table does not have makes every read of that type fail.
+//
+// It is `omitempty` for the same reason References is: every artifact produced
+// before this contract — the `--dump-schema` output, the API responses of an
+// installation whose types predate it — stays byte-identical.
 type ContentTypeDefinition struct {
 	Name       string                `json:"name"`
 	Fields     []FieldDefinition     `json:"fields"`
 	References []ReferenceDefinition `json:"references,omitempty"`
+	Folded     bool                  `json:"folded,omitempty"`
+}
+
+// FoldSearchText is THE fold, and there is exactly one of it on purpose: the
+// value written into SearchFoldColumn and the needle bound into the search WHERE
+// both go through this function, so the two can never disagree about what
+// "folded" means. A second spelling anywhere would make a search silently miss
+// rows whose fold was computed by the other one.
+//
+// strings.ToLower and nothing else. It folds the whole Unicode range (`Ñ`→`ñ`,
+// `Ú`→`ú`), which is exactly what `like` used to do on only one engine, and it
+// does it IN GO — identical on SQLite and PostgreSQL by construction, because
+// neither engine is involved. It deliberately does NOT strip accents: `nandu`
+// still does not find `ñandú`. Accent folding is a different, larger decision
+// about the whole panel and is not this contract's to take.
+func FoldSearchText(s string) string {
+	return strings.ToLower(s)
 }
 
 // Validate applies the T1 identifier gate to the type name and to every field
@@ -187,6 +221,27 @@ func DynamicTable(d ContentTypeDefinition) (compat.Table, error) {
 		own = append(own, compat.Column{
 			Name:     r.Name,
 			Type:     compat.Type{Family: compat.UUIDType},
+			Nullable: true,
+		})
+	}
+	// CONTRACT-34: the folded search column, LAST of the own columns, and only
+	// for a type whose registry says it has one (see ContentTypeFoldsTable). It is
+	// appended after the references so that adding it changes nothing about the
+	// physical position of any column an admin declared — a type created before
+	// this contract and one created after it differ by an appended column and
+	// nothing else.
+	//
+	// It is TEXT and NULLABLE unconditionally, INCLUDING for a type whose first
+	// field is not text and which therefore has nothing to fold (see
+	// DynamicSearchField). Making its presence depend on searchability would tie
+	// the physical shape of a table to a property an EDIT can flip — renaming or
+	// reordering fields can make a type searchable or stop it being so — and every
+	// such flip would then require a rebuild. Presence depends only on Folded; what
+	// the column CONTAINS (a folded value, or NULL) is what depends on the fields.
+	if d.Folded {
+		own = append(own, compat.Column{
+			Name:     SearchFoldColumn,
+			Type:     compat.Type{Family: compat.TextType},
 			Nullable: true,
 		})
 	}

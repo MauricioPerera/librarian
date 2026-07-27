@@ -143,7 +143,7 @@ func TestAdminContentTypeEditShowsDataLossBeforeDestroyingIt(t *testing.T) {
 	if status != http.StatusSeeOther {
 		t.Fatalf("confirmed submit: status = %d, want 303. body: %.900q", status, body)
 	}
-	if got, want := dynamicColumns(t, db, "eventos"), "id,author_id,encabezado,asistentes,resumen,created_at,updated_at,metadata"; got != want {
+	if got, want := dynamicColumns(t, db, "eventos"), "id,author_id,encabezado,asistentes,resumen,_search_fold,created_at,updated_at,metadata"; got != want {
 		t.Fatalf("columns after the confirmed edit = %s, want %s", got, want)
 	}
 	var encabezado string
@@ -193,7 +193,7 @@ func TestAdminContentTypeEditWithoutRemovalNeedsNoConfirmation(t *testing.T) {
 	if status != http.StatusSeeOther {
 		t.Fatalf("status = %d, want 303 (no confirmation needed). body: %.600q", status, body)
 	}
-	if got, want := dynamicColumns(t, db, "notas"), "id,author_id,encabezado,cuerpo,created_at,updated_at,metadata"; got != want {
+	if got, want := dynamicColumns(t, db, "notas"), "id,author_id,encabezado,cuerpo,_search_fold,created_at,updated_at,metadata"; got != want {
 		t.Fatalf("columns = %s, want %s", got, want)
 	}
 	t.Logf("NO-REMOVAL OK: applied on the first submit; columns %s", dynamicColumns(t, db, "notas"))

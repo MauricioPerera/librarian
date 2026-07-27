@@ -572,7 +572,22 @@ func dynamicContentRoutines(def ContentTypeDefinition) ([]compat.Routine, error)
 	// internal/server/ui_content.go and docs/PENDIENTES.md. This declaration only
 	// says WHICH column is filtered, WITH what parameter, in WHICH order, and that
 	// the order is total so the page is the same page on both engines.
+	//
+	// CONTRACT-34 — WHICH COLUMN IS FILTERED NOW DEPENDS ON THE TYPE, and that is
+	// the entire fix for the case-sensitivity regression above. For a FOLDED type
+	// the WHERE runs over SearchFoldColumn, which the application keeps as the
+	// lowercased copy of the search field, and the caller binds the needle through
+	// the SAME FoldSearchText. Both sides are already folded, so the engine keeps
+	// doing the ONE thing both engines do identically — a plain exact substring
+	// test — and the fold never happens in the database, which is what keeps this
+	// portable. For an UNFOLDED type (every type created before this contract:
+	// EnsureSchema never alters an existing table) nothing changes and the search
+	// stays case-sensitive; the panel SAYS which of the two modes applies.
 	if field, ok := DynamicSearchField(def); ok {
+		searchColumn := field.Name
+		if def.Folded {
+			searchColumn = SearchFoldColumn
+		}
 		routines = append(routines, compat.Routine{
 			Name: DynamicSearchRoutine(def),
 			Parameters: []compat.RoutineParameter{
@@ -585,7 +600,7 @@ func dynamicContentRoutines(def ContentTypeDefinition) ([]compat.Routine, error)
 				Relation: table,
 				Columns:  columns,
 				Where: ptrExpr(compat.Expression{Kind: "contains", Args: []compat.Expression{
-					authColumn(field.Name), authParam("search_text"),
+					authColumn(searchColumn), authParam("search_text"),
 				}}),
 				// The SAME total order the list routine declares, so "the N most
 				// recent that match" is the same notion of recent the unfiltered

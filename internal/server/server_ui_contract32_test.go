@@ -409,26 +409,29 @@ func htmlEscapeForTest(s string) string {
 	return r.Replace(s)
 }
 
-// TestSearchIsCaseSensitiveIncludingAccents is the REWRITTEN twin of
-// TestSearchIsCaseInsensitiveIncludingAccents, and it is rewritten rather than
-// deleted on purpose: a test dropped during a migration is a property that stops
-// being true with nobody recording that it did.
+// TestSearchIsCaseInsensitiveIncludingAccents is the SAME test for the THIRD
+// time, and the third rewrite is the point: the questions have never changed,
+// only the answer, and each answer is the truth of the mechanism in force. A test
+// deleted at any of the three steps would have been a property that stopped being
+// true with nobody recording that it did. Its full history is in the git log.
 //
-// WHAT IT USED TO ASSERT (CONTRACT-32): `ñandú` finds `ÑANDÚ`. The `like` WHERE
-// folded at least ASCII on both engines, so the true matches always reached Go
-// and referenceSearchMatches — case-insensitive over the whole Unicode range —
-// could level the two engines UP to the better behaviour.
+//	CONTRACT-32 (`like`)      `ñandú` FINDS `ÑANDÚ` — LIKE/ILIKE folded, unevenly.
+//	CONTRACT-33 (`contains`)  `ñandú` does NOT find `ÑANDÚ` — instr/strpos do not
+//	                          fold at all, and folding Unicode in the DATABASE is
+//	                          exactly what diverges between the engines.
+//	CONTRACT-34 (folded col)  `ñandú` FINDS `ÑANDÚ` again — and this time for a
+//	                          reason that cannot diverge: the application keeps a
+//	                          lowercased COPY of the field (schema.FoldSearchText,
+//	                          in Go), the needle is lowercased by the SAME
+//	                          function, and the database still does nothing but an
+//	                          exact substring test.
 //
-// WHAT IT ASSERTS NOW (CONTRACT-33): `ñandú` does NOT find `ÑANDÚ`. compat v0.7.0
-// refuses `like`, and the portable replacement `contains` compiles to
-// instr/strpos, which do not fold. The row is discarded by the WHERE, so Go never
-// sees it and no amount of folding in Go can bring it back. The regression is
-// real and visible in the panel; it is registered as a gap in docs/PENDIENTES.md
-// with its way out, and the form states it next to the search box.
-//
-// The accented cases are kept exactly because that is where the old divergence
-// lived: what changed is the ANSWER, not the questions asked.
-func TestSearchIsCaseSensitiveIncludingAccents(t *testing.T) {
+// The accented cases are kept exactly because that is where the divergence lived.
+// `autores` is created through the panel, so it is FOLDED (every type created
+// from this contract on is); the legacy half — a type WITHOUT the column, whose
+// search is still case-sensitive — is asserted in the CONTRACT-34 file, against a
+// table shaped like the ones that predate this contract.
+func TestSearchIsCaseInsensitiveIncludingAccents(t *testing.T) {
 	db, srv, cleanup := openUITLS(t)
 	defer cleanup()
 	grant(t, db, "editor", "content_types.manage", "content.create")
@@ -445,16 +448,20 @@ func TestSearchIsCaseSensitiveIncludingAccents(t *testing.T) {
 		want  []string
 		deny  []string
 	}{
-		// The case barrier, in both directions. Each query finds the row spelled
-		// its way and NOT the one spelled the other way.
-		{"ñandú", []string{"ñandú menor"}, []string{"ÑANDÚ", "Ábaco", "abaco sin tilde"}},
-		{"ÑANDÚ", []string{"ÑANDÚ"}, []string{"ñandú menor", "Ábaco"}},
+		// THE CASE BARRIER IS GONE, in both directions: each query finds the row
+		// spelled its way AND the one spelled the other way, for the non-ASCII
+		// letters (`ñ`/`Ñ`, `ú`/`Ú`, `á`/`Á`) that are precisely where the two
+		// engines' own folding disagreed.
+		{"ñandú", []string{"ñandú menor", "ÑANDÚ"}, []string{"Ábaco", "abaco sin tilde"}},
+		{"ÑANDÚ", []string{"ÑANDÚ", "ñandú menor"}, []string{"Ábaco", "abaco sin tilde"}},
 		{"Ábaco", []string{"Ábaco"}, []string{"abaco sin tilde", "ÑANDÚ"}},
+		// THE ACCENT IS STILL A BARRIER, and deliberately so: the fold is
+		// strings.ToLower and nothing else, so `abaco` does not find `Ábaco`.
+		// Accent-insensitive search is a different, larger decision about the whole
+		// panel and this contract does not take it.
 		{"abaco", []string{"abaco sin tilde"}, []string{"Ábaco", "ÑANDÚ"}},
-		// And the accent itself is NOT the barrier: `baco` — a pure-ASCII needle
-		// whose match runs right after a non-ASCII letter — finds both rows. So
-		// what `contains` lost is case folding specifically, not the ability to
-		// match text with accents in it.
+		// And a pure-ASCII needle whose match runs right after a non-ASCII letter
+		// still finds both rows, exactly as under `contains`.
 		{"baco", []string{"Ábaco", "abaco sin tilde"}, []string{"ÑANDÚ", "ñandú menor"}},
 	}
 	for _, c := range cases {
@@ -474,22 +481,27 @@ func TestSearchIsCaseSensitiveIncludingAccents(t *testing.T) {
 		}
 	}
 
-	// THE REGRESSION, ASSERTED AS A WHOLE and not only as an absent label: a query
-	// that differs from the row ONLY in case answers «ninguna coincide». That is
-	// exactly what the admin sees, and it is why the form has to say the search
-	// distinguishes case — otherwise this message reads as "that row is not here".
-	_, fragment := uiSearchReference(t, client, srv, "libros", "autor", "ábaco", "")
-	if !strings.Contains(fragment, `id="reference-no-matches-autor"`) {
-		t.Errorf("searching «ábaco» against the row «Ábaco» found something — case folding came back without the docs: %.500q", fragment)
+	// THE REGRESSION IS GONE, ASSERTED AS A WHOLE: the query that differed from the
+	// row ONLY in case used to answer «ninguna coincide», which read to an admin as
+	// "that row is not here". Now it finds it.
+	_, fragment := uiSearchReference(t, client, srv, "libros", "autor", "ÁBACO", "")
+	if strings.Contains(fragment, `id="reference-no-matches-autor"`) {
+		t.Errorf("searching «ÁBACO» against the row «Ábaco» still found nothing: %.500q", fragment)
+	}
+	if !strings.Contains(fragment, htmlEscapeForTest("Ábaco")) {
+		t.Errorf("searching «ÁBACO» does not offer «Ábaco»: %.500q", fragment)
 	}
 
-	// And the form WARNS about it, where the searching happens.
+	// And the form SAYS which mode applies, where the searching happens.
 	_, page := getBody(t, client, srv.URL+"/admin/content/libros/new")
-	if !strings.Contains(page, `id="reference-search-case-autor"`) {
-		t.Fatalf("the form does not warn that the search distinguishes case: %.1200q", page)
+	if !strings.Contains(page, `id="reference-search-fold-autor"`) {
+		t.Fatalf("the form does not state that this target's search ignores case: %.1200q", page)
 	}
-	if !strings.Contains(page, "Distingue mayúsculas") {
-		t.Errorf("the warning does not say what it warns about: %.1200q", page)
+	if strings.Contains(page, `id="reference-search-case-autor"`) {
+		t.Errorf("the form still warns about case for a FOLDED target: %.1200q", page)
+	}
+	if !strings.Contains(page, "No distingue mayúsculas") {
+		t.Errorf("the notice does not say what it states: %.1200q", page)
 	}
 }
 

@@ -215,7 +215,7 @@ func TestEditContentTypeRoundTripWithRealData(t *testing.T) {
 		t.Fatalf("staging table(s) left behind: %v", leftovers)
 	}
 	gotCols := columnsOf(t, db.DB, "cpt_eventos")
-	wantCols := []string{"id", "author_id", "encabezado", "asistentes", "gratis", "resumen", "created_at", "updated_at", "metadata"}
+	wantCols := []string{"id", "author_id", "encabezado", "asistentes", "gratis", "resumen", "_search_fold", "created_at", "updated_at", "metadata"}
 	if strings.Join(gotCols, ",") != strings.Join(wantCols, ",") {
 		t.Fatalf("columns = %v, want %v", gotCols, wantCols)
 	}

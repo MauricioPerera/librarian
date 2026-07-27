@@ -133,6 +133,31 @@ package server
 //     not exist. See templates/content_fields.html.
 //   - referenceSearchPattern is GONE, not simplified — see the note where it used
 //     to live, above referenceSearchMatches.
+//
+// CONTRACT-34 — THE DAY THE FOLDED COLUMN ARRIVED, and the prediction above held:
+// exactly ONE layer changed. Every dynamic type created from this contract on
+// carries the system column schema.SearchFoldColumn, which the CRUD layer keeps
+// as the lowercased copy of the searched field; the routine's WHERE runs over it
+// and content.go binds the needle through the SAME schema.FoldSearchText. The
+// fold happens in Go on BOTH sides, so the database still only ever does the
+// exact substring test — the portability argument of CONTRACT-33 is untouched,
+// and no `lower()` appears in any statement this project emits.
+//
+// referenceSearchMatches did not change a character, and now it filters again
+// (the WHERE stopped being narrower than it). The two behaviours that DID change
+// are the answer — `borges` finds `BORGES` — and the sentence the form shows.
+//
+// THE SEARCH IS NOT UNIFORM ACROSS AN INSTALLATION, AND THAT IS THE PART THAT
+// MUST NEVER BE SILENT. EnsureSchema creates missing tables and never alters an
+// existing one — the restriction that makes every restart safe — so a type
+// created BEFORE this contract has no such column and its search is still
+// case-sensitive. Migrating those types was evaluated and NOT shipped: the only
+// machinery that can reshape a table is the CONTRACT-18 rebuild, which drops and
+// re-creates it, which CONTRACT-27's guard refuses for any type something
+// references — and a relation TARGET is the only kind of type this search ever
+// runs over (measured: TestRebuildIsRefusedForARelationTarget). So the form
+// STATES which of the two modes applies, per target, next to the box where the
+// searching happens: contentReferenceInput.Folded and content_fields.html.
 
 import (
 	"context"
@@ -208,7 +233,17 @@ type contentReferenceInput struct {
 	Truncated  bool
 	Limit      int
 	Searchable bool
-	Empty      bool
+	// Folded says the TARGET type carries the folded search column, i.e. that its
+	// search ignores case. It is in the view model because the form has to SAY
+	// which of the two modes applies, and the two modes coexist by design: a type
+	// created before CONTRACT-34 does not have the column (EnsureSchema never
+	// alters an existing table) and its search still distinguishes case. Two
+	// targets that look identical and behave differently WITHOUT saying so is
+	// strictly worse than the case-sensitivity this contract set out to remove —
+	// that is why this field exists and why the template branches on it rather than
+	// picking one sentence.
+	Folded bool
+	Empty  bool
 	// NoMatches says the SEARCH matched no row of the target. It is not
 	// `len(Options) == 0`: a fruitless search still carries the current value as
 	// an option (that rescue is the point of this contract), so counting options
@@ -909,8 +944,13 @@ func (h *handlers) referenceInput(ctx context.Context, def schema.ContentTypeDef
 		Limit:      referenceOptionLimit,
 		Truncated:  page.truncated,
 		Searchable: searchable && !empty,
-		Empty:      empty,
-		NoMatches:  query != "" && len(page.rows) == 0,
+		// CONTRACT-34: which of the two search MODES this target is in. It is read
+		// from the TARGET's definition (page.def), never from the type being edited:
+		// the search runs over the target's table, so it is the target's column set
+		// that decides whether the comparison folds.
+		Folded:    page.def.Folded,
+		Empty:     empty,
+		NoMatches: query != "" && len(page.rows) == 0,
 	}
 	found := false
 	options := make([]contentReferenceOption, 0, len(page.rows))

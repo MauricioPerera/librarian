@@ -860,6 +860,21 @@ func (h *handlers) searchContentRows(ctx context.Context, def schema.ContentType
 	if err != nil {
 		return nil, err
 	}
+	// CONTRACT-34 — THE NEEDLE IS FOLDED HERE, AND ONLY WHEN THE COLUMN IS. For a
+	// folded type the routine's WHERE runs over schema.SearchFoldColumn, whose
+	// content is the lowercased copy of the field; comparing an unfolded needle
+	// against it would find nothing typed in capitals. For an unfolded type (every
+	// type that predates this contract) the WHERE still runs over the field itself
+	// and folding the needle would be the mirror mistake. The two decisions are
+	// made from the SAME def.Folded that composed the routine, one line apart from
+	// each other, so they cannot drift.
+	//
+	// Both sides go through schema.FoldSearchText, in Go. The engine receives two
+	// already-folded strings and performs the exact substring test that is the only
+	// thing it does identically on both engines.
+	if def.Folded {
+		needle = schema.FoldSearchText(needle)
+	}
 	rows, err := h.store.QueryRoutine(ctx, dyn, schema.DynamicSearchRoutine(def), map[string]compat.Value{
 		"search_text": textValue(needle),
 		"page_limit":  integerValue(limit),
@@ -934,6 +949,17 @@ func (h *handlers) insertContentRow(ctx context.Context, def schema.ContentTypeD
 		columns = append(columns, quoted)
 		args = append(args, values[i])
 	}
+	// CONTRACT-34: the folded copy of the searched field, written by the SAME
+	// statement that writes the field itself. It is not a trigger, not a second
+	// statement and not a background job, precisely so that "the fold agrees with
+	// the value" needs no reconciliation: there is no instant at which a row exists
+	// with one and not the other. The fold is computed in Go
+	// (store.SearchFoldValue → schema.FoldSearchText); nothing in this statement
+	// asks the engine to fold anything.
+	if def.Folded {
+		columns = append(columns, quote(schema.SearchFoldColumn))
+		args = append(args, store.SearchFoldValue(def, values))
+	}
 	query := `INSERT INTO ` + table + ` (` + strings.Join(columns, ", ") + `) VALUES (` +
 		bindList(engine, 1, len(args)) + `)`
 	if _, err := h.db.ExecContext(ctx, query, args...); err != nil {
@@ -967,6 +993,17 @@ func (h *handlers) updateContentRow(ctx context.Context, def schema.ContentTypeD
 		}
 		assignments = append(assignments, quoted+" = "+dual.Bind(engine, position))
 		args = append(args, values[i])
+		position++
+	}
+	// CONTRACT-34 T3 — THE FOLD FOLLOWS THE VALUE ON EVERY UPDATE, in the same
+	// statement, for the same reason the insert does it: a fold that lags behind
+	// the value is worse than no fold, because the search would keep finding the
+	// row by text it no longer contains. This UPDATE already replaces EVERY own
+	// column of the row (it is a full replace, not a patch), so recomputing the
+	// fold from `values` is recomputing it from the row's new content.
+	if def.Folded {
+		assignments = append(assignments, quote(schema.SearchFoldColumn)+" = "+dual.Bind(engine, position))
+		args = append(args, store.SearchFoldValue(def, values))
 		position++
 	}
 	assignments = append(assignments, quote(colUpdatedAt)+" = "+dual.Bind(engine, position))

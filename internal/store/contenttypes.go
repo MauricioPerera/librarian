@@ -144,8 +144,20 @@ func LoadContentTypeDefinitions(ctx context.Context, store *compat.Store) ([]sch
 	if err != nil {
 		return nil, err
 	}
+	// CONTRACT-34: which of these types carries the folded search column. A THIRD
+	// query, and a third one for the same reason the references half is a second:
+	// joining another independent one-to-many child of content_types onto the
+	// statement above would multiply its rows against the field rows. This one is
+	// one-to-ONE, so it could have been a LEFT JOIN — it is kept separate anyway so
+	// the shape of the read matches the shape of the registry and a future
+	// contract's fourth child table has an obvious place to go.
+	folded, err := loadFoldedTypeNames(ctx, store)
+	if err != nil {
+		return nil, err
+	}
 	for i := range out {
 		out[i].References = references[out[i].Name]
+		_, out[i].Folded = folded[out[i].Name]
 	}
 	dual.SortByKeys(out, func(d schema.ContentTypeDefinition) []dual.Key {
 		return dual.Ascending(d.Name)
@@ -285,6 +297,16 @@ func CreateContentType(ctx context.Context, store *compat.Store, def schema.Cont
 	if err := def.Validate(); err != nil {
 		return err
 	}
+	// CONTRACT-34 — EVERY TYPE CREATED FROM NOW ON IS BORN FOLDED, and the flag is
+	// FORCED here rather than taken from the caller. Folded is not a declaration:
+	// it describes whether the physical table has the system column, and the only
+	// code that can make that true is this function (it creates the table) and the
+	// rebuild. A caller that sent `"folded": false` in a JSON body would otherwise
+	// be asking for a table whose search is case-sensitive for no reason, and a
+	// caller that sent `"folded": true` to some other path would be asserting
+	// something about a table it is not creating. Overwriting it makes the field
+	// what it is: an ANSWER, never a request.
+	def.Folded = true
 
 	// 2. Compose the schema this database WILL have, and let compat validate the
 	//    whole thing (FK targets, column families, duplicate columns) up front.
@@ -444,6 +466,14 @@ func CreateContentType(ctx context.Context, store *compat.Store, def schema.Cont
 	// A reference row without its FK column (or the other way round) is the exact
 	// class of split this function's whole design exists to make unreachable.
 	if err := insertReferenceRows(ctx, engine, tx, typeID, def, targetIDs); err != nil {
+		return err
+	}
+	// CONTRACT-34: the fold marker, in the SAME transaction as the CREATE TABLE
+	// that gives the table its folded column. The two commit together or neither
+	// does, which is what makes "the registry says folded ⇔ the table has the
+	// column" a guarantee instead of a convention — and the reason no catalog
+	// probe is needed to answer the question later.
+	if err := insertFoldRow(ctx, engine, tx, typeID); err != nil {
 		return err
 	}
 	for _, statement := range statements {

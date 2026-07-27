@@ -132,6 +132,35 @@ const StagingTablePrefix = "cptmp_"
 // At 13 bytes it is always a legal identifier, whatever the type is called.
 const StagingTableName = StagingTablePrefix + "rebuild"
 
+// SearchFoldColumn (CONTRACT-34) is the SYSTEM column that carries the FOLDED
+// copy of the one field a dynamic type is searched by: the same text, lowercased
+// IN GO with strings.ToLower over the whole Unicode range (see FoldSearchText).
+//
+// WHY A COLUMN AT ALL. The portable substring operator (`contains`, compiled to
+// instr/strpos by compat v0.7.0) is case-SENSITIVE by construction, because
+// folding Unicode is exactly what diverges between SQLite and PostgreSQL. So the
+// database can only ever compare EXACTLY — and the only way to get a
+// case-insensitive search that both engines answer identically is to hand the
+// database two values that were already folded by the same Go code. The fold
+// happens in the application; the engine still does a plain, exact substring
+// test. That is the whole design, and it is why no `lower()` may ever appear in
+// a statement this project emits.
+//
+// WHY THE NAME STARTS WITH AN UNDERSCORE, AND WHY THAT IS A GUARANTEE RATHER
+// THAN A CONVENTION. Every dynamically-supplied name — a field, a relation —
+// must pass identifierPattern, `^[a-z][a-z0-9_]*$`, which requires a LETTER
+// first. A name beginning with `_` is therefore UNREACHABLE for anything an
+// admin can declare: there is no input, however hostile, that produces it. The
+// column can consequently never collide with a user field, and it needs no
+// reservation list to defend it (it is listed in ReservedNames() anyway, so the
+// reservation is auditable, exactly like compat's own `__compat_*` tables).
+//
+// It is a column of the SYSTEM, like id and created_at: it is not a field, it is
+// not in the routines' result columns, it is not rendered in the form or the
+// listing, and the generic CRUD layer maintains it on every write without the
+// admin ever being told it exists.
+const SearchFoldColumn = "_search_fold"
+
 // QuoteIdentifier is THE single place in the project where a dynamic name
 // becomes SQL text. It re-runs the CONTRACT-13 T1 gate before quoting, so an
 // identifier can only be interpolated if it still satisfies `[a-z][a-z0-9_]*`
@@ -158,8 +187,17 @@ func QuoteIdentifier(name string) (string, error) {
 // and must not be routed through the dynamic gate as if it were. Keeping the
 // two entry points separate makes every call site say which kind of name it is
 // handling.
+//
+// CONTRACT-34 WIDENED IT BY EXACTLY ONE LEADING UNDERSCORE, and the widening is
+// what keeps the two gates honest rather than loosening either. SearchFoldColumn
+// is `_search_fold`: a name identifierPattern rejects ON PURPOSE (that rejection
+// is precisely what makes the column uncollidable with a declared field), so the
+// dynamic gate must keep rejecting it while the INTERNAL gate — whose whole
+// meaning is "a name this package owns" — must accept it. Anything else would
+// force the fold column to be interpolated through a bespoke path with no
+// validation at all.
 func QuoteInternalIdentifier(name string) (string, error) {
-	if !identifierPattern.MatchString(name) || len(name) > MaxIdentifierLength {
+	if !internalIdentifierPattern.MatchString(name) || len(name) > MaxIdentifierLength {
 		return "", fmt.Errorf("internal identifier %q is not a legal identifier", name)
 	}
 	return `"` + name + `"`, nil
@@ -171,6 +209,14 @@ func QuoteInternalIdentifier(name string) (string, error) {
 // leading digits and the empty string — there is no escaping/sanitising path,
 // only accept or reject.
 var identifierPattern = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
+
+// internalIdentifierPattern is identifierPattern plus an OPTIONAL leading
+// underscore. It applies ONLY to names this project itself owns (the staging
+// table, SearchFoldColumn, the columns ContentType() injects) and never to a
+// name that arrived from outside: those still go through ValidateIdentifier.
+// The one extra character it admits is the whole reason a system column can be
+// spelled in a way no declared field can imitate.
+var internalIdentifierPattern = regexp.MustCompile(`^_?[a-z][a-z0-9_]*$`)
 
 // ReservedNames returns the set of identifiers a dynamic content type or field
 // may never use. It is DERIVED, never hardcoded, from two sources:
@@ -214,6 +260,11 @@ func ReservedNames() map[string]struct{} {
 		"__compat_applied_changes": {},
 		"__compat_capture_state":   {},
 		"__compat_change_journal":  {},
+		// CONTRACT-34: the folded search column. Like the four above it ALREADY
+		// fails identifierPattern (it starts with '_'), so this entry defends
+		// nothing that is currently reachable — it is here so the reservation is
+		// auditable in one list and survives any future loosening of the pattern.
+		SearchFoldColumn: {},
 	}
 	// Derive the injected column names from ContentType itself (its signature is
 	// untouched — this only calls it), so they can never drift apart.
