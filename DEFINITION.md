@@ -6,7 +6,7 @@ Sistema de administración headless (backend + API, sin panel visual en v1) para
 
 ## Arquitectura
 
-Un único servicio en Go que expone una API JSON. Consume [`sqlite-postgres-compat`](https://github.com/MauricioPerera/sqlite-postgres-compat) como librería Go directa (no como subproceso ni CLI externo): el esquema de `librarian` (usuarios, roles, permisos, tipos de contenido) se declara con el modelo canónico de `compat` desde el día uno, para heredar su validación, compilación DDL dual-motor y su capacidad de exportación sin ventana de corte.
+Un único servicio en Go que expone una API JSON. Consume [`sqlite-postgres-compat`](https://github.com/MauricioPerera/sqlite-postgres-compat) como librería Go directa (no como subproceso ni CLI externo): el esquema de `librarian` (usuarios, roles, permisos, tipos de contenido) se declara con el modelo canónico de `compat` desde el día uno, para heredar su validación, compilación DDL dual-motor y su capacidad de exportación sin apagar la aplicación durante la copia.
 
 Almacenamiento primario: libSQL embebido en el proceso, corriendo en el VPS propio (ardf.dev). No hay motor de base de datos separado que administrar en v1.
 
@@ -22,7 +22,7 @@ No hay otros componentes en v1 (sin servicio de auth separado, sin UI separada):
 - Metadatos extensibles sin migración: cada tipo de contenido incluye una columna `metadata JSON` de escape para campos no previstos en el esquema tipado (equivalente a `wp_postmeta`).
 - Columnas de tipo `vector(N)` para almacenar embeddings que el cliente calcula y envía (sin pipeline de generación de embeddings ni búsqueda semántica integrada en v1).
 - Autenticación dual: API keys por rol/servicio (integraciones servicio-a-servicio) y JWT con usuario/contraseña (usuarios humanos).
-- Exportación bajo demanda a PostgreSQL vía `compat`, sin ventana de corte, cuando el crecimiento lo exija.
+- Exportación bajo demanda a PostgreSQL vía `compat`, ~~sin ventana de corte~~ **sin apagar la aplicación durante la copia**, cuando el crecimiento lo exija. (Corregido tras el ensayo real de `compat cutover`: la ventana se achica —de "toda la copia" a "lo que falte drenar"— pero no desaparece. Se tacha en vez de reescribirse porque el error de encuadre vale registrarlo; ver `docs/OPERATIONS.md`.)
 
 ## Por qué es un caso válido / motivación real
 
